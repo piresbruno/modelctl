@@ -7,13 +7,59 @@ starting a server.
 
 ## Install
 
+Python 3.11 or newer is required. `rsync` is also required when using
+`sync-local`. The recommended installation method is an isolated uv tool.
+
+From the project folder:
+
 ```bash
-python -m pip install .
+cd ~/developer/modelctl
+uv tool install .
 ```
 
-Python 3.11 or newer and `rsync` (for local synchronization) are required.
-`huggingface_hub` installs `hf_xet`; its documented environment variables can
-be used to tune transfers.
+Verify that the installed command works:
+
+```bash
+modelctl --version
+modelctl --help
+```
+
+If the shell cannot find `modelctl`, add uv's executable directory to `PATH`
+and restart the shell:
+
+```bash
+uv tool update-shell
+exec "$SHELL"
+```
+
+After changing or updating the source, reinstall it with:
+
+```bash
+cd ~/developer/modelctl
+uv tool install --force .
+```
+
+To run directly from the checkout without installing:
+
+```bash
+uv run modelctl --help
+uv run modelctl download Qwen/Qwen3-8B --root /mnt/nas/llm-models
+```
+
+A regular pip installation is also supported:
+
+```bash
+python3 -m pip install .
+```
+
+To remove the uv tool installation:
+
+```bash
+uv tool uninstall modelctl
+```
+
+The `huggingface_hub` dependency installs `hf_xet`; its documented environment
+variables can be used to tune transfers.
 
 ## Quick start: download directly to the NAS
 
