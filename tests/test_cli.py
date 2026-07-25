@@ -49,7 +49,9 @@ def test_queue_help_documents_format_concurrency_and_examples(capsys):
     assert "source: Qwen/Qwen3-8B" in output
     assert "quantization: Q4_K_M" in output
     assert "modelctl queue downloads.yaml --jobs 2" in output
-    assert "continues after failures" in output
+    assert "No transfer starts unless every queue" in output
+    assert "unique effective model" in output
+    assert "mfsymlinks" in output
     assert "no fixed jobs limit" in output
 
 

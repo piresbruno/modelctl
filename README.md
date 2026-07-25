@@ -156,8 +156,8 @@ settings, the command stops unless `--force` is passed.
 
 ### Queue multiple downloads
 
-Create a YAML file containing a `downloads` list. Each entry accepts the same
-model-selection settings as `modelctl download`:
+A queue is a YAML mapping with exactly one top-level field, `downloads`.
+`downloads` must be a non-empty list of mappings:
 
 ```yaml
 # downloads.yaml
@@ -166,21 +166,59 @@ downloads:
     name: qwen3-8b-vllm
     revision: main
 
+  # Repeated repositories require a unique name for each quantization.
   - source: https://huggingface.co/org/model-GGUF
     name: model-q4
     quantization: Q4_K_M
     runtime: llama.cpp
     force: false
+
+  - source: https://huggingface.co/org/model-GGUF
+    name: model-q8
+    quantization: Q8_0
+    runtime: llama.cpp
+
+  # Auxiliary MTP and DFlash models also need their own names.
+  - source: unsloth/gemma-4-31B-it-GGUF
+    name: gemma-4-31b-it-mtp-q8-0
+    quantization: mtp-gemma-4-31B-it-Q8_0.gguf
+    runtime: llama.cpp
+
+  - source: z-lab/gemma-4-26B-A4B-it-DFlash
+    name: gemma-4-26b-a4b-it-dflash
+    runtime: vllm
 ```
+
+A bare YAML list is not accepted. Unknown top-level or entry fields are rejected
+to catch spelling mistakes before a transfer starts.
 
 | Field | Required | Meaning |
 | --- | --- | --- |
 | `source` | yes | Hugging Face `owner/model` id or model URL |
 | `name` | no | Local model name; defaults to the repository name |
 | `revision` | no | Branch, tag, or commit; defaults to `main` |
-| `quantization` | no | GGUF quantization substring such as `Q4_K_M` |
+| `quantization` | no | GGUF quantization substring or filename |
 | `runtime` | no | `auto`, `vllm`, or `llama.cpp`; defaults to `auto` |
-| `force` | no | Replace a generated manifest with different settings |
+| `force` | no | Boolean; replace a generated manifest with different settings |
+
+Every queue run performs a complete preflight before starting any model
+transfer:
+
+1. Validates the YAML structure, field names, field types, and allowed values.
+2. Resolves each effective local model name and rejects duplicates. Give every
+   quantization, MTP draft, and DFlash draft a unique `name`.
+3. Queries Hugging Face for every entry and validates its source, revision,
+   runtime, selected files, and GGUF quantization.
+4. Rejects existing manifests with conflicting settings unless that entry sets
+   `force: true`.
+5. Prepares the model root and verifies that it supports the atomic symlinks
+   required by `ROOT/active/NAME`.
+6. Prints the fully validated download plan.
+
+If any preflight check fails, the command exits before writing manifests or
+downloading model data. CIFS mounts commonly require the `mfsymlinks` mount
+option; without it, the root validation fails with an actionable error rather
+than failing after a large download.
 
 Run the queue sequentially (the default):
 
@@ -199,19 +237,18 @@ modelctl queue downloads.yaml \
 When running from a source checkout, use:
 
 ```bash
-uv run modelctl queue downloads.yaml --jobs 2 --root /mnt/nas/llm-models
+uv run --project ~/developer/modelctl \
+  modelctl queue ~/developer/downloads.yaml --jobs 2 --root /mnt/nas/llm-models
 ```
 
-Queue behavior:
+Execution behavior after preflight:
 
 - `--jobs` must be at least 1 and defaults to 1.
 - The effective concurrency is the smaller of `--jobs` and the queue length.
 - There is no fixed concurrency ceiling. Start with 2; NAS throughput, disk
   space, network bandwidth, and Hugging Face throttling determine whether a
   larger value helps.
-- Download and publication work for the same model name is serialized by that
-  model's lock.
-- The queue continues after an entry fails, reports every result, and exits
+- The queue continues after a transfer fails, reports every result, and exits
   unsuccessfully if any entry failed.
 - Interrupted entries retain resumable staging data. Rerunning the queue reuses
   valid published objects and resumes incomplete downloads.

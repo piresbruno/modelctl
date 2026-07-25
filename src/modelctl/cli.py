@@ -7,8 +7,11 @@ from pathlib import Path
 
 from .download_queue import (
     DownloadQueueError,
+    execute_download_queue,
     load_download_queue,
-    run_download_queue,
+    prepare_download_queue,
+    validate_prepared_manifests,
+    validate_queue_root,
 )
 from .errors import ModelctlError
 from .generation import (
@@ -140,8 +143,9 @@ llama.cpp. If multiple GGUF quantizations exist, --quantization is required.""",
         "queue",
         help="download models from a YAML queue",
         description=(
-            "Download a YAML list of Hugging Face models, with configurable "
-            "concurrency. Failures are reported after all queued entries run."
+            "Preflight and download a YAML list of Hugging Face models, with "
+            "configurable concurrency. No transfer starts unless every queue "
+            "entry and the model store pass validation."
         ),
         formatter_class=HELP_FORMATTER,
         epilog="""queue file (downloads.yaml):
@@ -160,11 +164,16 @@ examples:
   # Download at most two models at once:
   modelctl queue downloads.yaml --jobs 2 --root /mnt/nas/llm-models
 
-Each entry requires 'source'. Optional fields are name, revision, quantization,
-runtime (auto, vllm, or llama.cpp), and force (true or false). The queue
-continues after failures and reports a nonzero exit status when any entry fails.
-There is no fixed jobs limit; start with 2 or 3 to avoid storage and network
-contention.""",
+The top-level 'downloads' mapping is required. Each entry requires 'source'.
+Optional fields are name, revision, quantization, runtime (auto, vllm, or
+llama.cpp), and force (true or false).
+
+Before any transfer, preflight validates the YAML schema, unique effective model
+names, existing manifest compatibility, every Hugging Face source and
+quantization, and atomic symlink support at the model root. CIFS stores normally
+need the 'mfsymlinks' mount option. The queue continues after transfer failures
+and exits nonzero if any entry fails.
+There is no fixed jobs limit; start with 2 or 3 to avoid contention.""",
     )
     queue.add_argument(
         "file",
@@ -280,14 +289,26 @@ def run(argv: list[str] | None = None) -> int:
     if args.command == "queue":
         requests = load_download_queue(args.file)
         concurrency = min(args.jobs, len(requests))
+        print(f"preflight: validating store and {len(requests)} queue entries")
+        validate_queue_root(root)
+        prepared = prepare_download_queue(requests, jobs=args.jobs)
+        validate_prepared_manifests(root, prepared)
+        for index, item in enumerate(prepared, start=1):
+            selection = item.request.quantization or item.document.get(
+                "format", "auto"
+            )
+            print(
+                f"[{index}/{len(prepared)}] ready: {item.name} "
+                f"<- {item.request.source} ({selection})"
+            )
         print(
-            f"queue: {len(requests)} download(s), "
+            f"preflight complete: starting {len(prepared)} download(s), "
             f"up to {concurrency} concurrent"
         )
-        results = run_download_queue(root, requests, jobs=args.jobs)
+        results = execute_download_queue(root, prepared, jobs=args.jobs)
         failures = 0
         for index, result in enumerate(results, start=1):
-            label = result.request.name or result.request.source
+            label = prepared[index - 1].name
             if result.succeeded:
                 print(
                     f"[{index}/{len(results)}] complete: "

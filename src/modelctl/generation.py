@@ -270,31 +270,19 @@ def write_generated_manifest(
     return path
 
 
-def download_from_hf(
+def download_generated_manifest(
     root: Path,
-    source: str,
+    document: dict[str, Any],
     *,
-    name: str | None = None,
-    revision: str | None = None,
-    quantization: str | None = None,
-    runtime: str = "auto",
     force_manifest: bool = False,
     api: Any | None = None,
     snapshot: Any | None = None,
 ) -> tuple[Path, Path]:
-    """Generate a manifest, then download, validate, publish, and activate it."""
+    """Download from a manifest document already validated during preflight."""
     import yaml
 
     from .operations import update_model
 
-    document = generate_manifest_document(
-        source,
-        name=name,
-        revision=revision,
-        quantization=quantization,
-        runtime=runtime,
-        api=api,
-    )
     manifest_name = str(document["name"])
     path = root / "manifests" / f"{manifest_name}.yaml"
     if path.exists() and not force_manifest:
@@ -315,3 +303,33 @@ def download_from_hf(
     manifest = parse_manifest(document, manifest_name)
     active = update_model(root, manifest, api=api, snapshot=snapshot)
     return manifest_path, active
+
+
+def download_from_hf(
+    root: Path,
+    source: str,
+    *,
+    name: str | None = None,
+    revision: str | None = None,
+    quantization: str | None = None,
+    runtime: str = "auto",
+    force_manifest: bool = False,
+    api: Any | None = None,
+    snapshot: Any | None = None,
+) -> tuple[Path, Path]:
+    """Generate a manifest, then download, validate, publish, and activate it."""
+    document = generate_manifest_document(
+        source,
+        name=name,
+        revision=revision,
+        quantization=quantization,
+        runtime=runtime,
+        api=api,
+    )
+    return download_generated_manifest(
+        root,
+        document,
+        force_manifest=force_manifest,
+        api=api,
+        snapshot=snapshot,
+    )
