@@ -5,6 +5,11 @@ import os
 import sys
 from pathlib import Path
 
+from .download_queue import (
+    DownloadQueueError,
+    load_download_queue,
+    run_download_queue,
+)
 from .errors import ModelctlError
 from .generation import (
     download_from_hf,
@@ -20,6 +25,13 @@ HELP_FORMATTER = argparse.RawDescriptionHelpFormatter
 
 def _root(value: str | None) -> Path:
     return Path(value or os.environ.get("MODELCTL_ROOT", DEFAULT_ROOT)).expanduser().absolute()
+
+
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return number
 
 
 def _add_root(parser: argparse.ArgumentParser) -> None:
@@ -41,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="""examples:
   modelctl download Qwen/Qwen3-8B --root /mnt/nas/llm-models
   modelctl download OWNER/MODEL-GGUF --quantization Q4_K_M --root /mnt/nas/llm-models
+  modelctl queue downloads.yaml --jobs 2 --root /mnt/nas/llm-models
   modelctl path qwen3-8b --root /mnt/nas/llm-models
   modelctl serve-command qwen3-8b --root /mnt/nas/llm-models
   modelctl sync-local qwen3-8b --source-root /mnt/nas/llm-models --root /var/lib/llm-models
@@ -122,6 +135,50 @@ llama.cpp. If multiple GGUF quantizations exist, --quantization is required.""",
         help="replace a generated manifest with different settings",
     )
     _add_root(download)
+
+    queue = commands.add_parser(
+        "queue",
+        help="download models from a YAML queue",
+        description=(
+            "Download a YAML list of Hugging Face models, with configurable "
+            "concurrency. Failures are reported after all queued entries run."
+        ),
+        formatter_class=HELP_FORMATTER,
+        epilog="""queue file (downloads.yaml):
+  downloads:
+    - source: Qwen/Qwen3-8B
+      name: qwen3-8b-vllm
+    - source: org/model-GGUF
+      name: model-q4
+      quantization: Q4_K_M
+      runtime: llama.cpp
+
+examples:
+  # Sequential (the default):
+  modelctl queue downloads.yaml --root /mnt/nas/llm-models
+
+  # Download at most two models at once:
+  modelctl queue downloads.yaml --jobs 2 --root /mnt/nas/llm-models
+
+Each entry requires 'source'. Optional fields are name, revision, quantization,
+runtime (auto, vllm, or llama.cpp), and force (true or false). The queue
+continues after failures and reports a nonzero exit status when any entry fails.
+There is no fixed jobs limit; start with 2 or 3 to avoid storage and network
+contention.""",
+    )
+    queue.add_argument(
+        "file",
+        type=Path,
+        help="YAML file containing a downloads list",
+    )
+    queue.add_argument(
+        "--jobs",
+        type=_positive_int,
+        default=1,
+        metavar="N",
+        help="maximum concurrent downloads (default: 1)",
+    )
+    _add_root(queue)
 
     update = commands.add_parser(
         "update",
@@ -218,6 +275,36 @@ def run(argv: list[str] | None = None) -> int:
         )
         print(f"manifest: {manifest_path}")
         print(f"active: {active}")
+        return 0
+
+    if args.command == "queue":
+        requests = load_download_queue(args.file)
+        concurrency = min(args.jobs, len(requests))
+        print(
+            f"queue: {len(requests)} download(s), "
+            f"up to {concurrency} concurrent"
+        )
+        results = run_download_queue(root, requests, jobs=args.jobs)
+        failures = 0
+        for index, result in enumerate(results, start=1):
+            label = result.request.name or result.request.source
+            if result.succeeded:
+                print(
+                    f"[{index}/{len(results)}] complete: "
+                    f"{label} -> {result.active_path}"
+                )
+            else:
+                failures += 1
+                error = result.error
+                print(
+                    f"[{index}/{len(results)}] failed: {label}: "
+                    f"{type(error).__name__}: {error}",
+                    file=sys.stderr,
+                )
+        if failures:
+            raise DownloadQueueError(
+                f"{failures} of {len(results)} queued download(s) failed"
+            )
         return 0
 
     if args.command in {"manifest", "generate-manifest"}:

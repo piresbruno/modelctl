@@ -40,6 +40,19 @@ def test_serve_command_prints_without_starting_server(tmp_path, capsys):
     assert captured.err == ""
 
 
+def test_queue_help_documents_format_concurrency_and_examples(capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        build_parser().parse_args(["queue", "--help"])
+    assert exit_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "downloads:" in output
+    assert "source: Qwen/Qwen3-8B" in output
+    assert "quantization: Q4_K_M" in output
+    assert "modelctl queue downloads.yaml --jobs 2" in output
+    assert "continues after failures" in output
+    assert "no fixed jobs limit" in output
+
+
 def test_top_level_help_has_description_and_examples(capsys):
     with pytest.raises(SystemExit) as exit_info:
         build_parser().parse_args(["--help"])
@@ -56,6 +69,7 @@ def test_top_level_help_has_description_and_examples(capsys):
     [
         ("download", "modelctl download Qwen/Qwen3-8B"),
         ("manifest", "modelctl manifest Qwen/Qwen3-8B"),
+        ("queue", "modelctl queue downloads.yaml"),
         ("update", "modelctl update qwen3-8b-vllm"),
         ("path", "MODEL_PATH=$(modelctl path"),
         ("serve-command", "modelctl serve-command model-q4"),

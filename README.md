@@ -154,6 +154,68 @@ manifest is retained at `ROOT/manifests/NAME.yaml`; repeating the same command
 reuses it and any valid published object. If an existing manifest has different
 settings, the command stops unless `--force` is passed.
 
+### Queue multiple downloads
+
+Create a YAML file containing a `downloads` list. Each entry accepts the same
+model-selection settings as `modelctl download`:
+
+```yaml
+# downloads.yaml
+downloads:
+  - source: Qwen/Qwen3-8B
+    name: qwen3-8b-vllm
+    revision: main
+
+  - source: https://huggingface.co/org/model-GGUF
+    name: model-q4
+    quantization: Q4_K_M
+    runtime: llama.cpp
+    force: false
+```
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `source` | yes | Hugging Face `owner/model` id or model URL |
+| `name` | no | Local model name; defaults to the repository name |
+| `revision` | no | Branch, tag, or commit; defaults to `main` |
+| `quantization` | no | GGUF quantization substring such as `Q4_K_M` |
+| `runtime` | no | `auto`, `vllm`, or `llama.cpp`; defaults to `auto` |
+| `force` | no | Replace a generated manifest with different settings |
+
+Run the queue sequentially (the default):
+
+```bash
+modelctl queue downloads.yaml --root /mnt/nas/llm-models
+```
+
+Download at most two models concurrently:
+
+```bash
+modelctl queue downloads.yaml \
+  --jobs 2 \
+  --root /mnt/nas/llm-models
+```
+
+When running from a source checkout, use:
+
+```bash
+uv run modelctl queue downloads.yaml --jobs 2 --root /mnt/nas/llm-models
+```
+
+Queue behavior:
+
+- `--jobs` must be at least 1 and defaults to 1.
+- The effective concurrency is the smaller of `--jobs` and the queue length.
+- There is no fixed concurrency ceiling. Start with 2; NAS throughput, disk
+  space, network bandwidth, and Hugging Face throttling determine whether a
+  larger value helps.
+- Download and publication work for the same model name is serialized by that
+  model's lock.
+- The queue continues after an entry fails, reports every result, and exits
+  unsuccessfully if any entry failed.
+- Interrupted entries retain resumable staging data. Rerunning the queue reuses
+  valid published objects and resumes incomplete downloads.
+
 ### Generate a manifest from Hugging Face
 
 Generate a manifest directly from a Hugging Face model id or URL:
@@ -321,6 +383,7 @@ copyable examples:
 ```bash
 modelctl --help
 modelctl download --help
+modelctl queue --help
 modelctl manifest --help
 modelctl update --help
 modelctl path --help
