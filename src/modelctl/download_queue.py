@@ -26,6 +26,8 @@ class DownloadRequest:
     revision: str | None = None
     quantization: str | None = None
     runtime: str = "auto"
+    mmproj: str | None = None
+    mtp: str | None = None
     force: bool = False
 
 
@@ -57,6 +59,8 @@ _ALLOWED_KEYS = {
     "revision",
     "quantization",
     "runtime",
+    "mmproj",
+    "mtp",
     "force",
 }
 _ALLOWED_RUNTIMES = {"auto", "vllm", "llama.cpp"}
@@ -124,6 +128,8 @@ def load_download_queue(path: Path) -> list[DownloadRequest]:
                 revision=_optional_string(item, "revision", index),
                 quantization=_optional_string(item, "quantization", index),
                 runtime=runtime,
+                mmproj=_optional_string(item, "mmproj", index),
+                mtp=_optional_string(item, "mtp", index),
                 force=force,
             )
         )
@@ -214,6 +220,8 @@ def prepare_download_queue(
                 revision=request.revision,
                 quantization=request.quantization,
                 runtime=request.runtime,
+                mmproj=request.mmproj,
+                mtp=request.mtp,
             )
             if (
                 not isinstance(document, dict)
@@ -304,6 +312,8 @@ def execute_download_queue(
                     revision=request.revision,
                     quantization=request.quantization,
                     runtime=request.runtime,
+                    mmproj=request.mmproj,
+                    mtp=request.mtp,
                     force_manifest=request.force,
                 )
             return DownloadResult(request, manifest_path, active_path)

@@ -14,6 +14,7 @@ _SHARD_RE = re.compile(
     r"^(?P<base>.+)-(?P<index>\d{5})-of-(?P<count>\d{5})\.gguf$", re.I
 )
 _SAFE_NAME_RE = re.compile(r"[^a-z0-9._-]+")
+_MODEL_CARD = "README.md"
 _STANDARD_PATTERNS = (
     "*.json",
     "*.safetensors",
@@ -106,7 +107,8 @@ def _gguf_groups(files: list[str]) -> list[list[str]]:
     for value in files:
         if not value.lower().endswith(".gguf"):
             continue
-        if Path(value).name.lower().startswith("mmproj"):
+        basename = Path(value).name.lower()
+        if basename.startswith(("mmproj", "mtp-")):
             continue
         match = _SHARD_RE.match(Path(value).name)
         if match:
@@ -131,6 +133,76 @@ def _gguf_groups(files: list[str]) -> list[list[str]]:
             )
         result.append([value for _, value in sorted(shards)])
     return sorted(result, key=lambda group: group[0].lower())
+
+
+def _artifact_candidates(files: list[str], prefix: str) -> list[str]:
+    return sorted(
+        value
+        for value in files
+        if value.lower().endswith(".gguf")
+        and Path(value).name.lower().startswith(prefix)
+    )
+
+
+def _select_artifact(
+    candidates: list[str],
+    requested: str | None,
+    *,
+    option: str,
+) -> str | None:
+    if not candidates:
+        if requested:
+            raise ManifestError(f"no {option.removeprefix('--')} file matches {requested!r}")
+        return None
+    if requested:
+        needle = requested.lower()
+        matches = [
+            value
+            for value in candidates
+            if value.lower() == needle or Path(value).name.lower() == needle
+        ]
+        if not matches:
+            matches = [value for value in candidates if needle in value.lower()]
+        if len(matches) != 1:
+            examples = ", ".join(candidates[:6])
+            if not matches:
+                raise ManifestError(
+                    f"no {option.removeprefix('--')} file matches {requested!r}. "
+                    f"Candidates: {examples}"
+                )
+            raise ManifestError(
+                f"{requested!r} matches multiple companion files; pass an exact path "
+                f"with {option}. Candidates: {examples}"
+            )
+        return matches[0]
+    if len(candidates) == 1:
+        return candidates[0]
+    examples = ", ".join(candidates[:6])
+    raise ManifestError(
+        f"multiple companion files are available; pass {option}. Candidates: {examples}"
+    )
+
+
+def _select_mmproj(files: list[str], requested: str | None) -> str | None:
+    candidates = _artifact_candidates(files, "mmproj")
+    if requested is None:
+        f16 = [
+            value
+            for value in candidates
+            if re.search(r"(?:^|[-_.])f16(?:[-_.]|$)", Path(value).stem.lower())
+        ]
+        if len(f16) == 1:
+            return f16[0]
+    return _select_artifact(candidates, requested, option="--mmproj")
+
+
+def _select_mtp(files: list[str], requested: str | None) -> str | None:
+    candidates = _artifact_candidates(files, "mtp-")
+    if requested is None:
+        root_candidates = [value for value in candidates if len(Path(value).parts) == 1]
+        if len(root_candidates) == 1:
+            return root_candidates[0]
+    return _select_artifact(candidates, requested, option="--mtp")
 
 
 def _select_gguf(files: list[str], quantization: str | None) -> list[str]:
@@ -164,6 +236,8 @@ def generate_manifest_document(
     revision: str | None = None,
     quantization: str | None = None,
     runtime: str = "auto",
+    mmproj: str | None = None,
+    mtp: str | None = None,
     api: Any | None = None,
 ) -> dict[str, Any]:
     repo, selected_revision = parse_hf_source(source, revision)
@@ -202,17 +276,37 @@ def generate_manifest_document(
         "repo": repo,
         "revision": selected_revision,
     }
+    model_card = _MODEL_CARD if _MODEL_CARD in files else None
+    if model_card:
+        document["model_card"] = model_card
+
     if selected_runtime == "llama.cpp":
         selected = _select_gguf(files, quantization)
+        companions = {
+            kind: path
+            for kind, path in (
+                ("mmproj", _select_mmproj(files, mmproj)),
+                ("mtp", _select_mtp(files, mtp)),
+            )
+            if path is not None
+        }
+        include = [*selected]
+        if model_card:
+            include.append(model_card)
+        include.extend(companions.values())
         document.update(
             {
                 "format": "gguf",
-                "include": selected,
+                "include": include,
                 "entrypoint": selected[0],
                 "runtime": {"type": "llama.cpp", "executable": "llama-server"},
             }
         )
+        if companions:
+            document["companions"] = companions
     elif selected_runtime == "vllm":
+        if mmproj or mtp:
+            raise ManifestError("--mmproj and --mtp are only supported with llama.cpp")
         if not has_standard_weights:
             raise ManifestError("vLLM runtime requires safetensors or bin weights")
         patterns = [
@@ -222,6 +316,8 @@ def generate_manifest_document(
         ]
         if not has_safetensors:
             patterns.append("*.bin")
+        if model_card:
+            patterns.append(model_card)
         document.update(
             {
                 "format": "safetensors" if has_safetensors else "hf",
@@ -313,6 +409,8 @@ def download_from_hf(
     revision: str | None = None,
     quantization: str | None = None,
     runtime: str = "auto",
+    mmproj: str | None = None,
+    mtp: str | None = None,
     force_manifest: bool = False,
     api: Any | None = None,
     snapshot: Any | None = None,
@@ -324,6 +422,8 @@ def download_from_hf(
         revision=revision,
         quantization=quantization,
         runtime=runtime,
+        mmproj=mmproj,
+        mtp=mtp,
         api=api,
     )
     return download_generated_manifest(

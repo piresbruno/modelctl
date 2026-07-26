@@ -26,9 +26,14 @@ class ModelManifest:
     include: tuple[str, ...] = ()
     format: str = "auto"
     entrypoint: str | None = None
+    model_card: str | None = None
+    companions: tuple[tuple[str, str], ...] = ()
     runtime: RuntimeProfile = field(
         default_factory=lambda: RuntimeProfile("vllm", "vllm")
     )
+
+    def companion(self, kind: str) -> str | None:
+        return dict(self.companions).get(kind)
 
 
 def validate_name(name: str) -> str:
@@ -125,6 +130,23 @@ def parse_manifest(document: Any, name: str) -> ModelManifest:
             raise ManifestError("entrypoint must be a relative path")
         entrypoint = _relative_path(entrypoint, "entrypoint")
 
+    model_card = raw.get("model_card")
+    if model_card is not None:
+        if not isinstance(model_card, str):
+            raise ManifestError("model_card must be a relative path")
+        model_card = _relative_path(model_card, "model_card")
+
+    companions_raw = raw.get("companions", {})
+    if not isinstance(companions_raw, dict):
+        raise ManifestError("companions must be a mapping of names to relative paths")
+    companions: list[tuple[str, str]] = []
+    for kind, value in companions_raw.items():
+        if not isinstance(kind, str) or not kind or not _NAME_RE.fullmatch(kind):
+            raise ManifestError("companion names must use letters, digits, '.', '_' or '-'")
+        if not isinstance(value, str):
+            raise ManifestError(f"companion {kind!r} must be a relative path")
+        companions.append((kind, _relative_path(value, f"companion {kind!r}")))
+
     runtime_raw = raw.get("runtime")
     if runtime_raw is None and isinstance(raw.get("serve"), dict):
         runtime_raw = raw["serve"]
@@ -140,6 +162,8 @@ def parse_manifest(document: Any, name: str) -> ModelManifest:
         include=tuple(include),
         format=model_format,
         entrypoint=entrypoint,
+        model_card=model_card,
+        companions=tuple(sorted(companions)),
         runtime=runtime,
     )
 

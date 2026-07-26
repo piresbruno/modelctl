@@ -101,6 +101,14 @@ replaced unless --force is supplied.""",
         default="auto",
         help="runtime override (default: auto)",
     )
+    manifest.add_argument(
+        "--mmproj",
+        help="multimodal projector filename or substring when selection is ambiguous",
+    )
+    manifest.add_argument(
+        "--mtp",
+        help="MTP draft model filename or substring when selection is ambiguous",
+    )
     manifest.add_argument("--output", type=Path, help="output path")
     manifest.add_argument("--force", action="store_true", help="replace an existing manifest")
     _add_root(manifest)
@@ -136,6 +144,14 @@ llama.cpp. If multiple GGUF quantizations exist, --quantization is required.""",
         help="runtime override (default: auto)",
     )
     download.add_argument(
+        "--mmproj",
+        help="multimodal projector filename or substring when selection is ambiguous",
+    )
+    download.add_argument(
+        "--mtp",
+        help="MTP draft model filename or substring when selection is ambiguous",
+    )
+    download.add_argument(
         "--force",
         action="store_true",
         help="replace a generated manifest with different settings",
@@ -169,7 +185,7 @@ examples:
 
 The top-level 'downloads' mapping is required. Each entry requires 'source'.
 Optional fields are name, revision, quantization, runtime (auto, vllm, or
-llama.cpp), and force (true or false).
+llama.cpp), mmproj, mtp, and force (true or false).
 
 Before any transfer, preflight validates the YAML schema, unique effective model
 names, existing manifest compatibility, every Hugging Face source and
@@ -283,6 +299,8 @@ def run(argv: list[str] | None = None) -> int:
             revision=args.revision,
             quantization=args.quantization,
             runtime=args.runtime,
+            mmproj=args.mmproj,
+            mtp=args.mtp,
             force_manifest=args.force,
         )
         print(f"manifest: {manifest_path}")
@@ -338,6 +356,8 @@ def run(argv: list[str] | None = None) -> int:
             revision=args.revision,
             quantization=args.quantization,
             runtime=args.runtime,
+            mmproj=args.mmproj,
+            mtp=args.mtp,
         )
         print(
             write_generated_manifest(

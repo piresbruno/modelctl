@@ -15,6 +15,7 @@ from .validation import (
     ExpectedFile,
     resolve_entrypoint,
     runtime_from_metadata,
+    validate_artifacts,
     validate_expected,
     validate_object,
     write_metadata,
@@ -83,6 +84,7 @@ def update_model(
             )
             try:
                 validate_expected(staging, expected)
+                validate_artifacts(staging, manifest, expected)
                 entrypoint = resolve_entrypoint(staging, manifest, expected)
                 write_metadata(staging, manifest, commit, expected, entrypoint)
                 validate_object(
@@ -158,17 +160,36 @@ def serve_argv(root: Path, name: str) -> list[str]:
     has_path_placeholder = any(
         "{path}" in argument or "{object}" in argument for argument in profile.args
     )
+    companion_args: list[str] = []
     if profile.kind == "vllm":
         base = [profile.executable, "serve", str(path)]
     elif profile.kind in {"llama.cpp", "llama"}:
         base = [profile.executable, "--model", str(path)]
+        companions = metadata.get("companions", {})
+        mmproj = companions.get("mmproj")
+        if mmproj:
+            companion_args.extend(
+                ["--mmproj", str((object_path / mmproj).resolve(strict=True))]
+            )
+        mtp = companions.get("mtp")
+        if mtp:
+            companion_args.extend(
+                [
+                    "--model-draft",
+                    str((object_path / mtp).resolve(strict=True)),
+                    "--spec-type",
+                    "draft-mtp",
+                ]
+            )
     else:
         if not has_path_placeholder:
             raise ModelctlError(
                 f"runtime {profile.kind!r} must include {{path}} in runtime.args"
             )
         base = [profile.executable]
-    return [profile.executable, *custom] if has_path_placeholder else [*base, *custom]
+    if has_path_placeholder:
+        return [profile.executable, *custom, *companion_args]
+    return [*base, *companion_args, *custom]
 
 
 def serve_command(root: Path, name: str) -> str:

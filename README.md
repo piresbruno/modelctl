@@ -81,10 +81,11 @@ When running from this source checkout instead of an installed package, use
 
 1. Queries Hugging Face and resolves the requested revision.
 2. Infers vLLM for standard weights or llama.cpp for a GGUF-only repository.
-3. Generates `ROOT/manifests/NAME.yaml`.
-4. Estimates and downloads the selected files to resumable staging.
-5. Validates and atomically publishes the object.
-6. Atomically updates `ROOT/active/NAME` only after publication succeeds.
+3. Detects the repository model card and llama.cpp companion models such as
+   multimodal projectors (`mmproj`) and MTP draft models.
+4. Generates `ROOT/manifests/NAME.yaml`.
+5. Estimates, downloads, and validates the complete selection in resumable staging.
+6. Atomically publishes the object and updates `ROOT/active/NAME`.
 
 The default name is the lower-cased Hugging Face repository name. Override it
 when desired:
@@ -149,17 +150,29 @@ name: model-q4
 repo: org/model-GGUF
 revision: main
 format: gguf
-include: ["Model-Q4_K_M-*.gguf"]
+include:
+  - "Model-Q4_K_M-*.gguf"
+  - README.md
+  - mmproj-F16.gguf
+  - mtp-model-Q8_0.gguf
+model_card: README.md
+companions:
+  mmproj: mmproj-F16.gguf
+  mtp: mtp-model-Q8_0.gguf
 runtime:
   type: llama.cpp
   executable: llama-server
   args: ["--ctx-size", "8192"]
 ```
 
-`entrypoint` can select a relative GGUF path explicitly. A vLLM+GGUF profile is
-rejected in the version 1 workflow. Runtime arguments may contain `{path}`,
-`{object}`, and `{name}` placeholders; when `{path}` or `{object}` is present,
-the argument list replaces the runtime's default model arguments.
+`entrypoint` can select a relative GGUF path explicitly. `model_card` and every
+path in `companions` are required artifacts: update fails before publication if
+the selected snapshot omitted one. For llama.cpp, `serve-command` adds
+`--mmproj` and MTP draft arguments from the companion metadata automatically.
+A vLLM+GGUF profile is rejected in the version 1 workflow. Runtime arguments
+may contain `{path}`, `{object}`, and `{name}` placeholders; when `{path}` or
+`{object}` is present, the argument list replaces the runtime's default model
+arguments.
 
 A manifest file may also contain a `models` mapping keyed by model name.
 
@@ -224,12 +237,15 @@ downloads:
     quantization: Q8_0
     runtime: llama.cpp
 
-  # Auxiliary MTP and DFlash models also need their own names.
+  # mmproj and in-repository MTP files are attached automatically. Override
+  # an ambiguous selection with exact filenames when needed.
   - source: unsloth/gemma-4-31B-it-GGUF
-    name: gemma-4-31b-it-mtp-q8-0
-    quantization: mtp-gemma-4-31B-it-Q8_0.gguf
-    runtime: llama.cpp
+    name: gemma-4-31b-it-q4
+    quantization: UD-Q4_K_XL
+    mmproj: mmproj-F16.gguf
+    mtp: mtp-gemma-4-31B-it.gguf
 
+  # A draft model in a separate repository remains a separate queue entry.
   - source: z-lab/gemma-4-26B-A4B-it-DFlash
     name: gemma-4-26b-a4b-it-dflash
     runtime: vllm
@@ -245,6 +261,8 @@ to catch spelling mistakes before a transfer starts.
 | `revision` | no | Branch, tag, or commit; defaults to `main` |
 | `quantization` | no | GGUF quantization substring or filename |
 | `runtime` | no | `auto`, `vllm`, or `llama.cpp`; defaults to `auto` |
+| `mmproj` | no | Projector filename/path or substring when auto-selection is ambiguous |
+| `mtp` | no | MTP draft filename/path or substring when auto-selection is ambiguous |
 | `force` | no | Boolean; replace a generated manifest with different settings |
 
 Every queue run performs a complete preflight before starting any model
@@ -252,7 +270,7 @@ transfer:
 
 1. Validates the YAML structure, field names, field types, and allowed values.
 2. Resolves each effective local model name and rejects duplicates. Give every
-   quantization, MTP draft, and DFlash draft a unique `name`.
+   quantization or separately hosted draft model a unique `name`.
 3. Queries Hugging Face for every entry and validates its source, revision,
    runtime, selected files, and GGUF quantization.
 4. Rejects existing manifests with conflicting settings unless that entry sets
@@ -319,9 +337,14 @@ commands with `uv run`, for example `uv run modelctl manifest ...`.
 
 The generator queries Hugging Face for the selected revision and inspects the
 repository filenames. Standard safetensors/bin weights select vLLM; a
-GGUF-only repository selects llama.cpp. When multiple GGUF quantizations are
-available, generation stops and requires `--quantization`. For sharded GGUFs,
-every shard is selected and shard `00001` is used as the entrypoint.
+GGUF-only repository selects llama.cpp. The root `README.md` model card is
+retained with the model.
+For llama.cpp, in-repository `mmproj*.gguf` and `mtp-*.gguf` companions are also
+selected, recorded, and later validated. `mmproj-F16.gguf` and a single root MTP
+file are preferred when present; otherwise ambiguous companion choices require
+`--mmproj` or `--mtp`. When multiple primary GGUF quantizations are available,
+generation stops and requires `--quantization`. For sharded GGUFs, every shard
+is selected and shard `00001` is used as the entrypoint.
 
 The generated file is written to `ROOT/manifests/NAME.yaml`. The default name
 is the lower-cased repository name; use `--name` to override it. Existing
@@ -334,6 +357,8 @@ Useful options:
 --revision REVISION         Select a branch, tag, or commit
 --quantization Q4_K_M       Select one GGUF quantization
 --runtime auto|vllm|llama.cpp
+--mmproj FILE               Resolve an ambiguous multimodal projector
+--mtp FILE                  Resolve an ambiguous MTP draft model
 --output PATH               Write somewhere other than ROOT/manifests
 --force                     Replace an existing manifest
 ```

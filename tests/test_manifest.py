@@ -35,6 +35,24 @@ def test_selects_named_entry_from_combined_manifest():
     assert manifest.repo == "org/b"
 
 
-def test_rejects_unsafe_entrypoint():
+def test_parses_model_card_and_companions():
+    manifest = parse_manifest(
+        {
+            "repo": "org/model",
+            "model_card": "README.md",
+            "companions": {"mmproj": "vision/mmproj-F16.gguf"},
+        },
+        "model",
+    )
+    assert manifest.model_card == "README.md"
+    assert manifest.companion("mmproj") == "vision/mmproj-F16.gguf"
+
+
+def test_rejects_unsafe_entrypoint_and_artifacts():
     with pytest.raises(ManifestError, match="relative path"):
         parse_manifest({"repo": "org/model", "entrypoint": "../outside"}, "model")
+    with pytest.raises(ManifestError, match="relative path"):
+        parse_manifest(
+            {"repo": "org/model", "companions": {"mmproj": "../outside"}},
+            "model",
+        )

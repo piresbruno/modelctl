@@ -52,6 +52,8 @@ def test_generates_filtered_vllm_manifest():
     assert document["runtime"]["type"] == "vllm"
     assert "*.safetensors" in document["include"]
     assert "*.bin" not in document["include"]
+    assert "README.md" in document["include"]
+    assert document["model_card"] == "README.md"
     assert api.calls == [("Qwen/Qwen3-8B", "main")]
 
 
@@ -67,6 +69,53 @@ def test_multiple_gguf_quantizations_require_selection():
     assert document["include"] == ["Model-Q4_K_M.gguf"]
     assert document["entrypoint"] == "Model-Q4_K_M.gguf"
     assert document["runtime"]["type"] == "llama.cpp"
+
+
+def test_selects_model_card_and_gguf_companions():
+    files = [
+        "README.md",
+        "gemma-4-Q4_K_M.gguf",
+        "mmproj-BF16.gguf",
+        "mmproj-F16.gguf",
+        "mmproj-F32.gguf",
+        "MTP/mtp-gemma-4-BF16.gguf",
+        "MTP/mtp-gemma-4-Q8_0.gguf",
+        "mtp-gemma-4.gguf",
+    ]
+    document = generate_manifest_document(
+        "org/gemma-4-GGUF", quantization="Q4_K_M", api=FakeApi(files)
+    )
+    assert document["model_card"] == "README.md"
+    assert document["companions"] == {
+        "mmproj": "mmproj-F16.gguf",
+        "mtp": "mtp-gemma-4.gguf",
+    }
+    assert document["include"] == [
+        "gemma-4-Q4_K_M.gguf",
+        "README.md",
+        "mmproj-F16.gguf",
+        "mtp-gemma-4.gguf",
+    ]
+
+
+def test_ambiguous_companion_requires_selection():
+    files = [
+        "model-Q4_K_M.gguf",
+        "projectors/mmproj-Q5_K_M.gguf",
+        "projectors/mmproj-Q8_0.gguf",
+    ]
+    with pytest.raises(ManifestError, match="--mmproj"):
+        generate_manifest_document(
+            "org/model-GGUF", quantization="Q4_K_M", api=FakeApi(files)
+        )
+
+    document = generate_manifest_document(
+        "org/model-GGUF",
+        quantization="Q4_K_M",
+        mmproj="Q8_0",
+        api=FakeApi(files),
+    )
+    assert document["companions"]["mmproj"].endswith("Q8_0.gguf")
 
 
 def test_selects_every_shard_and_first_shard_entrypoint():
@@ -96,10 +145,14 @@ def test_manifest_writer_refuses_overwrite_without_force(tmp_path):
 
 
 def test_download_generates_manifest_and_activates_model(tmp_path):
-    api = FakeApi(["config.json", "model.safetensors"])
+    api = FakeApi(["config.json", "model.safetensors", "README.md"])
 
     def snapshot(**kwargs):
-        files = {"config.json": b"{}", "model.safetensors": b"weights"}
+        files = {
+            "config.json": b"{}",
+            "model.safetensors": b"weights",
+            "README.md": b"# Model card\n",
+        }
         if kwargs.get("dry_run"):
             return [
                 SimpleNamespace(filename=name, file_size=len(content))
@@ -123,6 +176,7 @@ def test_download_generates_manifest_and_activates_model(tmp_path):
     assert manifest_path.is_file()
     assert active == (tmp_path / "active" / "my-model").resolve()
     assert (active / "model.safetensors").read_bytes() == b"weights"
+    assert (active / "README.md").read_text() == "# Model card\n"
 
     def no_download(**kwargs):
         raise AssertionError("an identical published object should be reused")

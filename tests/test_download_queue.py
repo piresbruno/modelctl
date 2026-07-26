@@ -15,7 +15,7 @@ from modelctl.download_queue import (
 )
 
 
-def _generator(source, *, name, revision, quantization, runtime):
+def _generator(source, *, name, revision, quantization, runtime, mmproj, mtp):
     return {
         "name": name,
         "repo": source,
@@ -36,6 +36,8 @@ def test_loads_strict_mapping_queue_and_validates_fields(tmp_path):
   - source: org/model-GGUF
     quantization: Q4_K_M
     runtime: llama.cpp
+    mmproj: mmproj-F16.gguf
+    mtp: mtp-model.gguf
     force: true
 """
     )
@@ -46,6 +48,8 @@ def test_loads_strict_mapping_queue_and_validates_fields(tmp_path):
             "org/model-GGUF",
             quantization="Q4_K_M",
             runtime="llama.cpp",
+            mmproj="mmproj-F16.gguf",
+            mtp="mtp-model.gguf",
             force=True,
         ),
     ]
@@ -165,6 +169,8 @@ def test_queue_limits_concurrency_and_preserves_result_order(tmp_path):
     assert [result.request for result in results] == requests
     assert all(result.succeeded for result in results)
     assert all(call[1]["runtime"] == "auto" for call in calls)
+    assert all(call[1]["mmproj"] is None for call in calls)
+    assert all(call[1]["mtp"] is None for call in calls)
     assert all(call[1]["force_manifest"] is False for call in calls)
 
 

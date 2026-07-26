@@ -2,6 +2,16 @@
 
 This project follows semantic versioning.
 
+## Unreleased
+
+### Added
+
+- Store Hugging Face model cards with generated model selections.
+- Discover, select, validate, and serve llama.cpp `mmproj` and MTP companion
+  GGUFs together with their primary model.
+- `--mmproj` and `--mtp` overrides for ambiguous companion selections, including
+  equivalent download queue fields.
+
 ## 0.2.0
 
 ### Added

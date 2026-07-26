@@ -4,7 +4,12 @@ import pytest
 
 from modelctl.errors import ValidationError
 from modelctl.manifest import parse_manifest
-from modelctl.validation import ExpectedFile, resolve_entrypoint, validate_expected
+from modelctl.validation import (
+    ExpectedFile,
+    resolve_entrypoint,
+    validate_artifacts,
+    validate_expected,
+)
 
 
 def _touch(root: Path, names: list[str]) -> list[ExpectedFile]:
@@ -40,6 +45,21 @@ def test_sharded_gguf_rejects_missing_shard(tmp_path):
     )
     with pytest.raises(ValidationError, match="00002"):
         resolve_entrypoint(tmp_path, manifest, expected)
+
+
+def test_required_model_card_and_companions_must_be_selected(tmp_path):
+    expected = _touch(tmp_path, ["model.gguf", "README.md"])
+    manifest = parse_manifest(
+        {
+            "repo": "org/model",
+            "format": "gguf",
+            "model_card": "README.md",
+            "companions": {"mmproj": "mmproj-F16.gguf"},
+        },
+        "model",
+    )
+    with pytest.raises(ValidationError, match="mmproj companion.*not selected"):
+        validate_artifacts(tmp_path, manifest, expected)
 
 
 def test_independent_quantizations_are_ambiguous(tmp_path):

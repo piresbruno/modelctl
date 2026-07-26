@@ -142,6 +142,46 @@ def test_path_and_serve_command_use_resolved_entrypoint_and_shell_escape(tmp_pat
     ]
 
 
+def test_serve_command_includes_mmproj_and_mtp_companions(tmp_path):
+    layout = Layout(tmp_path)
+    layout.prepare()
+    manifest = _manifest(
+        runtime="llama.cpp",
+        format="gguf",
+        entrypoint="model.gguf",
+        companions={
+            "mmproj": "mmproj-F16.gguf",
+            "mtp": "mtp-model.gguf",
+        },
+    )
+    object_path = layout.object_path(manifest, "e" * 40)
+    object_path.mkdir(parents=True)
+    names = ["model.gguf", "mmproj-F16.gguf", "mtp-model.gguf"]
+    for name in names:
+        (object_path / name).write_bytes(b"gguf")
+    write_metadata(
+        object_path,
+        manifest,
+        "e" * 40,
+        [ExpectedFile(name, 4) for name in names],
+        "model.gguf",
+    )
+    atomic_symlink(object_path, layout.active_path("demo"))
+
+    argv = shlex.split(serve_command(tmp_path, "demo"))
+    assert argv == [
+        "llama-server",
+        "--model",
+        str((object_path / "model.gguf").resolve()),
+        "--mmproj",
+        str((object_path / "mmproj-F16.gguf").resolve()),
+        "--model-draft",
+        str((object_path / "mtp-model.gguf").resolve()),
+        "--spec-type",
+        "draft-mtp",
+    ]
+
+
 def test_local_sync_excludes_hf_cache_and_updates_reference_last(tmp_path):
     nas = tmp_path / "nas"
     local = tmp_path / "local"

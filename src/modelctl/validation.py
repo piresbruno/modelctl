@@ -72,6 +72,26 @@ def _gguf_files(directory: Path, expected: Iterable[ExpectedFile]) -> list[str]:
     return sorted(item.path for item in expected if item.path.lower().endswith(".gguf"))
 
 
+def validate_artifacts(
+    directory: Path, manifest: ModelManifest, expected: Iterable[ExpectedFile]
+) -> None:
+    selected = {item.path for item in expected}
+    required = []
+    if manifest.model_card:
+        required.append(("model card", manifest.model_card))
+    required.extend(
+        (f"{kind} companion", path) for kind, path in manifest.companions
+    )
+    for label, relative in required:
+        if relative not in selected:
+            raise ValidationError(
+                f"required {label} was not selected for download: {relative}"
+            )
+        path = directory.joinpath(*_safe_relative(relative).parts)
+        if not path.is_file():
+            raise ValidationError(f"required {label} is missing: {relative}")
+
+
 def resolve_entrypoint(
     directory: Path, manifest: ModelManifest, expected: list[ExpectedFile]
 ) -> str:
@@ -166,6 +186,8 @@ def write_metadata(
         "include": list(manifest.include),
         "format": manifest.format,
         "entrypoint": entrypoint,
+        "model_card": manifest.model_card,
+        "companions": dict(manifest.companions),
         "runtime": asdict(manifest.runtime),
         "files": [asdict(item) for item in expected],
     }
@@ -214,6 +236,27 @@ def validate_object(
     target = directory if entrypoint == "." else directory / entrypoint
     if not target.exists():
         raise ValidationError(f"object entrypoint is missing: {entrypoint}")
+
+    required: list[tuple[str, str]] = []
+    model_card = metadata.get("model_card")
+    if model_card is not None:
+        if not isinstance(model_card, str):
+            raise ValidationError("object metadata has an invalid model card path")
+        required.append(("model card", model_card))
+    companions = metadata.get("companions", {})
+    if not isinstance(companions, dict) or any(
+        not isinstance(kind, str) or not isinstance(path, str)
+        for kind, path in companions.items()
+    ):
+        raise ValidationError("object metadata has invalid companions")
+    required.extend((f"{kind} companion", path) for kind, path in companions.items())
+    selected = {item.path for item in expected}
+    for label, relative in required:
+        if relative not in selected:
+            raise ValidationError(f"object metadata {label} is not in its file list")
+        path = directory.joinpath(*_safe_relative(relative).parts)
+        if not path.is_file():
+            raise ValidationError(f"object {label} is missing: {relative}")
     return metadata
 
 

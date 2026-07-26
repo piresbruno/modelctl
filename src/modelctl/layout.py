@@ -42,21 +42,24 @@ class Layout:
 
     def object_path(self, manifest: ModelManifest, commit: str) -> Path:
         repo = PurePosixPath(manifest.repo)
+        settings = {
+            "name": manifest.name,
+            "include": manifest.include,
+            "format": manifest.format,
+            "entrypoint": manifest.entrypoint,
+            "runtime": {
+                "kind": manifest.runtime.kind,
+                "executable": manifest.runtime.executable,
+                "args": manifest.runtime.args,
+            },
+        }
+        # Keep object identities stable for pre-companion manifests.
+        if manifest.model_card:
+            settings["model_card"] = manifest.model_card
+        if manifest.companions:
+            settings["companions"] = manifest.companions
         selection = hashlib.sha256(
-            json.dumps(
-                {
-                    "name": manifest.name,
-                    "include": manifest.include,
-                    "format": manifest.format,
-                    "entrypoint": manifest.entrypoint,
-                    "runtime": {
-                        "kind": manifest.runtime.kind,
-                        "executable": manifest.runtime.executable,
-                        "args": manifest.runtime.args,
-                    },
-                },
-                sort_keys=True,
-            ).encode()
+            json.dumps(settings, sort_keys=True).encode()
         ).hexdigest()[:12]
         return self.models.joinpath(*repo.parts, f"{commit}--{selection}")
 
