@@ -36,7 +36,16 @@ After changing or updating the source, reinstall it with:
 
 ```bash
 cd ~/developer/modelctl
-uv tool install --force .
+uv tool install --force --refresh .
+```
+
+`--force` recreates the tool environment, while `--refresh` ensures uv rebuilds
+this local project instead of reusing cached dynamic version metadata. Verify
+the installed and checkout versions with:
+
+```bash
+modelctl --version
+uv run modelctl --version
 ```
 
 To run directly from the checkout without installing:
