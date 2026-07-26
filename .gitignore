@@ -6,3 +6,5 @@ dist/
 build/
 *.egg-info/
 graphify-out/
+.DS_Store
+._*
