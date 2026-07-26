@@ -476,6 +476,17 @@ modelctl sync-local --help
 
 From a source checkout, prefix these commands with `uv run`.
 
+## Versioning
+
+`modelctl` follows semantic versioning. While the project is in the `0.x`
+series, new functionality increments the minor version and compatible fixes
+increment the patch version. The queue and full preflight workflow were added
+in `0.2.0`.
+
+`src/modelctl/__init__.py` is the single version source. Hatch reads it when
+building the package, and `modelctl --version` imports the same value so package
+metadata and CLI output remain synchronized.
+
 ## Testing
 
 ```bash

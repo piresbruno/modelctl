@@ -5,6 +5,7 @@ import os
 import sys
 from pathlib import Path
 
+from . import __version__
 from .download_queue import (
     DownloadQueueError,
     execute_download_queue,
@@ -64,7 +65,9 @@ def build_parser() -> argparse.ArgumentParser:
 Use 'modelctl COMMAND --help' for command-specific examples.
 Set MODELCTL_ROOT to omit --root from commands.""",
     )
-    parser.add_argument("--version", action="version", version="modelctl 0.1.0")
+    parser.add_argument(
+        "--version", action="version", version=f"modelctl {__version__}"
+    )
     commands = parser.add_subparsers(dest="command", required=True)
 
     manifest = commands.add_parser(

@@ -1,5 +1,6 @@
 import pytest
 
+from modelctl import __version__
 from modelctl.cli import build_parser, run
 from modelctl.layout import Layout, atomic_symlink
 from modelctl.manifest import parse_manifest
@@ -38,6 +39,14 @@ def test_serve_command_prints_without_starting_server(tmp_path, capsys):
     captured = capsys.readouterr()
     assert captured.out == f"vllm serve {object_path}\n"
     assert captured.err == ""
+
+
+def test_cli_version_uses_package_version(capsys):
+    assert __version__ == "0.2.0"
+    with pytest.raises(SystemExit) as exit_info:
+        build_parser().parse_args(["--version"])
+    assert exit_info.value.code == 0
+    assert capsys.readouterr().out == f"modelctl {__version__}\n"
 
 
 def test_queue_help_documents_format_concurrency_and_examples(capsys):

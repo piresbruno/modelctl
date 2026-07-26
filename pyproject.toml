@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "modelctl"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Atomic Hugging Face model deployment for NAS and local inference hosts"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,6 +18,9 @@ modelctl = "modelctl.cli:main"
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
+
+[tool.hatch.version]
+path = "src/modelctl/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/modelctl"]

@@ -164,7 +164,6 @@ wheels = [
 
 [[package]]
 name = "modelctl"
-version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "huggingface-hub" },
