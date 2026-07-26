@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from .cards import sync_model_cards
 from .download_queue import (
     DownloadQueueError,
     execute_download_queue,
@@ -58,6 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
   modelctl download Qwen/Qwen3-8B --root /mnt/nas/llm-models
   modelctl download OWNER/MODEL-GGUF --quantization Q4_K_M --root /mnt/nas/llm-models
   modelctl queue downloads.yaml --jobs 2 --root /mnt/nas/llm-models
+  modelctl sync-cards --root /mnt/nas/llm-models
   modelctl path qwen3-8b --root /mnt/nas/llm-models
   modelctl serve-command qwen3-8b --root /mnt/nas/llm-models
   modelctl sync-local qwen3-8b --source-root /mnt/nas/llm-models --root /var/lib/llm-models
@@ -208,6 +210,37 @@ There is no fixed jobs limit; start with 2 or 3 to avoid contention.""",
     )
     _add_root(queue)
 
+    cards = commands.add_parser(
+        "sync-cards",
+        help="fetch model cards and create local run instructions",
+        description=(
+            "Backfill sidecar cards for active NAS models. The complete Hugging "
+            "Face README is preserved and RUN.md contains verified local modelctl "
+            "commands plus relevant upstream usage sections."
+        ),
+        formatter_class=HELP_FORMATTER,
+        epilog="""examples:
+  modelctl sync-cards --root /mnt/nas/llm-models
+  modelctl sync-cards qwen3-8b model-q4 --root /mnt/nas/llm-models
+  modelctl sync-cards qwen3-8b --force --root /mnt/nas/llm-models
+
+Without names, every active model under ROOT/active is inspected. Cards are
+published atomically under ROOT/cards/NAME without modifying model objects.
+Hugging Face content is fetched at the exact commit stored in object metadata.""",
+    )
+    cards.add_argument(
+        "names",
+        nargs="*",
+        metavar="NAME",
+        help="active model names (default: all active models)",
+    )
+    cards.add_argument(
+        "--force",
+        action="store_true",
+        help="rebuild cards that already match the active commit",
+    )
+    _add_root(cards)
+
     update = commands.add_parser(
         "update",
         help="resolve, download, validate, publish, and activate a model",
@@ -305,6 +338,22 @@ def run(argv: list[str] | None = None) -> int:
         )
         print(f"manifest: {manifest_path}")
         print(f"active: {active}")
+        return 0
+
+    if args.command == "sync-cards":
+        results = sync_model_cards(root, args.names, force=args.force)
+        counts = {status: 0 for status in ("updated", "unchanged", "unavailable", "failed")}
+        for result in results:
+            counts[result.status] += 1
+            detail = str(result.path) if result.path else result.message or ""
+            print(f"[{result.status}] {result.name}: {detail}")
+        print(
+            "cards: "
+            f"{counts['updated']} updated, {counts['unchanged']} unchanged, "
+            f"{counts['unavailable']} unavailable, {counts['failed']} failed"
+        )
+        if counts["failed"]:
+            raise ModelctlError(f"{counts['failed']} model card operation(s) failed")
         return 0
 
     if args.command == "queue":

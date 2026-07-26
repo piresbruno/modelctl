@@ -119,6 +119,11 @@ ROOT/
   active/NAME                          # atomically replaced symlink
   .staging/ORG/REPO/COMMIT--SELECTION/ # resumable, unpublished data
   state/NAME.json                      # state transition journal
+  cards/NAME -> .objects/NAME/COMMIT--HASH/
+  cards/.objects/NAME/COMMIT--HASH/
+    README.md                           # complete upstream model card
+    RUN.md                              # local and upstream run instructions
+    card.json                           # source and integrity metadata
 ```
 
 Staging and published objects are under one root so publication can use a
@@ -317,6 +322,40 @@ Execution behavior after preflight:
 - Interrupted entries retain resumable staging data. Rerunning the queue reuses
   valid published objects and resumes incomplete downloads.
 
+### Backfill model cards and run instructions
+
+Fetch cards for every active model in a NAS store:
+
+```bash
+modelctl sync-cards --root /mnt/nas/llm-models
+```
+
+Limit the operation to named models or force a fresh Hugging Face check:
+
+```bash
+modelctl sync-cards qwen3-8b-vllm model-q4 \
+  --force \
+  --root /mnt/nas/llm-models
+```
+
+Cards are published as sidecars under `ROOT/cards/NAME` without modifying the
+immutable model object. `README.md` preserves the complete Hugging Face model
+card from the exact commit recorded in the active object's metadata. If that
+card is already stored in the model object, it is reused without another
+network request.
+
+`RUN.md` contains copyable `modelctl path` and `modelctl serve-command`
+commands, runtime and entrypoint details, and relevant Usage, Quickstart,
+Inference, Transformers, vLLM, or llama.cpp sections copied from the upstream
+card. If the upstream card has no recognized run section, `RUN.md` says so and
+points to the complete README rather than inventing model-specific advice.
+`card.json` records provenance, detected instruction sections, and SHA-256
+hashes for both Markdown files.
+
+Repositories without a root `README.md` are reported as unavailable. A failure
+for one active model does not prevent the remaining cards from being processed;
+the command exits unsuccessfully when an operational failure occurred.
+
 ### Generate a manifest from Hugging Face
 
 Generate a manifest directly from a Hugging Face model id or URL:
@@ -492,6 +531,7 @@ copyable examples:
 modelctl --help
 modelctl download --help
 modelctl queue --help
+modelctl sync-cards --help
 modelctl manifest --help
 modelctl update --help
 modelctl path --help

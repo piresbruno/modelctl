@@ -1,6 +1,7 @@
 import pytest
 
 from modelctl import __version__
+from modelctl.cards import CardResult
 from modelctl.cli import build_parser, run
 from modelctl.layout import Layout, atomic_symlink
 from modelctl.manifest import parse_manifest
@@ -41,8 +42,27 @@ def test_serve_command_prints_without_starting_server(tmp_path, capsys):
     assert captured.err == ""
 
 
+def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
+    calls = []
+
+    def fake_sync(root, names, *, force=False):
+        calls.append((root, names, force))
+        return [
+            CardResult("a", "updated", root / "cards" / "a"),
+            CardResult("b", "unavailable", message="no README.md"),
+        ]
+
+    monkeypatch.setattr("modelctl.cli.sync_model_cards", fake_sync)
+    assert run(["sync-cards", "a", "b", "--force", "--root", str(tmp_path)]) == 0
+    output = capsys.readouterr().out
+    assert calls == [(tmp_path.absolute(), ["a", "b"], True)]
+    assert "[updated] a:" in output
+    assert "[unavailable] b: no README.md" in output
+    assert "1 updated, 0 unchanged, 1 unavailable, 0 failed" in output
+
+
 def test_cli_version_uses_package_version(capsys):
-    assert __version__ == "0.3.0"
+    assert __version__ == "0.4.0"
     with pytest.raises(SystemExit) as exit_info:
         build_parser().parse_args(["--version"])
     assert exit_info.value.code == 0
@@ -81,6 +101,7 @@ def test_top_level_help_has_description_and_examples(capsys):
         ("download", "modelctl download Qwen/Qwen3-8B"),
         ("manifest", "modelctl manifest Qwen/Qwen3-8B"),
         ("queue", "modelctl queue downloads.yaml"),
+        ("sync-cards", "modelctl sync-cards qwen3-8b model-q4"),
         ("update", "modelctl update qwen3-8b-vllm"),
         ("path", "MODEL_PATH=$(modelctl path"),
         ("serve-command", "modelctl serve-command model-q4"),

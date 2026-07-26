@@ -2,6 +2,17 @@
 
 This project follows semantic versioning.
 
+## 0.4.0
+
+### Added
+
+- `sync-cards` command to backfill sidecar cards for active NAS models at their
+  exact Hugging Face commits.
+- Complete upstream `README.md` preservation plus generated `RUN.md` files with
+  verified local commands and relevant upstream usage sections.
+- Atomic card publication with provenance, detected instruction headings, and
+  SHA-256 integrity metadata without modifying published model objects.
+
 ## 0.3.0
 
 ### Added
