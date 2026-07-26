@@ -506,7 +506,7 @@ From a source checkout, prefix these commands with `uv run`.
 `modelctl` follows semantic versioning. While the project is in the `0.x`
 series, new functionality increments the minor version and compatible fixes
 increment the patch version. The queue and full preflight workflow were added
-in `0.2.0`.
+in `0.2.0`; model cards and GGUF companion discovery were added in `0.3.0`.
 
 `src/modelctl/__init__.py` is the single version source. Hatch reads it when
 building the package, and `modelctl --version` imports the same value so package

@@ -42,7 +42,7 @@ def test_serve_command_prints_without_starting_server(tmp_path, capsys):
 
 
 def test_cli_version_uses_package_version(capsys):
-    assert __version__ == "0.2.0"
+    assert __version__ == "0.3.0"
     with pytest.raises(SystemExit) as exit_info:
         build_parser().parse_args(["--version"])
     assert exit_info.value.code == 0

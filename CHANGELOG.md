@@ -2,7 +2,7 @@
 
 This project follows semantic versioning.
 
-## Unreleased
+## 0.3.0
 
 ### Added
 
