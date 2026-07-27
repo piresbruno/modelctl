@@ -2,6 +2,14 @@
 
 This project follows semantic versioning.
 
+## 0.6.0
+
+### Added
+
+- `modelctl list` validates and displays active models in the configured NAS
+  store, with optional JSON output.
+- `modelctl list --local` displays models synchronized to the node-local store.
+
 ## 0.5.0
 
 ### Added

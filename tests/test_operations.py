@@ -9,7 +9,13 @@ import pytest
 from modelctl.errors import ModelctlError, ValidationError
 from modelctl.layout import Layout, atomic_symlink
 from modelctl.manifest import parse_manifest
-from modelctl.operations import active_entrypoint, serve_command, sync_local, update_model
+from modelctl.operations import (
+    active_entrypoint,
+    list_active_models,
+    serve_command,
+    sync_local,
+    update_model,
+)
 from modelctl.state import SyncState, UpdateState
 from modelctl.validation import ExpectedFile, write_metadata
 
@@ -215,6 +221,12 @@ def test_local_sync_excludes_hf_cache_and_updates_reference_last(tmp_path):
         SyncState.LOCAL_REFERENCE_UPDATE,
         SyncState.READY_FOR_SERVICE_RESTART,
     ]
+    inventory = list_active_models(local)
+    assert len(inventory) == 1
+    assert inventory[0].name == "demo"
+    assert inventory[0].repo == "org/demo"
+    assert inventory[0].commit == "d" * 40
+    assert inventory[0].path == result
 
 
 def test_interrupted_local_sync_keeps_previous_local_reference(tmp_path):

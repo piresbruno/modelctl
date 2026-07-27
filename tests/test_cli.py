@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -74,6 +75,51 @@ def test_root_precedence(tmp_path, monkeypatch):
     assert _root(str(explicit)) == explicit
 
 
+def test_list_prints_active_models(tmp_path, capsys):
+    object_path = _active_model(tmp_path)
+    assert run(["list", "--root", str(tmp_path)]) == 0
+    output = capsys.readouterr().out
+    assert "NAME" in output
+    assert "RUNTIME" in output
+    assert "REPOSITORY" in output
+    assert "demo" in output
+    assert "vllm" in output
+    assert "org/model" in output
+    assert "e" * 12 in output
+    assert str(object_path) in output
+
+
+def test_list_json_is_machine_readable(tmp_path, capsys):
+    object_path = _active_model(tmp_path)
+    assert run(["list", "--root", str(tmp_path), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == [
+        {
+            "name": "demo",
+            "repo": "org/model",
+            "revision": "main",
+            "commit": "e" * 40,
+            "format": "auto",
+            "runtime": "vllm",
+            "entrypoint": ".",
+            "path": str(object_path),
+        }
+    ]
+
+
+def test_list_local_uses_node_local_root(tmp_path, monkeypatch, capsys):
+    local = tmp_path / "local"
+    _active_model(local)
+    monkeypatch.setattr("modelctl.cli.DEFAULT_ROOT", str(local))
+    assert run(["list", "--local"]) == 0
+    assert "demo" in capsys.readouterr().out
+
+
+def test_list_empty_store(tmp_path, capsys):
+    assert run(["list", "--root", str(tmp_path)]) == 0
+    assert capsys.readouterr().out == f"No active models in {tmp_path}.\n"
+
+
 def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
     calls = []
 
@@ -94,7 +140,7 @@ def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_version_uses_package_version(capsys):
-    assert __version__ == "0.5.0"
+    assert __version__ == "0.6.0"
     with pytest.raises(SystemExit) as exit_info:
         build_parser().parse_args(["--version"])
     assert exit_info.value.code == 0
@@ -132,6 +178,7 @@ def test_top_level_help_has_description_and_examples(capsys):
     [
         ("download", "modelctl download Qwen/Qwen3-8B"),
         ("config", "modelctl config set-root"),
+        ("list", "modelctl list --local"),
         ("manifest", "modelctl manifest Qwen/Qwen3-8B"),
         ("queue", "modelctl queue downloads.yaml"),
         ("sync-cards", "modelctl sync-cards qwen3-8b model-q4"),

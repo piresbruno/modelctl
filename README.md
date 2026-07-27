@@ -470,6 +470,25 @@ configuration, and finally `/var/lib/llm-models`. The configuration is stored
 in `$XDG_CONFIG_HOME/modelctl/config.json`, or
 `~/.config/modelctl/config.json` when `XDG_CONFIG_HOME` is unset.
 
+List active models available on the configured NAS store:
+
+```bash
+modelctl list
+```
+
+On an inference node, list models that have been synchronized to its local
+store instead:
+
+```bash
+modelctl list --local
+```
+
+Use `modelctl list --root /srv/models` for another store, or `modelctl list
+--json` for machine-readable metadata. Listings include the model name,
+runtime, Hugging Face repository, commit, and resolved entrypoint. Only active,
+validated models are shown; inactive published objects and staging downloads
+are excluded.
+
 ## Moving existing models to the NAS
 
 ### Existing modelctl store
@@ -549,6 +568,7 @@ copyable examples:
 ```bash
 modelctl --help
 modelctl config --help
+modelctl list --help
 modelctl download --help
 modelctl queue --help
 modelctl sync-cards --help
@@ -568,7 +588,8 @@ series, new functionality increments the minor version and compatible fixes
 increment the patch version. The queue and full preflight workflow were added
 in `0.2.0`; model cards and GGUF companion discovery were added in `0.3.0`;
 active-model card backfilling with generated run instructions was added in
-`0.4.0`; and persistent default-root configuration was added in `0.5.0`.
+`0.4.0`; persistent default-root configuration was added in `0.5.0`; and NAS
+plus node-local active-model inventory was added in `0.6.0`.
 
 `src/modelctl/__init__.py` is the single version source. Hatch reads it when
 building the package, and `modelctl --version` imports the same value so package

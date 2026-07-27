@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 from . import __version__
@@ -23,7 +25,13 @@ from .generation import (
     write_generated_manifest,
 )
 from .manifest import load_manifest, validate_name
-from .operations import active_entrypoint, serve_command, sync_local, update_model
+from .operations import (
+    active_entrypoint,
+    list_active_models,
+    serve_command,
+    sync_local,
+    update_model,
+)
 
 DEFAULT_ROOT = "/var/lib/llm-models"
 HELP_FORMATTER = argparse.RawDescriptionHelpFormatter
@@ -50,6 +58,33 @@ def _add_root(parser: argparse.ArgumentParser) -> None:
             f"or {DEFAULT_ROOT})"
         ),
     )
+
+
+def _print_models(root: Path, *, json_output: bool) -> None:
+    models = list_active_models(root)
+    if json_output:
+        payload = [
+            {**asdict(model), "path": str(model.path)}
+            for model in models
+        ]
+        print(json.dumps(payload, indent=2))
+        return
+    if not models:
+        print(f"No active models in {root}.")
+        return
+    rows = [
+        (model.name, model.runtime, model.repo, model.commit[:12], str(model.path))
+        for model in models
+    ]
+    headers = ("NAME", "RUNTIME", "REPOSITORY", "COMMIT", "PATH")
+    widths = [
+        max(len(headers[index]), *(len(row[index]) for row in rows))
+        for index in range(len(headers) - 1)
+    ]
+    template = "  ".join(f"{{{index}:<{width}}}" for index, width in enumerate(widths))
+    print(template.format(*headers[:-1]) + "  " + headers[-1])
+    for row in rows:
+        print(template.format(*row[:-1]) + "  " + row[-1])
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -93,6 +128,32 @@ over the saved root.""",
     set_root = config_commands.add_parser("set-root", help="save the default model root")
     set_root.add_argument("path", metavar="PATH")
     config_commands.add_parser("get-root", help="print the effective default model root")
+
+    list_models = commands.add_parser(
+        "list",
+        help="list active models in the NAS or local store",
+        description=(
+            "Validate and list active models. The configured model store is used "
+            "by default; --local selects the node-local store."
+        ),
+        formatter_class=HELP_FORMATTER,
+        epilog="""examples:
+  modelctl list
+  modelctl list --local
+  modelctl list --root /srv/models
+  modelctl list --json
+
+Only active, validated models are listed. Published objects that are not active
+and incomplete staging downloads are excluded.""",
+    )
+    list_location = list_models.add_mutually_exclusive_group()
+    list_location.add_argument(
+        "--local",
+        action="store_true",
+        help=f"list the node-local store at {DEFAULT_ROOT}",
+    )
+    list_location.add_argument("--root", metavar="PATH", help="model store root")
+    list_models.add_argument("--json", action="store_true", help="emit JSON")
 
     manifest = commands.add_parser(
         "manifest",
@@ -353,6 +414,11 @@ def run(argv: list[str] | None = None) -> int:
             print(f"config: {saved}")
         else:
             print(_root(None))
+        return 0
+
+    if args.command == "list":
+        root = Path(DEFAULT_ROOT) if args.local else _root(args.root)
+        _print_models(root, json_output=args.json)
         return 0
 
     root = _root(args.root)

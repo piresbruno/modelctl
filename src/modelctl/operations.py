@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -20,6 +21,18 @@ from .validation import (
     validate_object,
     write_metadata,
 )
+
+
+@dataclass(frozen=True)
+class ActiveModel:
+    name: str
+    repo: str
+    revision: str
+    commit: str
+    format: str
+    runtime: str
+    entrypoint: str
+    path: Path
 
 
 def _fsync_directory(path: Path) -> None:
@@ -140,6 +153,31 @@ def active_entrypoint(root: Path, name: str) -> Path:
     entrypoint = metadata["entrypoint"]
     path = object_path if entrypoint == "." else object_path / entrypoint
     return path.resolve(strict=True)
+
+
+def list_active_models(root: Path) -> list[ActiveModel]:
+    layout = Layout(root)
+    if not layout.active.exists():
+        return []
+    models = []
+    for reference in sorted(layout.active.iterdir(), key=lambda path: path.name):
+        object_path, metadata = _active_object(layout, reference.name)
+        profile = runtime_from_metadata(metadata)
+        entrypoint = metadata["entrypoint"]
+        path = object_path if entrypoint == "." else object_path / entrypoint
+        models.append(
+            ActiveModel(
+                name=reference.name,
+                repo=str(metadata.get("repo", "")),
+                revision=str(metadata.get("revision", "")),
+                commit=str(metadata.get("commit", "")),
+                format=str(metadata.get("format", "")),
+                runtime=profile.kind,
+                entrypoint=entrypoint,
+                path=path.resolve(strict=True),
+            )
+        )
+    return models
 
 
 def serve_argv(root: Path, name: str) -> list[str]:
