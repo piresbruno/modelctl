@@ -5,7 +5,7 @@ import pytest
 
 from modelctl import __version__
 from modelctl.cards import CardResult
-from modelctl.cli import DEFAULT_ROOT, _root, build_parser, run
+from modelctl.cli import DEFAULT_ROOT, _local_root, _root, build_parser, run
 from modelctl.layout import Layout, atomic_symlink
 from modelctl.manifest import parse_manifest
 from modelctl.validation import ExpectedFile, write_metadata
@@ -59,6 +59,14 @@ def test_config_saves_and_uses_default_root(tmp_path, monkeypatch, capsys):
     assert run(["config", "get-root"]) == 0
     assert capsys.readouterr().out == f"{model_root}\n"
 
+    local_root = tmp_path / "local" / "models"
+    assert run(["config", "set-local-root", str(local_root)]) == 0
+    capsys.readouterr()
+    assert _local_root(None) == local_root
+    assert _root(None) == model_root
+    assert run(["config", "get-local-root"]) == 0
+    assert capsys.readouterr().out == f"{local_root}\n"
+
 
 def test_root_precedence(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
@@ -76,7 +84,7 @@ def test_root_precedence(tmp_path, monkeypatch):
 
 
 def test_list_prints_active_models(tmp_path, capsys):
-    object_path = _active_model(tmp_path)
+    _active_model(tmp_path)
     assert run(["list", "--root", str(tmp_path)]) == 0
     output = capsys.readouterr().out
     assert "NAME" in output
@@ -85,24 +93,19 @@ def test_list_prints_active_models(tmp_path, capsys):
     assert "demo" in output
     assert "vllm" in output
     assert "org/model" in output
-    assert "e" * 12 in output
-    assert str(object_path) in output
+    assert "COMMIT" not in output
+    assert "PATH" not in output
 
 
 def test_list_json_is_machine_readable(tmp_path, capsys):
-    object_path = _active_model(tmp_path)
+    _active_model(tmp_path)
     assert run(["list", "--root", str(tmp_path), "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload == [
         {
             "name": "demo",
-            "repo": "org/model",
-            "revision": "main",
-            "commit": "e" * 40,
-            "format": "auto",
             "runtime": "vllm",
-            "entrypoint": ".",
-            "path": str(object_path),
+            "repository": "org/model",
         }
     ]
 
@@ -110,7 +113,9 @@ def test_list_json_is_machine_readable(tmp_path, capsys):
 def test_list_local_uses_node_local_root(tmp_path, monkeypatch, capsys):
     local = tmp_path / "local"
     _active_model(local)
-    monkeypatch.setattr("modelctl.cli.DEFAULT_ROOT", str(local))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    run(["config", "set-local-root", str(local)])
+    capsys.readouterr()
     assert run(["list", "--local"]) == 0
     assert "demo" in capsys.readouterr().out
 
@@ -118,6 +123,25 @@ def test_list_local_uses_node_local_root(tmp_path, monkeypatch, capsys):
 def test_list_empty_store(tmp_path, capsys):
     assert run(["list", "--root", str(tmp_path)]) == 0
     assert capsys.readouterr().out == f"No active models in {tmp_path}.\n"
+
+
+def test_sync_local_uses_saved_nas_and_local_roots(tmp_path, monkeypatch, capsys):
+    nas = tmp_path / "nas"
+    local = tmp_path / "local"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    run(["config", "set-root", str(nas)])
+    run(["config", "set-local-root", str(local)])
+    capsys.readouterr()
+    calls = []
+
+    def fake_sync(source_root, local_root, name, *, rsync):
+        calls.append((source_root, local_root, name, rsync))
+        return local_root / "active" / name
+
+    monkeypatch.setattr("modelctl.cli.sync_local", fake_sync)
+    assert run(["sync-local", "demo"]) == 0
+    assert calls == [(nas, local, "demo", "rsync")]
+    assert capsys.readouterr().out == f"{local / 'active' / 'demo'}\n"
 
 
 def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
@@ -140,7 +164,7 @@ def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_version_uses_package_version(capsys):
-    assert __version__ == "0.6.0"
+    assert __version__ == "0.7.0"
     with pytest.raises(SystemExit) as exit_info:
         build_parser().parse_args(["--version"])
     assert exit_info.value.code == 0

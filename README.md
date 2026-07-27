@@ -463,6 +463,8 @@ Save the NAS model store once and omit `--root` from subsequent commands:
 ```bash
 modelctl config set-root /mnt/nas/llm-models
 modelctl config get-root
+modelctl config set-local-root /var/lib/llm-models
+modelctl config get-local-root
 ```
 
 The root precedence is an explicit `--root`, `MODELCTL_ROOT`, the saved user
@@ -483,11 +485,15 @@ store instead:
 modelctl list --local
 ```
 
+The local root uses an explicit sync `--root`, `MODELCTL_LOCAL_ROOT`, the saved
+local configuration, and finally `/var/lib/llm-models`. Once both roots are
+saved, `modelctl sync-local NAME` copies from the NAS to the local store without
+additional path arguments.
+
 Use `modelctl list --root /srv/models` for another store, or `modelctl list
---json` for machine-readable metadata. Listings include the model name,
-runtime, Hugging Face repository, commit, and resolved entrypoint. Only active,
-validated models are shown; inactive published objects and staging downloads
-are excluded.
+--json` for machine-readable output. Listings contain only the model name,
+runtime, and Hugging Face repository. Only active, validated models are shown;
+inactive published objects and staging downloads are excluded.
 
 ## Moving existing models to the NAS
 
@@ -588,8 +594,9 @@ series, new functionality increments the minor version and compatible fixes
 increment the patch version. The queue and full preflight workflow were added
 in `0.2.0`; model cards and GGUF companion discovery were added in `0.3.0`;
 active-model card backfilling with generated run instructions was added in
-`0.4.0`; persistent default-root configuration was added in `0.5.0`; and NAS
-plus node-local active-model inventory was added in `0.6.0`.
+`0.4.0`; persistent default-root configuration was added in `0.5.0`; NAS plus
+node-local active-model inventory was added in `0.6.0`; and persistent local
+roots with concise inventory output were added in `0.7.0`.
 
 `src/modelctl/__init__.py` is the single version source. Hatch reads it when
 building the package, and `modelctl --version` imports the same value so package

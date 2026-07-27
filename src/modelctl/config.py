@@ -14,27 +14,45 @@ def config_path() -> Path:
     return Path.home() / ".config" / "modelctl" / "config.json"
 
 
-def load_root() -> str | None:
+def _load() -> dict[str, object]:
     path = config_path()
     if not path.exists():
-        return None
+        return {}
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ModelctlError(f"cannot read configuration {path}: {exc}") from exc
-    root = document.get("root") if isinstance(document, dict) else None
-    if not isinstance(root, str) or not root.strip():
-        raise ModelctlError(f"configuration {path} has no valid root")
-    return root
+    if not isinstance(document, dict):
+        raise ModelctlError(f"configuration {path} must contain a JSON object")
+    return document
 
 
-def save_root(root: Path) -> Path:
+def _load_path(key: str) -> str | None:
+    value = _load().get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ModelctlError(f"configuration {config_path()} has no valid {key}")
+    return value
+
+
+def load_root() -> str | None:
+    return _load_path("root")
+
+
+def load_local_root() -> str | None:
+    return _load_path("local_root")
+
+
+def _save_path(key: str, root: Path) -> Path:
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
     try:
+        document = _load()
+        document[key] = str(root)
         temporary.write_text(
-            json.dumps({"root": str(root)}, indent=2) + "\n",
+            json.dumps(document, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
         temporary.chmod(0o600)
@@ -44,3 +62,11 @@ def save_root(root: Path) -> Path:
     finally:
         temporary.unlink(missing_ok=True)
     return path
+
+
+def save_root(root: Path) -> Path:
+    return _save_path("root", root)
+
+
+def save_local_root(root: Path) -> Path:
+    return _save_path("local_root", root)

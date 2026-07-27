@@ -2,6 +2,14 @@
 
 This project follows semantic versioning.
 
+## 0.7.0
+
+### Changed
+
+- `modelctl list` now displays only model name, runtime, and repository.
+- The node-local model root can be persisted with `modelctl config
+  set-local-root PATH`; `list --local` and `sync-local` use it automatically.
+
 ## 0.6.0
 
 ### Added

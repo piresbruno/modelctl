@@ -4,12 +4,11 @@ import argparse
 import json
 import os
 import sys
-from dataclasses import asdict
 from pathlib import Path
 
 from . import __version__
 from .cards import sync_model_cards
-from .config import load_root, save_root
+from .config import load_local_root, load_root, save_local_root, save_root
 from .download_queue import (
     DownloadQueueError,
     execute_download_queue,
@@ -42,6 +41,16 @@ def _root(value: str | None) -> Path:
     return Path(selected).expanduser().absolute()
 
 
+def _local_root(value: str | None) -> Path:
+    selected = (
+        value
+        or os.environ.get("MODELCTL_LOCAL_ROOT")
+        or load_local_root()
+        or DEFAULT_ROOT
+    )
+    return Path(selected).expanduser().absolute()
+
+
 def _positive_int(value: str) -> int:
     number = int(value)
     if number < 1:
@@ -60,11 +69,22 @@ def _add_root(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_local_root(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--root",
+        metavar="PATH",
+        help=(
+            "local model store root (default: $MODELCTL_LOCAL_ROOT, saved local "
+            f"configuration, or {DEFAULT_ROOT})"
+        ),
+    )
+
+
 def _print_models(root: Path, *, json_output: bool) -> None:
     models = list_active_models(root)
     if json_output:
         payload = [
-            {**asdict(model), "path": str(model.path)}
+            {"name": model.name, "runtime": model.runtime, "repository": model.repo}
             for model in models
         ]
         print(json.dumps(payload, indent=2))
@@ -72,19 +92,16 @@ def _print_models(root: Path, *, json_output: bool) -> None:
     if not models:
         print(f"No active models in {root}.")
         return
-    rows = [
-        (model.name, model.runtime, model.repo, model.commit[:12], str(model.path))
-        for model in models
-    ]
-    headers = ("NAME", "RUNTIME", "REPOSITORY", "COMMIT", "PATH")
+    rows = [(model.name, model.runtime, model.repo) for model in models]
+    headers = ("NAME", "RUNTIME", "REPOSITORY")
     widths = [
         max(len(headers[index]), *(len(row[index]) for row in rows))
-        for index in range(len(headers) - 1)
+        for index in range(len(headers))
     ]
     template = "  ".join(f"{{{index}:<{width}}}" for index, width in enumerate(widths))
-    print(template.format(*headers[:-1]) + "  " + headers[-1])
+    print(template.format(*headers))
     for row in rows:
-        print(template.format(*row[:-1]) + "  " + row[-1])
+        print(template.format(*row))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -120,14 +137,24 @@ Use 'modelctl config set-root PATH' to save the NAS root once.""",
         epilog="""examples:
   modelctl config set-root /mnt/nas/llm-models
   modelctl config get-root
+  modelctl config set-local-root /var/lib/llm-models
+  modelctl config get-local-root
 
 An explicit --root takes precedence over MODELCTL_ROOT, which takes precedence
-over the saved root.""",
+over the saved NAS root. MODELCTL_LOCAL_ROOT similarly overrides the saved
+local root.""",
     )
     config_commands = config.add_subparsers(dest="config_command", required=True)
     set_root = config_commands.add_parser("set-root", help="save the default model root")
     set_root.add_argument("path", metavar="PATH")
     config_commands.add_parser("get-root", help="print the effective default model root")
+    set_local_root = config_commands.add_parser(
+        "set-local-root", help="save the node-local model root"
+    )
+    set_local_root.add_argument("path", metavar="PATH")
+    config_commands.add_parser(
+        "get-local-root", help="print the effective node-local model root"
+    )
 
     list_models = commands.add_parser(
         "list",
@@ -150,7 +177,7 @@ and incomplete staging downloads are excluded.""",
     list_location.add_argument(
         "--local",
         action="store_true",
-        help=f"list the node-local store at {DEFAULT_ROOT}",
+        help="list the configured node-local store",
     )
     list_location.add_argument("--root", metavar="PATH", help="model store root")
     list_models.add_argument("--json", action="store_true", help="emit JSON")
@@ -388,8 +415,8 @@ Review a generated command before evaluating or executing it.""",
         formatter_class=HELP_FORMATTER,
         epilog="""examples:
   modelctl sync-local qwen3-8b-vllm \\
-    --source-root /mnt/nas/llm-models \\
-    --root /var/lib/llm-models
+    --source-root /mnt/nas/llm-models --root /var/lib/llm-models
+  modelctl sync-local qwen3-8b-vllm
   modelctl sync model-q4 --from-root /mnt/nas/llm-models --root /srv/models
 
 Hugging Face local_dir cache metadata is excluded from local runtime copies.
@@ -397,28 +424,43 @@ The inference service is not restarted or reloaded.""",
     )
     sync.add_argument("name")
     sync.add_argument(
-        "--source-root", "--from-root", required=True, metavar="PATH", dest="source_root"
+        "--source-root", "--from-root", metavar="PATH", dest="source_root",
+        help="NAS source root (default: configured NAS root)",
     )
     sync.add_argument("--rsync", default="rsync", help="rsync executable")
-    _add_root(sync)
+    _add_local_root(sync)
     return parser
 
 
 def run(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "config":
-        if args.config_command == "set-root":
+        if args.config_command in {"set-root", "set-local-root"}:
             root = Path(args.path).expanduser().absolute()
-            saved = save_root(root)
-            print(f"root: {root}")
+            local = args.config_command == "set-local-root"
+            saved = save_local_root(root) if local else save_root(root)
+            print(f"{'local_root' if local else 'root'}: {root}")
             print(f"config: {saved}")
+        elif args.config_command == "get-local-root":
+            print(_local_root(None))
         else:
             print(_root(None))
         return 0
 
     if args.command == "list":
-        root = Path(DEFAULT_ROOT) if args.local else _root(args.root)
+        root = _local_root(None) if args.local else _root(args.root)
         _print_models(root, json_output=args.json)
+        return 0
+
+    if args.command in {"sync-local", "sync"}:
+        validate_name(args.name)
+        result = sync_local(
+            _root(args.source_root),
+            _local_root(args.root),
+            args.name,
+            rsync=args.rsync,
+        )
+        print(result)
         return 0
 
     root = _root(args.root)
@@ -522,11 +564,6 @@ def run(argv: list[str] | None = None) -> int:
         print(active_entrypoint(root, args.name))
     elif args.command == "serve-command":
         print(serve_command(root, args.name))
-    elif args.command in {"sync-local", "sync"}:
-        result = sync_local(
-            _root(args.source_root), root, args.name, rsync=args.rsync
-        )
-        print(result)
     return 0
 
 
