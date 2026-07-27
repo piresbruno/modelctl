@@ -1,8 +1,10 @@
+from pathlib import Path
+
 import pytest
 
 from modelctl import __version__
 from modelctl.cards import CardResult
-from modelctl.cli import build_parser, run
+from modelctl.cli import DEFAULT_ROOT, _root, build_parser, run
 from modelctl.layout import Layout, atomic_symlink
 from modelctl.manifest import parse_manifest
 from modelctl.validation import ExpectedFile, write_metadata
@@ -42,6 +44,36 @@ def test_serve_command_prints_without_starting_server(tmp_path, capsys):
     assert captured.err == ""
 
 
+def test_config_saves_and_uses_default_root(tmp_path, monkeypatch, capsys):
+    config_home = tmp_path / "config"
+    model_root = tmp_path / "nas" / "models"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    monkeypatch.delenv("MODELCTL_ROOT", raising=False)
+
+    assert run(["config", "set-root", str(model_root)]) == 0
+    output = capsys.readouterr().out
+    assert f"root: {model_root}\n" in output
+    assert _root(None) == model_root
+
+    assert run(["config", "get-root"]) == 0
+    assert capsys.readouterr().out == f"{model_root}\n"
+
+
+def test_root_precedence(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.delenv("MODELCTL_ROOT", raising=False)
+    assert _root(None) == Path(DEFAULT_ROOT)
+
+    saved = tmp_path / "saved"
+    run(["config", "set-root", str(saved)])
+    environment = tmp_path / "environment"
+    monkeypatch.setenv("MODELCTL_ROOT", str(environment))
+    assert _root(None) == environment
+
+    explicit = tmp_path / "explicit"
+    assert _root(str(explicit)) == explicit
+
+
 def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
     calls = []
 
@@ -62,7 +94,7 @@ def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_version_uses_package_version(capsys):
-    assert __version__ == "0.4.0"
+    assert __version__ == "0.5.0"
     with pytest.raises(SystemExit) as exit_info:
         build_parser().parse_args(["--version"])
     assert exit_info.value.code == 0
@@ -99,6 +131,7 @@ def test_top_level_help_has_description_and_examples(capsys):
     ("command", "example"),
     [
         ("download", "modelctl download Qwen/Qwen3-8B"),
+        ("config", "modelctl config set-root"),
         ("manifest", "modelctl manifest Qwen/Qwen3-8B"),
         ("queue", "modelctl queue downloads.yaml"),
         ("sync-cards", "modelctl sync-cards qwen3-8b model-q4"),

@@ -76,7 +76,7 @@ Mount the NAS, choose the managed store root, and give `download` a Hugging
 Face model id or URL:
 
 ```bash
-export MODELCTL_ROOT=/mnt/nas/llm-models
+modelctl config set-root /mnt/nas/llm-models
 
 modelctl download Qwen/Qwen3-8B
 # URLs are accepted too:
@@ -458,7 +458,17 @@ The local copy uses `rsync --archive --delete --partial`, excludes
 changes the local reference last. It does not restart or reload an inference
 service.
 
-`MODELCTL_ROOT` can provide the default root for all commands.
+Save the NAS model store once and omit `--root` from subsequent commands:
+
+```bash
+modelctl config set-root /mnt/nas/llm-models
+modelctl config get-root
+```
+
+The root precedence is an explicit `--root`, `MODELCTL_ROOT`, the saved user
+configuration, and finally `/var/lib/llm-models`. The configuration is stored
+in `$XDG_CONFIG_HOME/modelctl/config.json`, or
+`~/.config/modelctl/config.json` when `XDG_CONFIG_HOME` is unset.
 
 ## Moving existing models to the NAS
 
@@ -538,6 +548,7 @@ copyable examples:
 
 ```bash
 modelctl --help
+modelctl config --help
 modelctl download --help
 modelctl queue --help
 modelctl sync-cards --help
@@ -556,8 +567,8 @@ From a source checkout, prefix these commands with `uv run`.
 series, new functionality increments the minor version and compatible fixes
 increment the patch version. The queue and full preflight workflow were added
 in `0.2.0`; model cards and GGUF companion discovery were added in `0.3.0`;
-and active-model card backfilling with generated run instructions was added in
-`0.4.0`.
+active-model card backfilling with generated run instructions was added in
+`0.4.0`; and persistent default-root configuration was added in `0.5.0`.
 
 `src/modelctl/__init__.py` is the single version source. Hatch reads it when
 building the package, and `modelctl --version` imports the same value so package

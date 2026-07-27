@@ -2,6 +2,14 @@
 
 This project follows semantic versioning.
 
+## 0.5.0
+
+### Added
+
+- `modelctl config set-root PATH` persists the default NAS model store so
+  commands no longer require repeated `--root` arguments.
+- `modelctl config get-root` prints the effective default model store.
+
 ## 0.4.0
 
 ### Added

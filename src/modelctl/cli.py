@@ -7,6 +7,7 @@ from pathlib import Path
 
 from . import __version__
 from .cards import sync_model_cards
+from .config import load_root, save_root
 from .download_queue import (
     DownloadQueueError,
     execute_download_queue,
@@ -29,7 +30,8 @@ HELP_FORMATTER = argparse.RawDescriptionHelpFormatter
 
 
 def _root(value: str | None) -> Path:
-    return Path(value or os.environ.get("MODELCTL_ROOT", DEFAULT_ROOT)).expanduser().absolute()
+    selected = value or os.environ.get("MODELCTL_ROOT") or load_root() or DEFAULT_ROOT
+    return Path(selected).expanduser().absolute()
 
 
 def _positive_int(value: str) -> int:
@@ -43,7 +45,10 @@ def _add_root(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--root",
         metavar="PATH",
-        help=f"model store root (default: $MODELCTL_ROOT or {DEFAULT_ROOT})",
+        help=(
+            "model store root (default: $MODELCTL_ROOT, saved configuration, "
+            f"or {DEFAULT_ROOT})"
+        ),
     )
 
 
@@ -65,12 +70,29 @@ def build_parser() -> argparse.ArgumentParser:
   modelctl sync-local qwen3-8b --source-root /mnt/nas/llm-models --root /var/lib/llm-models
 
 Use 'modelctl COMMAND --help' for command-specific examples.
-Set MODELCTL_ROOT to omit --root from commands.""",
+Use 'modelctl config set-root PATH' to save the NAS root once.""",
     )
     parser.add_argument(
         "--version", action="version", version=f"modelctl {__version__}"
     )
     commands = parser.add_subparsers(dest="command", required=True)
+
+    config = commands.add_parser(
+        "config",
+        help="save or display modelctl configuration",
+        description="Save the default model store root or display its current value.",
+        formatter_class=HELP_FORMATTER,
+        epilog="""examples:
+  modelctl config set-root /mnt/nas/llm-models
+  modelctl config get-root
+
+An explicit --root takes precedence over MODELCTL_ROOT, which takes precedence
+over the saved root.""",
+    )
+    config_commands = config.add_subparsers(dest="config_command", required=True)
+    set_root = config_commands.add_parser("set-root", help="save the default model root")
+    set_root.add_argument("path", metavar="PATH")
+    config_commands.add_parser("get-root", help="print the effective default model root")
 
     manifest = commands.add_parser(
         "manifest",
@@ -323,6 +345,16 @@ The inference service is not restarted or reloaded.""",
 
 def run(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "config":
+        if args.config_command == "set-root":
+            root = Path(args.path).expanduser().absolute()
+            saved = save_root(root)
+            print(f"root: {root}")
+            print(f"config: {saved}")
+        else:
+            print(_root(None))
+        return 0
+
     root = _root(args.root)
     if args.command == "download":
         manifest_path, active = download_from_hf(
