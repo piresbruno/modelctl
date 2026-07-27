@@ -578,6 +578,32 @@ that is not recoverable from a known Hugging Face repository cannot currently
 be adopted as a managed object; it can be archived elsewhere on the NAS but
 will not work with `modelctl path`, `update`, or `serve-command`.
 
+### Comparing a Hugging Face cache with the NAS
+
+List the repositories in the local Hugging Face cache:
+
+```bash
+hf cache list
+```
+
+Keep comparison results in the same table format. For example:
+
+```text
+ID         SIZE LAST_ACCESSED LAST_MODIFIED REFS
+---------- ---- ------------- ------------- ----
+model/gpt2 2.9M 22 hours ago  5 weeks ago   main
+```
+
+Compare the `ID` column with repositories under the modelctl `ROOT/models`
+directory. A cache ID such as `model/Qwen/Qwen3.6-27B-FP8` corresponds to
+`ROOT/models/Qwen/Qwen3.6-27B-FP8`; a root-level ID such as `model/gpt2`
+corresponds to `ROOT/models/gpt2`.
+
+Repository-ID comparison includes small or incomplete cache entries that may
+contain only metadata or references. It does not prove that cached and NAS
+revisions or selected weight files are identical; compare the resolved revision
+and modelctl object metadata when exact equivalence is required.
+
 ## CLI help
 
 The top-level and every subcommand provide descriptions, option details, and
@@ -610,7 +636,8 @@ active-model card backfilling with generated run instructions was added in
 `0.4.0`; persistent default-root configuration was added in `0.5.0`; NAS plus
 node-local active-model inventory was added in `0.6.0`; persistent local roots
 with concise inventory output were added in `0.7.0`; and safe local model
-deletion was added in `0.8.0`.
+deletion was added in `0.8.0`. Documentation for comparing Hugging Face cache
+repository IDs with a NAS store was added in `0.8.1`.
 
 `src/modelctl/__init__.py` is the single version source. Hatch reads it when
 building the package, and `modelctl --version` imports the same value so package

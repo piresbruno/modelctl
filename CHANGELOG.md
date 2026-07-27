@@ -2,6 +2,14 @@
 
 This project follows semantic versioning.
 
+## 0.8.1
+
+### Documentation
+
+- Documented how to compare Hugging Face cache repository IDs with repositories
+  already present in a modelctl NAS store, using the `hf cache list` output
+  format.
+
 ## 0.8.0
 
 ### Added
