@@ -144,6 +144,23 @@ def test_sync_local_uses_saved_nas_and_local_roots(tmp_path, monkeypatch, capsys
     assert capsys.readouterr().out == f"{local / 'active' / 'demo'}\n"
 
 
+def test_delete_local_uses_saved_local_root(tmp_path, monkeypatch, capsys):
+    local = tmp_path / "local"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    run(["config", "set-local-root", str(local)])
+    capsys.readouterr()
+    calls = []
+
+    def fake_delete(root, name):
+        calls.append((root, name))
+        return root / "models" / name
+
+    monkeypatch.setattr("modelctl.cli.delete_local", fake_delete)
+    assert run(["delete-local", "demo"]) == 0
+    assert calls == [(local, "demo")]
+    assert capsys.readouterr().out == f"deleted: {local / 'models' / 'demo'}\n"
+
+
 def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
     calls = []
 
@@ -164,7 +181,7 @@ def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_version_uses_package_version(capsys):
-    assert __version__ == "0.7.0"
+    assert __version__ == "0.8.0"
     with pytest.raises(SystemExit) as exit_info:
         build_parser().parse_args(["--version"])
     assert exit_info.value.code == 0
@@ -202,6 +219,7 @@ def test_top_level_help_has_description_and_examples(capsys):
     [
         ("download", "modelctl download Qwen/Qwen3-8B"),
         ("config", "modelctl config set-root"),
+        ("delete-local", "modelctl delete-local qwen3-8b-vllm"),
         ("list", "modelctl list --local"),
         ("manifest", "modelctl manifest Qwen/Qwen3-8B"),
         ("queue", "modelctl queue downloads.yaml"),

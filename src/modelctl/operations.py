@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -178,6 +179,44 @@ def list_active_models(root: Path) -> list[ActiveModel]:
             )
         )
     return models
+
+
+def delete_local(root: Path, name: str) -> Path:
+    layout = Layout(root)
+    layout.prepare()
+    with model_lock(layout, name):
+        object_path, _ = _active_object(layout, name)
+        for reference in layout.active.iterdir():
+            if reference.name == name or not reference.is_symlink():
+                continue
+            try:
+                shared_target = reference.resolve(strict=True)
+            except OSError:
+                continue
+            if shared_target == object_path:
+                raise ModelctlError(
+                    f"cannot delete local model {name!r}; object is also active "
+                    f"as {reference.name!r}"
+                )
+
+        layout.active_path(name).unlink()
+        _fsync_directory(layout.active)
+        try:
+            shutil.rmtree(object_path)
+            _fsync_directory(object_path.parent)
+        except OSError as exc:
+            raise ModelctlError(
+                f"active reference was removed, but local object deletion failed "
+                f"at {object_path}: {exc}"
+            ) from exc
+        try:
+            layout.state_path(name).unlink(missing_ok=True)
+        except OSError as exc:
+            raise ModelctlError(
+                f"local object was deleted, but state cleanup failed at "
+                f"{layout.state_path(name)}: {exc}"
+            ) from exc
+        return object_path
 
 
 def serve_argv(root: Path, name: str) -> list[str]:

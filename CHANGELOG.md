@@ -2,6 +2,13 @@
 
 This project follows semantic versioning.
 
+## 0.8.0
+
+### Added
+
+- `modelctl delete-local NAME` safely removes a synchronized model from the
+  configured local store without modifying its NAS source.
+
 ## 0.7.0
 
 ### Changed

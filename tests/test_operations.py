@@ -11,6 +11,7 @@ from modelctl.layout import Layout, atomic_symlink
 from modelctl.manifest import parse_manifest
 from modelctl.operations import (
     active_entrypoint,
+    delete_local,
     list_active_models,
     serve_command,
     sync_local,
@@ -227,6 +228,51 @@ def test_local_sync_excludes_hf_cache_and_updates_reference_last(tmp_path):
     assert inventory[0].repo == "org/demo"
     assert inventory[0].commit == "d" * 40
     assert inventory[0].path == result
+
+
+def test_delete_local_removes_local_model_and_preserves_nas(tmp_path):
+    nas = tmp_path / "nas"
+    local = tmp_path / "local"
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot({"config.json": b"data"}),
+    )
+
+    def copy(command, check):
+        assert check is True
+        source = Path(command[-2].removesuffix("/"))
+        destination = Path(command[-1].removesuffix("/"))
+        shutil.copytree(source, destination, dirs_exist_ok=True)
+
+    sync_local(nas, local, "demo", runner=copy)
+    local_object = (local / "active" / "demo").resolve()
+    nas_object = (nas / "active" / "demo").resolve()
+
+    assert delete_local(local, "demo") == local_object
+    assert not (local / "active" / "demo").exists()
+    assert not local_object.exists()
+    assert not (local / "state" / "demo.json").exists()
+    assert (nas / "active" / "demo").resolve() == nas_object
+    assert nas_object.exists()
+
+
+def test_delete_local_refuses_object_used_by_another_active_name(tmp_path):
+    update_model(
+        tmp_path,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot({"config.json": b"data"}),
+    )
+    object_path = (tmp_path / "active" / "demo").resolve()
+    atomic_symlink(object_path, tmp_path / "active" / "alias")
+
+    with pytest.raises(ModelctlError, match="also active as 'alias'"):
+        delete_local(tmp_path, "demo")
+
+    assert (tmp_path / "active" / "demo").is_symlink()
+    assert object_path.exists()
 
 
 def test_interrupted_local_sync_keeps_previous_local_reference(tmp_path):

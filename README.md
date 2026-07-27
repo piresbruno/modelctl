@@ -495,6 +495,18 @@ Use `modelctl list --root /srv/models` for another store, or `modelctl list
 runtime, and Hugging Face repository. Only active, validated models are shown;
 inactive published objects and staging downloads are excluded.
 
+Delete a synchronized model from the local store while preserving its NAS
+source:
+
+```bash
+modelctl delete-local MODEL_NAME
+```
+
+The command uses the configured local root by default. Use `--root PATH` to
+select another local store. It validates the active object is inside that store,
+refuses to remove an object shared by another active name, then removes the
+active reference, model data, and local state. It never modifies the NAS store.
+
 ## Moving existing models to the NAS
 
 ### Existing modelctl store
@@ -575,6 +587,7 @@ copyable examples:
 modelctl --help
 modelctl config --help
 modelctl list --help
+modelctl delete-local --help
 modelctl download --help
 modelctl queue --help
 modelctl sync-cards --help
@@ -595,8 +608,9 @@ increment the patch version. The queue and full preflight workflow were added
 in `0.2.0`; model cards and GGUF companion discovery were added in `0.3.0`;
 active-model card backfilling with generated run instructions was added in
 `0.4.0`; persistent default-root configuration was added in `0.5.0`; NAS plus
-node-local active-model inventory was added in `0.6.0`; and persistent local
-roots with concise inventory output were added in `0.7.0`.
+node-local active-model inventory was added in `0.6.0`; persistent local roots
+with concise inventory output were added in `0.7.0`; and safe local model
+deletion was added in `0.8.0`.
 
 `src/modelctl/__init__.py` is the single version source. Hatch reads it when
 building the package, and `modelctl --version` imports the same value so package

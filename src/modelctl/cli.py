@@ -26,6 +26,7 @@ from .generation import (
 from .manifest import load_manifest, validate_name
 from .operations import (
     active_entrypoint,
+    delete_local,
     list_active_models,
     serve_command,
     sync_local,
@@ -181,6 +182,24 @@ and incomplete staging downloads are excluded.""",
     )
     list_location.add_argument("--root", metavar="PATH", help="model store root")
     list_models.add_argument("--json", action="store_true", help="emit JSON")
+
+    delete = commands.add_parser(
+        "delete-local",
+        help="delete a model from the node-local store",
+        description=(
+            "Validate and delete an active node-local model object, its active "
+            "reference, and its local state. The NAS model is never modified."
+        ),
+        formatter_class=HELP_FORMATTER,
+        epilog="""examples:
+  modelctl delete-local qwen3-8b-vllm
+  modelctl delete-local model-q4 --root /srv/models
+
+The command refuses to delete objects outside the local model store or objects
+that are also referenced by another active model name.""",
+    )
+    delete.add_argument("name")
+    _add_local_root(delete)
 
     manifest = commands.add_parser(
         "manifest",
@@ -450,6 +469,12 @@ def run(argv: list[str] | None = None) -> int:
     if args.command == "list":
         root = _local_root(None) if args.local else _root(args.root)
         _print_models(root, json_output=args.json)
+        return 0
+
+    if args.command == "delete-local":
+        validate_name(args.name)
+        removed = delete_local(_local_root(args.root), args.name)
+        print(f"deleted: {removed}")
         return 0
 
     if args.command in {"sync-local", "sync"}:
