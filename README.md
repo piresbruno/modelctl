@@ -4,9 +4,10 @@
 store, activates validated revisions, synchronizes active objects to local
 storage with resumable `rsync`, and emits service starter commands without
 starting a server.
-This was made having with the focus on the homelab, a local NAS stores AI models 
-and `modelctl` syncs those to the local inference machines, leaving the NAS
-as source of truth for available models and their versioning.
+This was developed with the focus on the homelab, someone with a  local NAS 
+that stores AI models and uses `modelctl` syncs those to the local inference 
+machines, leaving the NAS as source of truth for available models and their 
+versioning, copying only as needed models to the inference machine.
 
 ## Install
 
