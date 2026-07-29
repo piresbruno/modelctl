@@ -2,17 +2,17 @@ from __future__ import annotations
 
 import os
 import shlex
-import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 from .errors import ModelctlError, ValidationError
+from .hf_cache import cached_entrypoint, delete_record, list_records, load_record, sync_cache
 from .hub import download_snapshot, estimate_snapshot, resolve_commit
 from .layout import Layout, assert_same_filesystem, atomic_symlink, model_lock
 from .manifest import ModelManifest
-from .state import StateJournal, SyncState, UpdateState
+from .state import StateJournal, UpdateState
 from .validation import (
     ExpectedFile,
     resolve_entrypoint,
@@ -122,7 +122,10 @@ def update_model(
                     final, expected_commit=commit, expected_name=manifest.name
                 )
 
-        journal.transition(UpdateState.UPDATING_REFERENCE, reference=str(layout.active_path(manifest.name)))
+        journal.transition(
+            UpdateState.UPDATING_REFERENCE,
+            reference=str(layout.active_path(manifest.name)),
+        )
         atomic_symlink(final, layout.active_path(manifest.name))
         _fsync_directory(layout.active)
         journal.transition(UpdateState.ACTIVE_ON_NAS, object=str(final), commit=commit)
@@ -182,41 +185,7 @@ def list_active_models(root: Path) -> list[ActiveModel]:
 
 
 def delete_local(root: Path, name: str) -> Path:
-    layout = Layout(root)
-    layout.prepare()
-    with model_lock(layout, name):
-        object_path, _ = _active_object(layout, name)
-        for reference in layout.active.iterdir():
-            if reference.name == name or not reference.is_symlink():
-                continue
-            try:
-                shared_target = reference.resolve(strict=True)
-            except OSError:
-                continue
-            if shared_target == object_path:
-                raise ModelctlError(
-                    f"cannot delete local model {name!r}; object is also active "
-                    f"as {reference.name!r}"
-                )
-
-        layout.active_path(name).unlink()
-        _fsync_directory(layout.active)
-        try:
-            shutil.rmtree(object_path)
-            _fsync_directory(object_path.parent)
-        except OSError as exc:
-            raise ModelctlError(
-                f"active reference was removed, but local object deletion failed "
-                f"at {object_path}: {exc}"
-            ) from exc
-        try:
-            layout.state_path(name).unlink(missing_ok=True)
-        except OSError as exc:
-            raise ModelctlError(
-                f"local object was deleted, but state cleanup failed at "
-                f"{layout.state_path(name)}: {exc}"
-            ) from exc
-        return object_path
+    return delete_record(root, name)
 
 
 def serve_argv(root: Path, name: str) -> list[str]:
@@ -281,80 +250,86 @@ def sync_local(
     rsync: str = "rsync",
     runner: Callable[..., Any] = subprocess.run,
 ) -> Path:
-    source = Layout(source_root)
-    local = Layout(local_root)
-    local.prepare()
-    journal = StateJournal(local.state_path(name), "local-sync")
-    with model_lock(local, name):
-        journal.transition(SyncState.NAS_REFERENCE_READ, source=str(source_root))
-        source_object, source_metadata = _active_object(source, name)
-        journal.transition(
-            SyncState.SOURCE_VALIDATED, commit=source_metadata.get("commit")
+    return sync_cache(
+        source_root, local_root, name, rsync=rsync, runner=runner
+    )
+
+
+def list_cached_models(cache_dir: Path) -> list[ActiveModel]:
+    models = []
+    for record in list_records(cache_dir):
+        metadata = record.metadata
+        profile = runtime_from_metadata(metadata)
+        entrypoint = str(metadata["entrypoint"])
+        path = record.snapshot if entrypoint == "." else record.snapshot / entrypoint
+        models.append(
+            ActiveModel(
+                record.name,
+                record.repo,
+                record.revision,
+                record.commit,
+                str(metadata.get("format", "")),
+                profile.kind,
+                entrypoint,
+                path.resolve(strict=True),
+            )
         )
-        try:
-            relative = source_object.relative_to(source.models.resolve(strict=True))
-        except ValueError as exc:
-            raise ModelctlError("source object is outside the NAS models directory") from exc
-        final = local.models / relative
-        staging = local.staging / relative
+    return models
 
-        if final.exists():
-            validate_object(
-                final,
-                expected_commit=source_metadata.get("commit"),
-                expected_name=name,
-            )
-        else:
-            assert_same_filesystem(staging, final)
-            staging.mkdir(parents=True, exist_ok=True)
-            journal.transition(
-                SyncState.RSYNC_TO_LOCAL_STAGING, staging=str(staging)
-            )
-            command = [
-                rsync,
-                "--archive",
-                "--delete",
-                "--partial",
-                "--exclude=/.cache/huggingface/",
-                f"{source_object}/",
-                f"{staging}/",
-            ]
-            try:
-                runner(command, check=True)
-            except BaseException as exc:
-                journal.transition(
-                    SyncState.PARTIAL_RESUMABLE,
-                    staging=str(staging),
-                    error=f"{type(exc).__name__}: {exc}",
-                )
-                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                    raise
-                raise ModelctlError(f"rsync failed; staging is resumable: {exc}") from exc
 
-            journal.transition(SyncState.LOCAL_VALIDATION, staging=str(staging))
-            validate_object(
-                staging,
-                expected_commit=source_metadata.get("commit"),
-                expected_name=name,
-            )
-            journal.transition(SyncState.LOCAL_OBJECT_PUBLICATION, object=str(final))
-            try:
-                os.rename(staging, final)
-                _fsync_directory(final.parent)
-            except FileExistsError:
-                validate_object(
-                    final,
-                    expected_commit=source_metadata.get("commit"),
-                    expected_name=name,
-                )
+def local_active_entrypoint(cache_dir: Path, name: str) -> Path:
+    return cached_entrypoint(cache_dir, name)
 
-        journal.transition(SyncState.LOCAL_REFERENCE_UPDATE, reference=str(local.active_path(name)))
-        atomic_symlink(final, local.active_path(name))
-        _fsync_directory(local.active)
-        journal.transition(
-            SyncState.READY_FOR_SERVICE_RESTART,
-            object=str(final),
-            commit=source_metadata.get("commit"),
-        )
-        entrypoint = source_metadata["entrypoint"]
-        return (final if entrypoint == "." else final / entrypoint).resolve(strict=True)
+
+def delete_cached(cache_dir: Path, name: str) -> Path:
+    return delete_record(cache_dir, name)
+
+
+def serve_cached_command(cache_dir: Path, name: str) -> str:
+    record = load_record(cache_dir, name)
+    metadata = record.metadata
+    entrypoint = str(metadata["entrypoint"])
+    path = (
+        record.snapshot if entrypoint == "." else record.snapshot / entrypoint
+    ).resolve(strict=True)
+    profile = runtime_from_metadata(metadata)
+    substitutions = {"path": str(path), "name": name, "object": str(record.snapshot)}
+    custom = []
+    for argument in profile.args:
+        rendered = argument
+        for key, value in substitutions.items():
+            rendered = rendered.replace("{" + key + "}", value)
+        custom.append(rendered)
+    has_path = any("{path}" in argument or "{object}" in argument for argument in profile.args)
+    companions = metadata.get("companions", {})
+    companion_args = []
+    if profile.kind == "vllm":
+        base = [profile.executable, "serve", str(path)]
+    elif profile.kind in {"llama.cpp", "llama"}:
+        base = [profile.executable, "--model", str(path)]
+        if companions.get("mmproj"):
+            companion_args.extend(
+                [
+                    "--mmproj",
+                    str((record.snapshot / companions["mmproj"]).resolve(strict=True)),
+                ]
+            )
+        if companions.get("mtp"):
+            companion_args.extend(
+                [
+                    "--model-draft",
+                    str((record.snapshot / companions["mtp"]).resolve(strict=True)),
+                    "--spec-type",
+                    "draft-mtp",
+                ]
+            )
+    else:
+        if not has_path:
+            raise ModelctlError(f"runtime {profile.kind!r} must include {{path}} in runtime.args")
+        base = [profile.executable]
+    argv = (
+        [profile.executable, *custom, *companion_args]
+        if has_path
+        else [*base, *companion_args, *custom]
+    )
+    return shlex.join(argv)

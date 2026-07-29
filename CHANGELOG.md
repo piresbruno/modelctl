@@ -2,6 +2,28 @@
 
 This project follows semantic versioning.
 
+## 0.9.1
+
+### Documentation
+
+- Clarified Hugging Face cache defaults, deprecated local-root compatibility,
+  partial-snapshot behavior, and record-only local deletion across the README
+  and CLI help.
+
+## 0.9.0
+
+### Changed
+
+- `sync-local` now publishes validated NAS files into the standard Hugging Face
+  cache `blobs`/`snapshots`/`refs` layout, with offline ETag verification,
+  resumable staging, and modelctl sidecar registrations.
+- Local inventory, path, and serve workflows can resolve modelctl registrations
+  from the Hugging Face cache using `--local` and `--cache-dir`.
+- `delete-local` now removes only modelctl registration state; shared Hugging
+  Face cache data is retained for explicit `hf cache rm` or `hf cache prune`.
+- Existing `--root`, `MODELCTL_LOCAL_ROOT`, and saved local-root behavior remain
+  deprecated cache-directory fallbacks.
+
 ## 0.8.1
 
 ### Documentation

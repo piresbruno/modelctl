@@ -26,8 +26,11 @@ from .generation import (
 from .manifest import load_manifest, validate_name
 from .operations import (
     active_entrypoint,
-    delete_local,
+    delete_cached,
     list_active_models,
+    list_cached_models,
+    local_active_entrypoint,
+    serve_cached_command,
     serve_command,
     sync_local,
     update_model,
@@ -52,6 +55,28 @@ def _local_root(value: str | None) -> Path:
     return Path(selected).expanduser().absolute()
 
 
+def _cache_dir(value: str | None) -> Path:
+    if value:
+        return Path(value).expanduser().absolute()
+    if os.environ.get("HF_HUB_CACHE"):
+        return Path(os.environ["HF_HUB_CACHE"]).expanduser().absolute()
+    if os.environ.get("HF_HOME"):
+        return (Path(os.environ["HF_HOME"]).expanduser() / "hub").absolute()
+    legacy = os.environ.get("MODELCTL_LOCAL_ROOT") or load_local_root()
+    if legacy:
+        return Path(legacy).expanduser().absolute()
+    cache_home = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")).expanduser()
+    return (cache_home / "huggingface" / "hub").absolute()
+
+
+def _selected_cache(args: argparse.Namespace) -> Path:
+    explicit = getattr(args, "cache_dir", None)
+    legacy = getattr(args, "local_root", None)
+    if explicit and legacy:
+        raise ModelctlError("--cache-dir and deprecated --root cannot be combined")
+    return _cache_dir(explicit or legacy)
+
+
 def _positive_int(value: str) -> int:
     number = int(value)
     if number < 1:
@@ -72,17 +97,18 @@ def _add_root(parser: argparse.ArgumentParser) -> None:
 
 def _add_local_root(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--root",
-        metavar="PATH",
-        help=(
-            "local model store root (default: $MODELCTL_LOCAL_ROOT, saved local "
-            f"configuration, or {DEFAULT_ROOT})"
-        ),
+        "--cache-dir", metavar="PATH",
+        help=("Hugging Face hub cache directory (default: HF_HUB_CACHE, "
+              "HF_HOME/hub, or the HF default)"),
+    )
+    parser.add_argument(
+        "--root", dest="local_root", metavar="PATH",
+        help="deprecated alias for --cache-dir",
     )
 
 
-def _print_models(root: Path, *, json_output: bool) -> None:
-    models = list_active_models(root)
+def _print_models(root: Path, *, json_output: bool, local: bool = False) -> None:
+    models = list_cached_models(root) if local else list_active_models(root)
     if json_output:
         payload = [
             {"name": model.name, "runtime": model.runtime, "repository": model.repo}
@@ -120,7 +146,7 @@ def build_parser() -> argparse.ArgumentParser:
   modelctl sync-cards --root /mnt/nas/llm-models
   modelctl path qwen3-8b --root /mnt/nas/llm-models
   modelctl serve-command qwen3-8b --root /mnt/nas/llm-models
-  modelctl sync-local qwen3-8b --source-root /mnt/nas/llm-models --root /var/lib/llm-models
+  modelctl sync-local qwen3-8b --source-root /mnt/nas/llm-models --cache-dir ~/.cache/huggingface/hub
 
 Use 'modelctl COMMAND --help' for command-specific examples.
 Use 'modelctl config set-root PATH' to save the NAS root once.""",
@@ -138,31 +164,33 @@ Use 'modelctl config set-root PATH' to save the NAS root once.""",
         epilog="""examples:
   modelctl config set-root /mnt/nas/llm-models
   modelctl config get-root
-  modelctl config set-local-root /var/lib/llm-models
+  # Deprecated fallback; prefer HF_HUB_CACHE or --cache-dir:
+  modelctl config set-local-root /srv/huggingface/hub
   modelctl config get-local-root
 
 An explicit --root takes precedence over MODELCTL_ROOT, which takes precedence
-over the saved NAS root. MODELCTL_LOCAL_ROOT similarly overrides the saved
-local root.""",
+over the saved NAS root. Local cache commands prefer --cache-dir,
+HF_HUB_CACHE, and HF_HOME/hub. MODELCTL_LOCAL_ROOT and the saved local root are
+deprecated compatibility fallbacks.""",
     )
     config_commands = config.add_subparsers(dest="config_command", required=True)
     set_root = config_commands.add_parser("set-root", help="save the default model root")
     set_root.add_argument("path", metavar="PATH")
     config_commands.add_parser("get-root", help="print the effective default model root")
     set_local_root = config_commands.add_parser(
-        "set-local-root", help="save the node-local model root"
+        "set-local-root", help="save a deprecated fallback Hugging Face cache path"
     )
     set_local_root.add_argument("path", metavar="PATH")
     config_commands.add_parser(
-        "get-local-root", help="print the effective node-local model root"
+        "get-local-root", help="print the effective local Hugging Face cache path"
     )
 
     list_models = commands.add_parser(
         "list",
-        help="list active models in the NAS or local store",
+        help="list active NAS models or local HF-cache registrations",
         description=(
             "Validate and list active models. The configured model store is used "
-            "by default; --local selects the node-local store."
+            "by default; --local selects modelctl registrations in the HF cache."
         ),
         formatter_class=HELP_FORMATTER,
         epilog="""examples:
@@ -178,25 +206,28 @@ and incomplete staging downloads are excluded.""",
     list_location.add_argument(
         "--local",
         action="store_true",
-        help="list the configured node-local store",
+        help="list modelctl registrations in the local Hugging Face cache",
     )
     list_location.add_argument("--root", metavar="PATH", help="model store root")
+    list_models.add_argument(
+        "--cache-dir", metavar="PATH", help="Hugging Face cache used with --local"
+    )
     list_models.add_argument("--json", action="store_true", help="emit JSON")
 
     delete = commands.add_parser(
         "delete-local",
-        help="delete a model from the node-local store",
+        help="unregister a model from the local Hugging Face cache",
         description=(
-            "Validate and delete an active node-local model object, its active "
-            "reference, and its local state. The NAS model is never modified."
+            "Remove modelctl local registration state without deleting shared "
+            "Hugging Face cache data or modifying the NAS model."
         ),
         formatter_class=HELP_FORMATTER,
         epilog="""examples:
   modelctl delete-local qwen3-8b-vllm
-  modelctl delete-local model-q4 --root /srv/models
+  modelctl delete-local model-q4 --cache-dir /srv/huggingface/hub
 
-The command refuses to delete objects outside the local model store or objects
-that are also referenced by another active model name.""",
+Cache snapshots, refs, and blobs are retained. Use hf cache rm or hf cache prune
+explicitly when shared cache data should be removed.""",
     )
     delete.add_argument("name")
     _add_local_root(delete)
@@ -221,7 +252,9 @@ replaced unless --force is supplied.""",
     )
     manifest.add_argument("source", help="owner/model or huggingface.co model URL")
     manifest.add_argument("--name", help="local model name (default: repository name)")
-    manifest.add_argument("--revision", help="branch, tag, or commit (default: URL revision or main)")
+    manifest.add_argument(
+        "--revision", help="branch, tag, or commit (default: URL revision or main)"
+    )
     manifest.add_argument(
         "--quantization",
         help="GGUF quantization substring, for example Q4_K_M",
@@ -403,6 +436,11 @@ Without --manifest, modelctl reads ROOT/manifests/NAME.yaml, .yml, or .json.""",
   MODELCTL_ROOT=/mnt/nas/llm-models modelctl path model-q4""",
     )
     path.add_argument("name")
+    path.add_argument(
+        "--local", action="store_true",
+        help="resolve from the local Hugging Face cache",
+    )
+    path.add_argument("--cache-dir", metavar="PATH")
     _add_root(path)
 
     serve = commands.add_parser(
@@ -421,25 +459,30 @@ Without --manifest, modelctl reads ROOT/manifests/NAME.yaml, .yml, or .json.""",
 Review a generated command before evaluating or executing it.""",
     )
     serve.add_argument("name")
+    serve.add_argument(
+        "--local", action="store_true",
+        help="resolve from the local Hugging Face cache",
+    )
+    serve.add_argument("--cache-dir", metavar="PATH")
     _add_root(serve)
 
     sync = commands.add_parser(
         "sync-local",
         aliases=["sync"],
-        help="copy an active NAS object to a local model store",
+        help="copy an active NAS object into the local Hugging Face cache",
         description=(
-            "Validate the active NAS object, rsync it into local staging, publish "
-            "it atomically, and update the local active reference."
+            "Validate the active NAS object, rsync selected files into staging, "
+            "publish HF blobs and a commit snapshot, then register it locally."
         ),
         formatter_class=HELP_FORMATTER,
         epilog="""examples:
   modelctl sync-local qwen3-8b-vllm \\
-    --source-root /mnt/nas/llm-models --root /var/lib/llm-models
+    --source-root /mnt/nas/llm-models --cache-dir ~/.cache/huggingface/hub
   modelctl sync-local qwen3-8b-vllm
-  modelctl sync model-q4 --from-root /mnt/nas/llm-models --root /srv/models
+  modelctl sync model-q4 --from-root /mnt/nas/llm-models --cache-dir /srv/huggingface/hub
 
-Hugging Face local_dir cache metadata is excluded from local runtime copies.
-The inference service is not restarted or reloaded.""",
+Selected repository files are published as HF blobs and snapshot symlinks. Partial
+selections remain partial snapshots. The inference service is not restarted.""",
     )
     sync.add_argument("name")
     sync.add_argument(
@@ -461,27 +504,29 @@ def run(argv: list[str] | None = None) -> int:
             print(f"{'local_root' if local else 'root'}: {root}")
             print(f"config: {saved}")
         elif args.config_command == "get-local-root":
-            print(_local_root(None))
+            print(_cache_dir(None))
         else:
             print(_root(None))
         return 0
 
     if args.command == "list":
-        root = _local_root(None) if args.local else _root(args.root)
-        _print_models(root, json_output=args.json)
+        if args.cache_dir and not args.local:
+            raise ModelctlError("--cache-dir requires --local")
+        selected = _cache_dir(args.cache_dir) if args.local else _root(args.root)
+        _print_models(selected, json_output=args.json, local=args.local)
         return 0
 
     if args.command == "delete-local":
         validate_name(args.name)
-        removed = delete_local(_local_root(args.root), args.name)
-        print(f"deleted: {removed}")
+        removed = delete_cached(_selected_cache(args), args.name)
+        print(f"unregistered: {removed} (cache data retained)")
         return 0
 
     if args.command in {"sync-local", "sync"}:
         validate_name(args.name)
         result = sync_local(
             _root(args.source_root),
-            _local_root(args.root),
+            _selected_cache(args),
             args.name,
             rsync=args.rsync,
         )
@@ -586,9 +631,23 @@ def run(argv: list[str] | None = None) -> int:
         result = update_model(root, manifest)
         print(result)
     elif args.command == "path":
-        print(active_entrypoint(root, args.name))
+        if args.local:
+            if args.root:
+                raise ModelctlError("--root cannot be combined with --local; use --cache-dir")
+            print(local_active_entrypoint(_cache_dir(args.cache_dir), args.name))
+        else:
+            if args.cache_dir:
+                raise ModelctlError("--cache-dir requires --local")
+            print(active_entrypoint(root, args.name))
     elif args.command == "serve-command":
-        print(serve_command(root, args.name))
+        if args.local:
+            if args.root:
+                raise ModelctlError("--root cannot be combined with --local; use --cache-dir")
+            print(serve_cached_command(_cache_dir(args.cache_dir), args.name))
+        else:
+            if args.cache_dir:
+                raise ModelctlError("--cache-dir requires --local")
+            print(serve_command(root, args.name))
     return 0
 
 

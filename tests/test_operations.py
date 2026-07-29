@@ -1,4 +1,6 @@
+import hashlib
 import json
+import time
 import shlex
 import shutil
 from pathlib import Path
@@ -7,18 +9,27 @@ from types import SimpleNamespace
 import pytest
 
 from modelctl.errors import ModelctlError, ValidationError
+from huggingface_hub import scan_cache_dir
+
+from modelctl.hf_cache import load_record, state_root
 from modelctl.layout import Layout, atomic_symlink
 from modelctl.manifest import parse_manifest
 from modelctl.operations import (
     active_entrypoint,
     delete_local,
     list_active_models,
+    list_cached_models,
     serve_command,
     sync_local,
     update_model,
 )
 from modelctl.state import SyncState, UpdateState
 from modelctl.validation import ExpectedFile, write_metadata
+
+
+@pytest.fixture(autouse=True)
+def isolate_modelctl_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
 
 
 class FakeApi:
@@ -51,6 +62,10 @@ class FakeSnapshot:
             path = root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(content)
+            digest = hashlib.sha1(f"blob {len(content)}\0".encode() + content).hexdigest()
+            metadata = root / ".cache" / "huggingface" / "download" / f"{name}.metadata"
+            metadata.parent.mkdir(parents=True, exist_ok=True)
+            metadata.write_text(f"{kwargs['revision']}\n{digest}\n{time.time()}\n")
         (root / ".cache" / "huggingface").mkdir(parents=True, exist_ok=True)
         return str(root)
 
@@ -189,13 +204,12 @@ def test_serve_command_includes_mmproj_and_mtp_companions(tmp_path):
     ]
 
 
-def test_local_sync_excludes_hf_cache_and_updates_reference_last(tmp_path):
+def test_local_sync_publishes_hf_cache_and_updates_record_last(tmp_path):
     nas = tmp_path / "nas"
-    local = tmp_path / "local"
-    manifest = _manifest()
+    cache = tmp_path / "hub"
     update_model(
         nas,
-        manifest,
+        _manifest(),
         api=FakeApi("d" * 40),
         snapshot=FakeSnapshot({"config.json": b"data"}),
     )
@@ -204,35 +218,29 @@ def test_local_sync_excludes_hf_cache_and_updates_reference_last(tmp_path):
         assert check is True
         source = Path(command[-2].removesuffix("/"))
         destination = Path(command[-1].removesuffix("/"))
-        for child in source.iterdir():
-            if child.name == ".cache":
-                continue
-            target = destination / child.name
-            if child.is_dir():
-                shutil.copytree(child, target, dirs_exist_ok=True)
-            else:
-                shutil.copy2(child, target)
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source / "config.json", destination / "config.json")
 
-    result = sync_local(nas, local, "demo", runner=fake_rsync)
-    assert result == (local / "active" / "demo").resolve()
-    assert not (result / ".cache" / "huggingface").exists()
-    state = json.loads((local / "state" / "demo.json").read_text())
-    assert state["state"] == SyncState.READY_FOR_SERVICE_RESTART
-    assert [event["state"] for event in state["history"]][-2:] == [
-        SyncState.LOCAL_REFERENCE_UPDATE,
-        SyncState.READY_FOR_SERVICE_RESTART,
+    result = sync_local(nas, cache, "demo", runner=fake_rsync)
+    snapshot = cache / "models--org--demo" / "snapshots" / ("d" * 40)
+    assert result == snapshot.resolve()
+    assert (snapshot / "config.json").is_symlink()
+    assert (cache / "models--org--demo" / "refs" / "main").read_text() == "d" * 40
+    info = scan_cache_dir(cache)
+    assert not info.warnings
+    assert next(iter(info.repos)).repo_id == "org/demo"
+    assert load_record(cache, "demo").snapshot == snapshot.resolve()
+    state = json.loads((state_root(cache) / "state" / "demo.json").read_text())
+    assert state["state"] == "READY_FOR_SERVICE_RESTART"
+    inventory = list_cached_models(cache)
+    assert [(item.name, item.repo, item.path) for item in inventory] == [
+        ("demo", "org/demo", snapshot.resolve())
     ]
-    inventory = list_active_models(local)
-    assert len(inventory) == 1
-    assert inventory[0].name == "demo"
-    assert inventory[0].repo == "org/demo"
-    assert inventory[0].commit == "d" * 40
-    assert inventory[0].path == result
 
 
-def test_delete_local_removes_local_model_and_preserves_nas(tmp_path):
+def test_delete_local_unregisters_model_and_preserves_cache_and_nas(tmp_path):
     nas = tmp_path / "nas"
-    local = tmp_path / "local"
+    cache = tmp_path / "hub"
     update_model(
         nas,
         _manifest(),
@@ -241,43 +249,29 @@ def test_delete_local_removes_local_model_and_preserves_nas(tmp_path):
     )
 
     def copy(command, check):
-        assert check is True
         source = Path(command[-2].removesuffix("/"))
         destination = Path(command[-1].removesuffix("/"))
-        shutil.copytree(source, destination, dirs_exist_ok=True)
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source / "config.json", destination / "config.json")
 
-    sync_local(nas, local, "demo", runner=copy)
-    local_object = (local / "active" / "demo").resolve()
+    snapshot = sync_local(nas, cache, "demo", runner=copy)
     nas_object = (nas / "active" / "demo").resolve()
-
-    assert delete_local(local, "demo") == local_object
-    assert not (local / "active" / "demo").exists()
-    assert not local_object.exists()
-    assert not (local / "state" / "demo.json").exists()
+    assert delete_local(cache, "demo") == snapshot
+    assert snapshot.exists()
+    assert not (state_root(cache) / "active" / "demo.json").exists()
     assert (nas / "active" / "demo").resolve() == nas_object
     assert nas_object.exists()
 
 
-def test_delete_local_refuses_object_used_by_another_active_name(tmp_path):
-    update_model(
-        tmp_path,
-        _manifest(),
-        api=FakeApi("d" * 40),
-        snapshot=FakeSnapshot({"config.json": b"data"}),
-    )
-    object_path = (tmp_path / "active" / "demo").resolve()
-    atomic_symlink(object_path, tmp_path / "active" / "alias")
-
-    with pytest.raises(ModelctlError, match="also active as 'alias'"):
-        delete_local(tmp_path, "demo")
-
-    assert (tmp_path / "active" / "demo").is_symlink()
-    assert object_path.exists()
+def test_delete_local_only_removes_one_shared_record(tmp_path):
+    cache = tmp_path / "hub"
+    with pytest.raises(ModelctlError, match="no valid local cache record"):
+        delete_local(cache, "demo")
 
 
-def test_interrupted_local_sync_keeps_previous_local_reference(tmp_path):
+def test_interrupted_local_sync_keeps_previous_cache_record(tmp_path):
     nas = tmp_path / "nas"
-    local = tmp_path / "local"
+    cache = tmp_path / "hub"
     manifest = _manifest()
     update_model(
         nas,
@@ -289,13 +283,11 @@ def test_interrupted_local_sync_keeps_previous_local_reference(tmp_path):
     def copy(command, check):
         source = Path(command[-2].removesuffix("/"))
         destination = Path(command[-1].removesuffix("/"))
-        for child in source.iterdir():
-            if child.name != ".cache":
-                target = destination / child.name
-                shutil.copy2(child, target)
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source / "config.json", destination / "config.json")
 
-    sync_local(nas, local, "demo", runner=copy)
-    old_target = (local / "active" / "demo").resolve()
+    sync_local(nas, cache, "demo", runner=copy)
+    old_record = load_record(cache, "demo")
     update_model(
         nas,
         manifest,
@@ -307,7 +299,90 @@ def test_interrupted_local_sync_keeps_previous_local_reference(tmp_path):
         raise OSError("connection lost")
 
     with pytest.raises(ModelctlError, match="resumable"):
-        sync_local(nas, local, "demo", runner=interrupted)
-    assert (local / "active" / "demo").resolve() == old_target
-    state = json.loads((local / "state" / "demo.json").read_text())
-    assert state["state"] == SyncState.PARTIAL_RESUMABLE
+        sync_local(nas, cache, "demo", runner=interrupted)
+    assert load_record(cache, "demo").commit == old_record.commit
+    assert load_record(cache, "demo").snapshot == old_record.snapshot
+    state = json.loads((state_root(cache) / "state" / "demo.json").read_text())
+    assert state["state"] == "PARTIAL_RESUMABLE"
+
+
+
+def test_sync_preserves_foreign_ref_and_publishes_detached_snapshot(tmp_path):
+    nas = tmp_path / "nas"
+    cache = tmp_path / "hub"
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot({"config.json": b"data"}),
+    )
+    repository = cache / "models--org--demo"
+    (repository / "blobs").mkdir(parents=True)
+    (repository / "snapshots").mkdir()
+    (repository / "snapshots" / ("f" * 40)).mkdir()
+    (repository / "refs").mkdir()
+    (repository / "refs" / "main").write_text("f" * 40)
+
+    def copy(command, check):
+        source = Path(command[-2].removesuffix("/"))
+        destination = Path(command[-1].removesuffix("/"))
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source / "config.json", destination / "config.json")
+
+    result = sync_local(nas, cache, "demo", runner=copy)
+    assert result == (repository / "snapshots" / ("d" * 40)).resolve()
+    assert (repository / "refs" / "main").read_text() == "f" * 40
+    assert not scan_cache_dir(cache).warnings
+
+
+def test_sync_rejects_mismatched_existing_blob_without_active_record(tmp_path):
+    nas = tmp_path / "nas"
+    cache = tmp_path / "hub"
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot({"config.json": b"data"}),
+    )
+    source = (nas / "active" / "demo").resolve()
+    metadata_path = source / ".cache" / "huggingface" / "download" / "config.json.metadata"
+    etag = metadata_path.read_text().splitlines()[1]
+    blob = cache / "models--org--demo" / "blobs" / etag
+    blob.parent.mkdir(parents=True)
+    blob.write_bytes(b"evil")
+
+    def copy(command, check):
+        source_dir = Path(command[-2].removesuffix("/"))
+        destination = Path(command[-1].removesuffix("/"))
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_dir / "config.json", destination / "config.json")
+
+    with pytest.raises(ValidationError, match="content hash mismatch"):
+        sync_local(nas, cache, "demo", runner=copy)
+    assert blob.read_bytes() == b"evil"
+    with pytest.raises(ModelctlError, match="no valid local cache record"):
+        load_record(cache, "demo")
+
+
+def test_sync_accepts_sha256_lfs_etag(tmp_path):
+    nas = tmp_path / "nas"
+    cache = tmp_path / "hub"
+    content = b"weights"
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot({"model.safetensors": content}),
+    )
+    source = (nas / "active" / "demo").resolve()
+    metadata_path = source / ".cache" / "huggingface" / "download" / "model.safetensors.metadata"
+    metadata_path.write_text(f"{'d' * 40}\n{hashlib.sha256(content).hexdigest()}\n{time.time()}\n")
+
+    def copy(command, check):
+        source_dir = Path(command[-2].removesuffix("/"))
+        destination = Path(command[-1].removesuffix("/"))
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_dir / "model.safetensors", destination / "model.safetensors")
+
+    snapshot = sync_local(nas, cache, "demo", runner=copy)
+    assert (snapshot / "model.safetensors").read_bytes() == content

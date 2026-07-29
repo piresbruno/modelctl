@@ -1,8 +1,8 @@
 # modelctl
 
 `modelctl` atomically downloads Hugging Face model snapshots to a NAS model
-store, activates validated revisions, synchronizes active objects to local
-storage with resumable `rsync`, and emits service starter commands without
+store, activates validated revisions, synchronizes selected files into the local
+Hugging Face cache with resumable `rsync`, and emits service commands without
 starting a server.
 This was developed with the focus on the homelab, someone with a  local NAS 
 that stores AI models and uses `modelctl` syncs those to the local inference 
@@ -12,7 +12,8 @@ versioning, copying only as needed models to the inference machine.
 ## Install
 
 Python 3.11 or newer is required. `rsync` is also required when using
-`sync-local`. The recommended installation method is an isolated uv tool.
+`sync-local` to populate a Hugging Face cache from the NAS. The recommended
+installation method is an isolated uv tool.
 
 From the project folder:
 
@@ -449,25 +450,42 @@ Print a shell-escaped command without executing it:
 modelctl serve-command qwen3-8b-vllm --root /var/lib/llm-models
 ```
 
-Synchronize the current NAS object to local storage:
+Synchronize the current NAS object into the local Hugging Face cache:
+
+```bash
+modelctl sync-local qwen3-8b-vllm \
+  --source-root /mnt/nas/llm-models
+```
+
+The default destination follows Hugging Face cache resolution: `HF_HUB_CACHE`,
+then `HF_HOME/hub`, then the platform default (normally
+`~/.cache/huggingface/hub`). Override it explicitly when required:
 
 ```bash
 modelctl sync-local qwen3-8b-vllm \
   --source-root /mnt/nas/llm-models \
-  --root /var/lib/llm-models
+  --cache-dir /srv/huggingface/hub
 ```
 
-The local copy uses `rsync --archive --delete --partial`, excludes
-`.cache/huggingface`, validates in local staging, publishes with rename, and
-changes the local reference last. It does not restart or reload an inference
-service.
+The command reads the NAS object's retained Hugging Face download metadata,
+verifies Git SHA-1 or LFS/Xet SHA-256 ETags, and publishes the standard
+`models--OWNER--REPO/blobs`, `snapshots/COMMIT`, and `refs` layout. The transfer
+is offline and resumable. The active modelctl registration changes only after
+all selected files and snapshot links validate.
+
+A manifest can select only part of a repository, such as one GGUF
+quantization. Such a revision is visible to `hf cache ls` and supports offline
+access to the synchronized files, but it is not a complete repository snapshot.
+Foreign branch or tag refs are preserved; modelctl resolves its exact cached
+commit through its own registration state.
 
 Save the NAS model store once and omit `--root` from subsequent commands:
 
 ```bash
 modelctl config set-root /mnt/nas/llm-models
 modelctl config get-root
-modelctl config set-local-root /var/lib/llm-models
+# Deprecated fallback; prefer HF_HUB_CACHE or --cache-dir:
+modelctl config set-local-root /srv/huggingface/hub
 modelctl config get-local-root
 ```
 
@@ -482,34 +500,34 @@ List active models available on the configured NAS store:
 modelctl list
 ```
 
-On an inference node, list models that have been synchronized to its local
-store instead:
+On an inference node, list modelctl registrations in its Hugging Face cache:
 
 ```bash
 modelctl list --local
 ```
 
-The local root uses an explicit sync `--root`, `MODELCTL_LOCAL_ROOT`, the saved
-local configuration, and finally `/var/lib/llm-models`. Once both roots are
-saved, `modelctl sync-local NAME` copies from the NAS to the local store without
-additional path arguments.
+Local cache commands use explicit `--cache-dir`, `HF_HUB_CACHE`, `HF_HOME/hub`,
+and then the Hugging Face platform default. `MODELCTL_LOCAL_ROOT`, saved
+`local_root`, and local `--root` remain deprecated migration fallbacks. Use
+`modelctl path NAME --local` and `serve-command NAME --local` to resolve a
+modelctl registration from the selected cache.
 
 Use `modelctl list --root /srv/models` for another store, or `modelctl list
 --json` for machine-readable output. Listings contain only the model name,
-runtime, and Hugging Face repository. Only active, validated models are shown;
-inactive published objects and staging downloads are excluded.
+runtime, and Hugging Face repository. NAS listings contain only active validated objects; local
+listings contain only validated modelctl cache registrations.
 
-Delete a synchronized model from the local store while preserving its NAS
-source:
+Unregister a synchronized model while preserving both its NAS source and shared
+Hugging Face cache data:
 
 ```bash
 modelctl delete-local MODEL_NAME
 ```
 
-The command uses the configured local root by default. Use `--root PATH` to
-select another local store. It validates the active object is inside that store,
-refuses to remove an object shared by another active name, then removes the
-active reference, model data, and local state. It never modifies the NAS store.
+The command atomically removes only modelctl's local registration and journal.
+It does not delete snapshots, refs, or blobs because the Hugging Face cache may
+also be used by Transformers, vLLM, `hf`, or other processes. Reclaim data
+explicitly with `hf cache rm` or `hf cache prune` after reviewing what is shared.
 
 ## Moving existing models to the NAS
 
@@ -642,6 +660,8 @@ node-local active-model inventory was added in `0.6.0`; persistent local roots
 with concise inventory output were added in `0.7.0`; and safe local model
 deletion was added in `0.8.0`. Documentation for comparing Hugging Face cache
 repository IDs with a NAS store was added in `0.8.1`.
+Hugging Face cache-native local synchronization was added in `0.9.0`, and its
+configuration and migration documentation was clarified in `0.9.1`.
 
 `src/modelctl/__init__.py` is the single version source. Hatch reads it when
 building the package, and `modelctl --version` imports the same value so package

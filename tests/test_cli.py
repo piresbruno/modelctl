@@ -5,7 +5,8 @@ import pytest
 
 from modelctl import __version__
 from modelctl.cards import CardResult
-from modelctl.cli import DEFAULT_ROOT, _local_root, _root, build_parser, run
+from modelctl.errors import ModelctlError
+from modelctl.cli import DEFAULT_ROOT, _cache_dir, _local_root, _root, build_parser, run
 from modelctl.layout import Layout, atomic_symlink
 from modelctl.manifest import parse_manifest
 from modelctl.validation import ExpectedFile, write_metadata
@@ -110,13 +111,18 @@ def test_list_json_is_machine_readable(tmp_path, capsys):
     ]
 
 
-def test_list_local_uses_node_local_root(tmp_path, monkeypatch, capsys):
-    local = tmp_path / "local"
-    _active_model(local)
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
-    run(["config", "set-local-root", str(local)])
-    capsys.readouterr()
-    assert run(["list", "--local"]) == 0
+def test_list_local_uses_hf_cache(tmp_path, monkeypatch, capsys):
+    cache = tmp_path / "hub"
+    model = type("Model", (), {"name": "demo", "runtime": "vllm", "repo": "org/model"})()
+    calls = []
+
+    def fake_list(selected):
+        calls.append(selected)
+        return [model]
+
+    monkeypatch.setattr("modelctl.cli.list_cached_models", fake_list)
+    assert run(["list", "--local", "--cache-dir", str(cache)]) == 0
+    assert calls == [cache]
     assert "demo" in capsys.readouterr().out
 
 
@@ -144,21 +150,19 @@ def test_sync_local_uses_saved_nas_and_local_roots(tmp_path, monkeypatch, capsys
     assert capsys.readouterr().out == f"{local / 'active' / 'demo'}\n"
 
 
-def test_delete_local_uses_saved_local_root(tmp_path, monkeypatch, capsys):
-    local = tmp_path / "local"
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
-    run(["config", "set-local-root", str(local)])
-    capsys.readouterr()
+def test_delete_local_uses_hf_cache_and_retains_data(tmp_path, monkeypatch, capsys):
+    cache = tmp_path / "hub"
+    snapshot = cache / "models--org--demo" / "snapshots" / ("e" * 40)
     calls = []
 
-    def fake_delete(root, name):
-        calls.append((root, name))
-        return root / "models" / name
+    def fake_delete(selected, name):
+        calls.append((selected, name))
+        return snapshot
 
-    monkeypatch.setattr("modelctl.cli.delete_local", fake_delete)
-    assert run(["delete-local", "demo"]) == 0
-    assert calls == [(local, "demo")]
-    assert capsys.readouterr().out == f"deleted: {local / 'models' / 'demo'}\n"
+    monkeypatch.setattr("modelctl.cli.delete_cached", fake_delete)
+    assert run(["delete-local", "demo", "--cache-dir", str(cache)]) == 0
+    assert calls == [(cache, "demo")]
+    assert capsys.readouterr().out == f"unregistered: {snapshot} (cache data retained)\n"
 
 
 def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
@@ -181,7 +185,7 @@ def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_version_uses_package_version(capsys):
-    assert __version__ == "0.8.1"
+    assert __version__ == "0.9.1"
     with pytest.raises(SystemExit) as exit_info:
         build_parser().parse_args(["--version"])
     assert exit_info.value.code == 0
@@ -237,3 +241,40 @@ def test_subcommand_help_has_description_and_examples(command, example, capsys):
     output = capsys.readouterr().out
     assert "examples:" in output
     assert example in output
+
+
+
+def test_hf_cache_precedence(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("MODELCTL_LOCAL_ROOT", str(tmp_path / "legacy"))
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "hf-home"))
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "explicit-env"))
+    assert _cache_dir(None) == tmp_path / "explicit-env"
+    assert _cache_dir(str(tmp_path / "argument")) == tmp_path / "argument"
+
+
+def test_sync_rejects_cache_dir_and_legacy_root_together(tmp_path):
+    with pytest.raises(ModelctlError, match="cannot be combined"):
+        run([
+            "sync-local",
+            "demo",
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--root",
+            str(tmp_path / "legacy"),
+        ])
+
+
+def test_path_local_uses_cache_record_resolver(tmp_path, monkeypatch, capsys):
+    cache = tmp_path / "hub"
+    result = cache / "models--org--demo" / "snapshots" / ("d" * 40)
+    calls = []
+
+    def fake_path(selected, name):
+        calls.append((selected, name))
+        return result
+
+    monkeypatch.setattr("modelctl.cli.local_active_entrypoint", fake_path)
+    assert run(["path", "demo", "--local", "--cache-dir", str(cache)]) == 0
+    assert calls == [(cache, "demo")]
+    assert capsys.readouterr().out == f"{result}\n"
