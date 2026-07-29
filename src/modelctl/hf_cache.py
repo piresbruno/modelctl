@@ -388,6 +388,8 @@ def sync_cache(
             "--archive",
             "--partial",
             "--delete",
+            "--human-readable",
+            "--info=progress2",
             "--from0",
             f"--files-from={file_list}",
             f"{source}/",

@@ -2,6 +2,13 @@
 
 This project follows semantic versioning.
 
+## 0.9.2
+
+### Changed
+
+- `sync-local` now displays aggregate transfer progress, speed, and ETA while
+  copying an active NAS model into the local Hugging Face cache.
+
 ## 0.9.1
 
 ### Documentation

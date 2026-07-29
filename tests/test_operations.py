@@ -216,6 +216,8 @@ def test_local_sync_publishes_hf_cache_and_updates_record_last(tmp_path):
 
     def fake_rsync(command, check):
         assert check is True
+        assert "--human-readable" in command
+        assert "--info=progress2" in command
         source = Path(command[-2].removesuffix("/"))
         destination = Path(command[-1].removesuffix("/"))
         destination.mkdir(parents=True, exist_ok=True)

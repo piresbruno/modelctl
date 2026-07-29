@@ -470,8 +470,9 @@ modelctl sync-local qwen3-8b-vllm \
 The command reads the NAS object's retained Hugging Face download metadata,
 verifies Git SHA-1 or LFS/Xet SHA-256 ETags, and publishes the standard
 `models--OWNER--REPO/blobs`, `snapshots/COMMIT`, and `refs` layout. The transfer
-is offline and resumable. The active modelctl registration changes only after
-all selected files and snapshot links validate.
+is offline and resumable. While rsync is running, it displays aggregate bytes
+transferred, completion percentage, current speed, and ETA. The active modelctl
+registration changes only after all selected files and snapshot links validate.
 
 A manifest can select only part of a repository, such as one GGUF
 quantization. Such a revision is visible to `hf cache ls` and supports offline
@@ -661,7 +662,8 @@ with concise inventory output were added in `0.7.0`; and safe local model
 deletion was added in `0.8.0`. Documentation for comparing Hugging Face cache
 repository IDs with a NAS store was added in `0.8.1`.
 Hugging Face cache-native local synchronization was added in `0.9.0`, and its
-configuration and migration documentation was clarified in `0.9.1`.
+configuration and migration documentation was clarified in `0.9.1`. Aggregate
+transfer progress, speed, and ETA were added to `sync-local` in `0.9.2`.
 
 `src/modelctl/__init__.py` is the single version source. Hatch reads it when
 building the package, and `modelctl --version` imports the same value so package

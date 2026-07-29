@@ -472,7 +472,8 @@ Review a generated command before evaluating or executing it.""",
         help="copy an active NAS object into the local Hugging Face cache",
         description=(
             "Validate the active NAS object, rsync selected files into staging, "
-            "publish HF blobs and a commit snapshot, then register it locally."
+            "show aggregate transfer progress and speed, publish HF blobs and "
+            "a commit snapshot, then register it locally."
         ),
         formatter_class=HELP_FORMATTER,
         epilog="""examples:
@@ -482,7 +483,8 @@ Review a generated command before evaluating or executing it.""",
   modelctl sync model-q4 --from-root /mnt/nas/llm-models --cache-dir /srv/huggingface/hub
 
 Selected repository files are published as HF blobs and snapshot symlinks. Partial
-selections remain partial snapshots. The inference service is not restarted.""",
+selections remain partial snapshots. Transfer status includes bytes, completion,
+speed, and ETA. The inference service is not restarted.""",
     )
     sync.add_argument("name")
     sync.add_argument(
