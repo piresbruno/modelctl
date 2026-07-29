@@ -185,7 +185,7 @@ def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_version_uses_package_version(capsys):
-    assert __version__ == "0.9.2"
+    assert __version__ == "0.9.3"
     with pytest.raises(SystemExit) as exit_info:
         build_parser().parse_args(["--version"])
     assert exit_info.value.code == 0

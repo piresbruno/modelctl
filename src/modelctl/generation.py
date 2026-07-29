@@ -101,6 +101,14 @@ def _sibling_names(info: Any) -> list[str]:
     return sorted(set(names))
 
 
+def _is_mtp_artifact(value: str) -> bool:
+    path = PurePosixPath(value)
+    return path.suffix.lower() == ".gguf" and (
+        path.name.lower().startswith("mtp-")
+        or any(part.lower() == "mtp" for part in path.parts[:-1])
+    )
+
+
 def _gguf_groups(files: list[str]) -> list[list[str]]:
     groups: dict[tuple[str, str, int], list[tuple[int, str]]] = {}
     standalone: list[list[str]] = []
@@ -108,7 +116,7 @@ def _gguf_groups(files: list[str]) -> list[list[str]]:
         if not value.lower().endswith(".gguf"):
             continue
         basename = Path(value).name.lower()
-        if basename.startswith(("mmproj", "mtp-")):
+        if basename.startswith("mmproj") or _is_mtp_artifact(value):
             continue
         match = _SHARD_RE.match(Path(value).name)
         if match:
@@ -197,9 +205,11 @@ def _select_mmproj(files: list[str], requested: str | None) -> str | None:
 
 
 def _select_mtp(files: list[str], requested: str | None) -> str | None:
-    candidates = _artifact_candidates(files, "mtp-")
+    candidates = sorted(value for value in files if _is_mtp_artifact(value))
     if requested is None:
-        root_candidates = [value for value in candidates if len(Path(value).parts) == 1]
+        root_candidates = [
+            value for value in candidates if len(PurePosixPath(value).parts) == 1
+        ]
         if len(root_candidates) == 1:
             return root_candidates[0]
     return _select_artifact(candidates, requested, option="--mtp")

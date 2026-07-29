@@ -98,6 +98,32 @@ def test_selects_model_card_and_gguf_companions():
     ]
 
 
+def test_selects_mtp_directory_artifact_without_mtp_filename_prefix():
+    files = [
+        "README.md",
+        "MTP/gemma-4-12B-it-MTP-BF16.gguf",
+        "MTP/gemma-4-12B-it-MTP-F16.gguf",
+        "MTP/gemma-4-12B-it-MTP-Q8_0.gguf",
+        "gemma4-v2-Q4_K_M.gguf",
+        "gemma4-v2-Q8_0.gguf",
+    ]
+    document = generate_manifest_document(
+        "org/gemma-4-GGUF",
+        quantization="Q8_0",
+        mtp="MTP/gemma-4-12B-it-MTP-Q8_0.gguf",
+        api=FakeApi(files),
+    )
+    assert document["entrypoint"] == "gemma4-v2-Q8_0.gguf"
+    assert document["companions"]["mtp"] == (
+        "MTP/gemma-4-12B-it-MTP-Q8_0.gguf"
+    )
+    assert document["include"] == [
+        "gemma4-v2-Q8_0.gguf",
+        "README.md",
+        "MTP/gemma-4-12B-it-MTP-Q8_0.gguf",
+    ]
+
+
 def test_ambiguous_companion_requires_selection():
     files = [
         "model-Q4_K_M.gguf",

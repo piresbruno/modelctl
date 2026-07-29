@@ -257,7 +257,7 @@ downloads:
     runtime: llama.cpp
 
   # mmproj and in-repository MTP files are attached automatically. Override
-  # an ambiguous selection with exact filenames when needed.
+  # an ambiguous selection with an exact repository-relative path when needed.
   - source: unsloth/gemma-4-31B-it-GGUF
     name: gemma-4-31b-it-q4
     quantization: UD-Q4_K_XL
@@ -283,6 +283,10 @@ to catch spelling mistakes before a transfer starts.
 | `mmproj` | no | Projector filename/path or substring when auto-selection is ambiguous |
 | `mtp` | no | MTP draft filename/path or substring when auto-selection is ambiguous |
 | `force` | no | Boolean; replace a generated manifest with different settings |
+
+Companion paths are relative to the Hugging Face repository root. Include the
+folder when a companion is nested, for example
+`mtp: MTP/gemma-4-12B-it-MTP-Q8_0.gguf`.
 
 Every queue run performs a complete preflight before starting any model
 transfer:
@@ -392,12 +396,14 @@ The generator queries Hugging Face for the selected revision and inspects the
 repository filenames. Standard safetensors/bin weights select vLLM; a
 GGUF-only repository selects llama.cpp. The root `README.md` model card is
 retained with the model.
-For llama.cpp, in-repository `mmproj*.gguf` and `mtp-*.gguf` companions are also
-selected, recorded, and later validated. `mmproj-F16.gguf` and a single root MTP
-file are preferred when present; otherwise ambiguous companion choices require
-`--mmproj` or `--mtp`. When multiple primary GGUF quantizations are available,
-generation stops and requires `--quantization`. For sharded GGUFs, every shard
-is selected and shard `00001` is used as the entrypoint.
+For llama.cpp, in-repository `mmproj*.gguf`, `mtp-*.gguf`, and GGUF files under
+an `MTP/` directory are selected as companions, recorded, and later validated.
+MTP-directory files are excluded from primary model quantization selection.
+`mmproj-F16.gguf` and a single root MTP file are preferred when present;
+otherwise ambiguous companion choices require `--mmproj` or `--mtp`. When
+multiple primary GGUF quantizations are available, generation stops and
+requires `--quantization`. For sharded GGUFs, every shard is selected and shard
+`00001` is used as the entrypoint.
 
 The generated file is written to `ROOT/manifests/NAME.yaml`. The default name
 is the lower-cased repository name; use `--name` to override it. Existing
@@ -663,7 +669,8 @@ deletion was added in `0.8.0`. Documentation for comparing Hugging Face cache
 repository IDs with a NAS store was added in `0.8.1`.
 Hugging Face cache-native local synchronization was added in `0.9.0`, and its
 configuration and migration documentation was clarified in `0.9.1`. Aggregate
-transfer progress, speed, and ETA were added to `sync-local` in `0.9.2`.
+transfer progress, speed, and ETA were added to `sync-local` in `0.9.2`. MTP
+companion discovery for GGUFs stored under `MTP/` was fixed in `0.9.3`.
 
 `src/modelctl/__init__.py` is the single version source. Hatch reads it when
 building the package, and `modelctl --version` imports the same value so package

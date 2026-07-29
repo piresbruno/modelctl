@@ -2,6 +2,14 @@
 
 This project follows semantic versioning.
 
+## 0.9.3
+
+### Fixed
+
+- Detect GGUF draft models stored under an `MTP/` directory even when their
+  filenames do not start with `mtp-`, and exclude them from primary GGUF
+  quantization selection.
+
 ## 0.9.2
 
 ### Changed
