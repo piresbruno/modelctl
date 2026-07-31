@@ -670,7 +670,8 @@ repository IDs with a NAS store was added in `0.8.1`.
 Hugging Face cache-native local synchronization was added in `0.9.0`, and its
 configuration and migration documentation was clarified in `0.9.1`. Aggregate
 transfer progress, speed, and ETA were added to `sync-local` in `0.9.2`. MTP
-companion discovery for GGUFs stored under `MTP/` was fixed in `0.9.3`.
+companion discovery for GGUFs stored under `MTP/` was fixed in `0.9.3`, and
+active-model listings began ignoring hidden and unmanaged entries in `0.9.4`.
 
 `src/modelctl/__init__.py` is the single version source. Hatch reads it when
 building the package, and `modelctl --version` imports the same value so package

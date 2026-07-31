@@ -2,6 +2,13 @@
 
 This project follows semantic versioning.
 
+## 0.9.4
+
+### Fixed
+
+- Ignore hidden entries and non-symlinks, including macOS `.DS_Store` files,
+  when listing active models.
+
 ## 0.9.3
 
 ### Fixed

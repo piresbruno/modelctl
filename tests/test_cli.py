@@ -111,6 +111,18 @@ def test_list_json_is_machine_readable(tmp_path, capsys):
     ]
 
 
+def test_list_ignores_hidden_entries_and_non_symlinks(tmp_path, capsys):
+    object_path = _active_model(tmp_path)
+    active = tmp_path / "active"
+    (active / ".DS_Store").write_bytes(b"metadata")
+    (active / ".hidden-model").symlink_to(object_path)
+    (active / "notes.txt").write_text("not a managed reference")
+
+    assert run(["list", "--root", str(tmp_path), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [model["name"] for model in payload] == ["demo"]
+
+
 def test_list_local_uses_hf_cache(tmp_path, monkeypatch, capsys):
     cache = tmp_path / "hub"
     model = type("Model", (), {"name": "demo", "runtime": "vllm", "repo": "org/model"})()
@@ -185,7 +197,7 @@ def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_version_uses_package_version(capsys):
-    assert __version__ == "0.9.3"
+    assert __version__ == "0.9.4"
     with pytest.raises(SystemExit) as exit_info:
         build_parser().parse_args(["--version"])
     assert exit_info.value.code == 0

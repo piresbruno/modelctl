@@ -165,6 +165,8 @@ def list_active_models(root: Path) -> list[ActiveModel]:
         return []
     models = []
     for reference in sorted(layout.active.iterdir(), key=lambda path: path.name):
+        if reference.name.startswith(".") or not reference.is_symlink():
+            continue
         object_path, metadata = _active_object(layout, reference.name)
         profile = runtime_from_metadata(metadata)
         entrypoint = metadata["entrypoint"]
