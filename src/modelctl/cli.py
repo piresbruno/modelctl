@@ -477,16 +477,21 @@ Review a generated command before evaluating or executing it.""",
         ),
         formatter_class=HELP_FORMATTER,
         epilog="""examples:
-  modelctl sync-local qwen3-8b-vllm \\
+  modelctl sync-local unsloth/DeepSeek-V4-Flash-0731 \\
     --source-root /mnt/nas/llm-models --cache-dir ~/.cache/huggingface/hub
   modelctl sync-local qwen3-8b-vllm
   modelctl sync model-q4 --from-root /mnt/nas/llm-models --cache-dir /srv/huggingface/hub
 
-Selected repository files are published as HF blobs and snapshot symlinks. Partial
-selections remain partial snapshots. Transfer status includes bytes, completion,
-speed, and ETA. The inference service is not restarted.""",
+Pass an active model name or its Hugging Face repository id. A repository id
+must identify exactly one active model. Selected repository files are published
+as HF blobs and snapshot symlinks. Partial selections remain partial snapshots.
+Transfer status includes bytes, completion, speed, and ETA. The inference service
+is not restarted.""",
     )
-    sync.add_argument("name")
+    sync.add_argument(
+        "name", metavar="MODEL_OR_REPO",
+        help="active model name or unique Hugging Face repository id",
+    )
     sync.add_argument(
         "--source-root", "--from-root", metavar="PATH", dest="source_root",
         help="NAS source root (default: configured NAS root)",
@@ -525,7 +530,6 @@ def run(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command in {"sync-local", "sync"}:
-        validate_name(args.name)
         result = sync_local(
             _root(args.source_root),
             _selected_cache(args),

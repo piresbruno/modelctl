@@ -456,12 +456,20 @@ Print a shell-escaped command without executing it:
 modelctl serve-command qwen3-8b-vllm --root /var/lib/llm-models
 ```
 
-Synchronize the current NAS object into the local Hugging Face cache:
+Synchronize the current NAS object into the local Hugging Face cache by its
+active model name or Hugging Face repository id:
 
 ```bash
 modelctl sync-local qwen3-8b-vllm \
   --source-root /mnt/nas/llm-models
+
+modelctl sync-local unsloth/DeepSeek-V4-Flash-0731 \
+  --source-root /mnt/nas/llm-models
 ```
+
+A repository id is resolved from active NAS object metadata and must match
+exactly one active model. If multiple active names select different variants of
+the same repository, pass the desired active model name instead.
 
 The default destination follows Hugging Face cache resolution: `HF_HUB_CACHE`,
 then `HF_HOME/hub`, then the platform default (normally

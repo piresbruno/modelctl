@@ -204,6 +204,59 @@ def test_serve_command_includes_mmproj_and_mtp_companions(tmp_path):
     ]
 
 
+def test_local_sync_resolves_hugging_face_repository_to_active_name(
+    tmp_path, monkeypatch
+):
+    source_root = tmp_path / "nas"
+    cache = tmp_path / "hub"
+    calls = []
+    model = SimpleNamespace(name="custom-name", repo="org/demo")
+
+    monkeypatch.setattr(
+        "modelctl.operations.list_active_models", lambda root: [model]
+    )
+
+    def fake_sync(source, destination, name, *, rsync, runner):
+        calls.append((source, destination, name, rsync, runner))
+        return destination / "snapshot"
+
+    monkeypatch.setattr("modelctl.operations.sync_cache", fake_sync)
+    result = sync_local(
+        source_root, cache, "org/demo", rsync="custom-rsync", runner=shutil.copy
+    )
+
+    assert result == cache / "snapshot"
+    assert calls == [
+        (source_root, cache, "custom-name", "custom-rsync", shutil.copy)
+    ]
+
+
+def test_local_sync_rejects_ambiguous_hugging_face_repository(
+    tmp_path, monkeypatch
+):
+    models = [
+        SimpleNamespace(name="demo-fp16", repo="org/demo"),
+        SimpleNamespace(name="demo-q4", repo="org/demo"),
+    ]
+    monkeypatch.setattr(
+        "modelctl.operations.list_active_models", lambda root: models
+    )
+
+    with pytest.raises(ModelctlError, match="multiple model names.*demo-fp16.*demo-q4"):
+        sync_local(tmp_path / "nas", tmp_path / "hub", "org/demo")
+
+
+def test_local_sync_reports_unknown_hugging_face_repository(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        "modelctl.operations.list_active_models", lambda root: []
+    )
+
+    with pytest.raises(ModelctlError, match="has no active NAS model"):
+        sync_local(tmp_path / "nas", tmp_path / "hub", "org/missing")
+
+
 def test_local_sync_publishes_hf_cache_and_updates_record_last(tmp_path):
     nas = tmp_path / "nas"
     cache = tmp_path / "hub"

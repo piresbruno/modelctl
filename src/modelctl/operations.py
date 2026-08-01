@@ -8,10 +8,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .errors import ModelctlError, ValidationError
+from .generation import parse_hf_source
 from .hf_cache import cached_entrypoint, delete_record, list_records, load_record, sync_cache
 from .hub import download_snapshot, estimate_snapshot, resolve_commit
 from .layout import Layout, assert_same_filesystem, atomic_symlink, model_lock
-from .manifest import ModelManifest
+from .manifest import ModelManifest, validate_name
 from .state import StateJournal, UpdateState
 from .validation import (
     ExpectedFile,
@@ -244,6 +245,28 @@ def serve_command(root: Path, name: str) -> str:
     return shlex.join(serve_argv(root, name))
 
 
+def _resolve_active_name(source_root: Path, selector: str) -> str:
+    if "/" not in selector:
+        return validate_name(selector)
+
+    repo, _ = parse_hf_source(selector)
+    matches = [
+        model.name for model in list_active_models(source_root) if model.repo == repo
+    ]
+    if not matches:
+        raise ModelctlError(
+            f"Hugging Face repository {repo!r} has no active NAS model; "
+            "run 'modelctl list' to see active model names"
+        )
+    if len(matches) > 1:
+        names = ", ".join(repr(name) for name in matches)
+        raise ModelctlError(
+            f"Hugging Face repository {repo!r} is active under multiple model "
+            f"names: {names}; pass one of those names"
+        )
+    return matches[0]
+
+
 def sync_local(
     source_root: Path,
     local_root: Path,
@@ -252,8 +275,9 @@ def sync_local(
     rsync: str = "rsync",
     runner: Callable[..., Any] = subprocess.run,
 ) -> Path:
+    resolved_name = _resolve_active_name(source_root, name)
     return sync_cache(
-        source_root, local_root, name, rsync=rsync, runner=runner
+        source_root, local_root, resolved_name, rsync=rsync, runner=runner
     )
 
 

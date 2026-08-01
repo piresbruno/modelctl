@@ -162,6 +162,32 @@ def test_sync_local_uses_saved_nas_and_local_roots(tmp_path, monkeypatch, capsys
     assert capsys.readouterr().out == f"{local / 'active' / 'demo'}\n"
 
 
+def test_sync_local_accepts_hugging_face_repository(
+    tmp_path, monkeypatch, capsys
+):
+    nas = tmp_path / "nas"
+    cache = tmp_path / "hub"
+    calls = []
+
+    def fake_sync(source_root, local_root, name, *, rsync):
+        calls.append((source_root, local_root, name, rsync))
+        return local_root / "snapshot"
+
+    monkeypatch.setattr("modelctl.cli.sync_local", fake_sync)
+    assert run([
+        "sync-local",
+        "unsloth/DeepSeek-V4-Flash-0731",
+        "--source-root",
+        str(nas),
+        "--cache-dir",
+        str(cache),
+    ]) == 0
+    assert calls == [
+        (nas.absolute(), cache, "unsloth/DeepSeek-V4-Flash-0731", "rsync")
+    ]
+    assert capsys.readouterr().out == f"{cache / 'snapshot'}\n"
+
+
 def test_delete_local_uses_hf_cache_and_retains_data(tmp_path, monkeypatch, capsys):
     cache = tmp_path / "hub"
     snapshot = cache / "models--org--demo" / "snapshots" / ("e" * 40)
@@ -197,7 +223,7 @@ def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_version_uses_package_version(capsys):
-    assert __version__ == "0.9.4"
+    assert __version__ == "0.9.5"
     with pytest.raises(SystemExit) as exit_info:
         build_parser().parse_args(["--version"])
     assert exit_info.value.code == 0
@@ -253,7 +279,9 @@ def test_subcommand_help_has_description_and_examples(command, example, capsys):
     output = capsys.readouterr().out
     assert "examples:" in output
     assert example in output
-
+    if command == "sync-local":
+        assert "unsloth/DeepSeek-V4-Flash-0731" in output
+        assert "active model name or its Hugging Face repository id" in output
 
 
 def test_hf_cache_precedence(tmp_path, monkeypatch):

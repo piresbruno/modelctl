@@ -2,6 +2,13 @@
 
 This project follows semantic versioning.
 
+## 0.9.5
+
+### Fixed
+
+- `sync-local` now accepts a Hugging Face repository id and resolves it to a
+  unique active NAS model name.
+
 ## 0.9.4
 
 ### Fixed
