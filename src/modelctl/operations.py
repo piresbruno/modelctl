@@ -9,13 +9,24 @@ from typing import Any, Callable
 
 from .errors import ModelctlError, ValidationError
 from .generation import parse_hf_source
-from .hf_cache import cached_entrypoint, delete_record, list_records, load_record, sync_cache
+from .hf_cache import (
+    cached_entrypoint,
+    delete_record,
+    list_records,
+    load_record,
+    sync_cache,
+)
 from .hub import download_snapshot, estimate_snapshot, resolve_commit
-from .layout import Layout, assert_same_filesystem, atomic_symlink, model_lock
+from .layout import (
+    Layout,
+    assert_same_filesystem,
+    atomic_symlink,
+    model_lock,
+    verify_symlink,
+)
 from .manifest import ModelManifest, validate_name
 from .state import StateJournal, UpdateState
 from .validation import (
-    ExpectedFile,
     resolve_entrypoint,
     runtime_from_metadata,
     validate_artifacts,
@@ -43,6 +54,94 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _reference_kind(path: Path) -> str:
+    if path.is_symlink():
+        return "symlink"
+    if path.is_dir():
+        return "directory"
+    if path.exists():
+        return "file"
+    return "missing"
+
+
+def _activate_reference(
+    layout: Layout,
+    name: str,
+    target: Path,
+    journal: StateJournal,
+) -> None:
+    reference = layout.active_path(name)
+    previous: Path | None = None
+    if os.path.lexists(reference):
+        if not reference.is_symlink():
+            error = f"active reference path is a {_reference_kind(reference)}: {reference}"
+            journal.transition(
+                UpdateState.FAILED_TO_ACTIVATE,
+                object=str(target),
+                reference=str(reference),
+                observed_type=_reference_kind(reference),
+                rollback="not-needed",
+                error=error,
+            )
+            raise ModelctlError(
+                f"{error}; run 'modelctl doctor' and 'modelctl repair-active'"
+            )
+        previous, _ = _active_object(layout, name)
+
+    try:
+        atomic_symlink(target, reference)
+        verify_symlink(reference, target, managed_root=layout.models)
+    except BaseException as exc:
+        rollback = "not-needed"
+        rollback_error: str | None = None
+        try:
+            if previous is not None:
+                try:
+                    verify_symlink(reference, previous, managed_root=layout.models)
+                    rollback = "previous-reference-intact"
+                except ModelctlError:
+                    if os.path.lexists(reference):
+                        if reference.is_dir() and not reference.is_symlink():
+                            failed = layout.staging / ".failed-references" / name
+                            failed.parent.mkdir(parents=True, exist_ok=True)
+                            if os.path.lexists(failed):
+                                failed = failed.with_name(
+                                    f"{failed.name}-{os.getpid()}"
+                                )
+                            os.rename(reference, failed)
+                        else:
+                            reference.unlink(missing_ok=True)
+                    atomic_symlink(previous, reference)
+                    verify_symlink(reference, previous, managed_root=layout.models)
+                    rollback = "previous-reference-restored"
+            elif os.path.lexists(reference):
+                if reference.is_dir() and not reference.is_symlink():
+                    failed = layout.staging / ".failed-references" / name
+                    failed.parent.mkdir(parents=True, exist_ok=True)
+                    if os.path.lexists(failed):
+                        failed = failed.with_name(f"{failed.name}-{os.getpid()}")
+                    os.rename(reference, failed)
+                    rollback = f"unexpected-reference-quarantined:{failed}"
+                else:
+                    reference.unlink(missing_ok=True)
+                    rollback = "invalid-reference-removed"
+        except Exception as recovery_exc:
+            rollback = "failed"
+            rollback_error = f"{type(recovery_exc).__name__}: {recovery_exc}"
+
+        details: dict[str, Any] = {
+            "object": str(target),
+            "reference": str(reference),
+            "observed_type": _reference_kind(reference),
+            "rollback": rollback,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        if rollback_error is not None:
+            details["rollback_error"] = rollback_error
+        journal.transition(UpdateState.FAILED_TO_ACTIVATE, **details)
+        raise
 
 
 def update_model(
@@ -127,7 +226,7 @@ def update_model(
             UpdateState.UPDATING_REFERENCE,
             reference=str(layout.active_path(manifest.name)),
         )
-        atomic_symlink(final, layout.active_path(manifest.name))
+        _activate_reference(layout, manifest.name, final, journal)
         _fsync_directory(layout.active)
         journal.transition(UpdateState.ACTIVE_ON_NAS, object=str(final), commit=commit)
         metadata = validate_object(final, expected_commit=commit, expected_name=manifest.name)
@@ -168,7 +267,10 @@ def list_active_models(root: Path) -> list[ActiveModel]:
     for reference in sorted(layout.active.iterdir(), key=lambda path: path.name):
         if reference.name.startswith(".") or not reference.is_symlink():
             continue
-        object_path, metadata = _active_object(layout, reference.name)
+        try:
+            object_path, metadata = _active_object(layout, reference.name)
+        except (ModelctlError, ValidationError, OSError):
+            continue
         profile = runtime_from_metadata(metadata)
         entrypoint = metadata["entrypoint"]
         path = object_path if entrypoint == "." else object_path / entrypoint

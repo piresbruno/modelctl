@@ -230,7 +230,9 @@ The inferred local name is the lower-cased repository name. Optional
 `--revision` and `--runtime` arguments override automatic selection. The
 manifest is retained at `ROOT/manifests/NAME.yaml`; repeating the same command
 reuses it and any valid published object. If an existing manifest has different
-settings, the command stops unless `--force` is passed.
+settings, the command stops unless `--force` is passed. Direct downloads and
+queues both verify symbolic-link support before remote work, and activation is
+not recorded until the final active reference is verified.
 
 ### Queue multiple downloads
 
@@ -529,8 +531,39 @@ modelctl registration from the selected cache.
 
 Use `modelctl list --root /srv/models` for another store, or `modelctl list
 --json` for machine-readable output. Listings contain only the model name,
-runtime, and Hugging Face repository. NAS listings contain only active validated objects; local
-listings contain only validated modelctl cache registrations.
+runtime, and Hugging Face repository. NAS listings contain only active validated
+objects; local listings contain only validated modelctl cache registrations.
+Human NAS listings warn when malformed active references were skipped.
+
+Audit every active-store entry without modifying the store:
+
+```bash
+modelctl doctor --root /mnt/nas/llm-models
+modelctl doctor --root /mnt/nas/llm-models --json
+```
+
+`doctor` distinguishes valid links, hidden foreign files, broken or outside-store
+links, invalid objects, journal mismatches, and regular directory copies. A
+regular directory is repairable only when its manifest, successful update
+journal, active metadata, and canonical object all agree.
+
+Repair is dry-run by default. With `--apply`, the directory is moved to a
+same-filesystem quarantine before a verified relative symlink is published:
+
+```bash
+modelctl repair-active MODEL_NAME --root /mnt/nas/llm-models
+modelctl repair-active MODEL_NAME --root /mnt/nas/llm-models --apply
+```
+
+Omit `MODEL_NAME` to inspect or repair every currently repairable directory.
+Quarantine data is retained when the filesystem preserves the renamed copy.
+After an observation period, inspect cleanup in dry-run mode and delete only
+validated quarantines explicitly:
+
+```bash
+modelctl cleanup-quarantine MODEL_NAME --root /mnt/nas/llm-models
+modelctl cleanup-quarantine MODEL_NAME --root /mnt/nas/llm-models --apply
+```
 
 Unregister a synchronized model while preserving both its NAS source and shared
 Hugging Face cache data:

@@ -5,8 +5,9 @@ import pytest
 
 from modelctl import __version__
 from modelctl.cards import CardResult
-from modelctl.errors import ModelctlError
 from modelctl.cli import DEFAULT_ROOT, _cache_dir, _local_root, _root, build_parser, run
+from modelctl.errors import ModelctlError
+from modelctl.integrity import RepairResult
 from modelctl.layout import Layout, atomic_symlink
 from modelctl.manifest import parse_manifest
 from modelctl.validation import ExpectedFile, write_metadata
@@ -27,6 +28,15 @@ def _active_model(root):
         ".",
     )
     atomic_symlink(object_path, layout.active_path("demo"))
+    layout.state_path("demo").write_text(json.dumps({
+        "operation": "update",
+        "state": "ACTIVE_ON_NAS",
+        "history": [{
+            "state": "ACTIVE_ON_NAS",
+            "object": str(object_path),
+            "commit": "e" * 40,
+        }],
+    }))
     return object_path.resolve()
 
 
@@ -121,6 +131,72 @@ def test_list_ignores_hidden_entries_and_non_symlinks(tmp_path, capsys):
     assert run(["list", "--root", str(tmp_path), "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert [model["name"] for model in payload] == ["demo"]
+
+
+def test_list_warns_when_malformed_active_references_are_skipped(tmp_path, capsys):
+    _active_model(tmp_path)
+    (tmp_path / "active" / "copied-model").mkdir()
+
+    assert run(["list", "--root", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    assert "demo" in captured.out
+    assert "skipped 1 malformed active reference" in captured.err
+    assert "modelctl doctor" in captured.err
+
+
+def test_doctor_reports_malformed_references(tmp_path, capsys):
+    _active_model(tmp_path)
+    (tmp_path / "active" / "copied-model").mkdir()
+
+    assert run(["doctor", "--root", str(tmp_path)]) == 1
+    captured = capsys.readouterr()
+    assert "[regular_directory] copied-model" in captured.out
+    assert "doctor: 1 healthy/ignored, 0 warning(s), 1 malformed" in captured.out
+
+
+def test_repair_active_is_dry_run_by_default(tmp_path, monkeypatch, capsys):
+    calls = []
+
+    def fake_repair(root, name, *, apply):
+        calls.append((root, name, apply))
+        return RepairResult(
+            name,
+            "dry-run",
+            root / "active" / name,
+            root / "models" / name,
+        )
+
+    monkeypatch.setattr("modelctl.cli.repair_active_reference", fake_repair)
+    assert run([
+        "repair-active",
+        "demo",
+        "--root",
+        str(tmp_path),
+    ]) == 0
+    assert calls == [(tmp_path.absolute(), "demo", False)]
+    assert "[dry-run] demo" in capsys.readouterr().out
+
+
+def test_download_checks_symlink_support_before_remote_work(
+    tmp_path, monkeypatch, capsys
+):
+    calls = []
+
+    def fake_validate(root):
+        calls.append(("validate", root))
+
+    def fake_download(root, source, **kwargs):
+        calls.append(("download", root, source))
+        return root / "manifests" / "demo.yaml", root / "models" / "demo"
+
+    monkeypatch.setattr("modelctl.cli.validate_queue_root", fake_validate)
+    monkeypatch.setattr("modelctl.cli.download_from_hf", fake_download)
+    assert run(["download", "org/demo", "--root", str(tmp_path)]) == 0
+    assert calls == [
+        ("validate", tmp_path.absolute()),
+        ("download", tmp_path.absolute(), "org/demo"),
+    ]
+    assert "manifest:" in capsys.readouterr().out
 
 
 def test_list_local_uses_hf_cache(tmp_path, monkeypatch, capsys):
@@ -223,7 +299,7 @@ def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_version_uses_package_version(capsys):
-    assert __version__ == "0.9.5"
+    assert __version__ == "0.9.6"
     with pytest.raises(SystemExit) as exit_info:
         build_parser().parse_args(["--version"])
     assert exit_info.value.code == 0

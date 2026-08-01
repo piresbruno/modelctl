@@ -1,29 +1,27 @@
 import hashlib
 import json
-import time
 import shlex
 import shutil
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
-from modelctl.errors import ModelctlError, ValidationError
 from huggingface_hub import scan_cache_dir
 
+from modelctl.errors import ModelctlError, ValidationError
 from modelctl.hf_cache import load_record, state_root
 from modelctl.layout import Layout, atomic_symlink
 from modelctl.manifest import parse_manifest
 from modelctl.operations import (
     active_entrypoint,
     delete_local,
-    list_active_models,
     list_cached_models,
     serve_command,
     sync_local,
     update_model,
 )
-from modelctl.state import SyncState, UpdateState
+from modelctl.state import UpdateState
 from modelctl.validation import ExpectedFile, write_metadata
 
 
@@ -134,6 +132,64 @@ def test_failed_new_revision_does_not_change_active_reference(tmp_path):
     state = json.loads((tmp_path / "state" / "demo.json").read_text())
     assert state["state"] == UpdateState.FAILED_UNPUBLISHED
     assert not any(path.name.startswith("b" * 40) for path in (tmp_path / "models").rglob("*"))
+
+
+def test_activation_failure_restores_previous_active_reference(tmp_path, monkeypatch):
+    update_model(
+        tmp_path,
+        _manifest(),
+        api=FakeApi("a" * 40),
+        snapshot=FakeSnapshot({"config.json": b"old"}),
+    )
+    reference = tmp_path / "active" / "demo"
+    old_target = reference.resolve()
+    real_atomic_symlink = atomic_symlink
+    calls = 0
+
+    def malformed_publication(target, link):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            link.unlink()
+            link.mkdir()
+            (link / "unexpected").write_text("preserved")
+            raise ModelctlError("simulated invalid publication")
+        real_atomic_symlink(target, link)
+
+    monkeypatch.setattr("modelctl.operations.atomic_symlink", malformed_publication)
+    with pytest.raises(ModelctlError, match="simulated invalid publication"):
+        update_model(
+            tmp_path,
+            _manifest(),
+            api=FakeApi("b" * 40),
+            snapshot=FakeSnapshot({"config.json": b"new"}),
+        )
+
+    assert reference.is_symlink()
+    assert reference.resolve() == old_target
+    state = json.loads((tmp_path / "state" / "demo.json").read_text())
+    assert state["state"] == UpdateState.FAILED_TO_ACTIVATE
+    assert state["history"][-1]["rollback"] == "previous-reference-restored"
+    failed = tmp_path / ".staging" / ".failed-references" / "demo"
+    assert (failed / "unexpected").read_text() == "preserved"
+
+
+def test_update_refuses_to_overwrite_regular_active_directory(tmp_path):
+    active = tmp_path / "active" / "demo"
+    active.mkdir(parents=True)
+    (active / "keep").write_text("data")
+
+    with pytest.raises(ModelctlError, match="active reference path is a directory"):
+        update_model(
+            tmp_path,
+            _manifest(),
+            api=FakeApi("a" * 40),
+            snapshot=FakeSnapshot({"config.json": b"new"}),
+        )
+
+    assert (active / "keep").read_text() == "data"
+    state = json.loads((tmp_path / "state" / "demo.json").read_text())
+    assert state["state"] == UpdateState.FAILED_TO_ACTIVATE
 
 
 def test_path_and_serve_command_use_resolved_entrypoint_and_shell_escape(tmp_path):

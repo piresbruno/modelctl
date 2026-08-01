@@ -2,6 +2,22 @@
 
 This project follows semantic versioning.
 
+## 0.9.6
+
+### Added
+
+- Add `doctor`, dry-run-first `repair-active`, and explicit
+  `cleanup-quarantine` workflows for auditing and safely repairing malformed
+  active references.
+
+### Fixed
+
+- Verify temporary and published active symlinks, restore the previous active
+  reference after activation failure, and probe symlink support for direct
+  downloads as well as queues.
+- Warn when human-readable listings skip malformed active references while
+  preserving machine-readable JSON output.
+
 ## 0.9.5
 
 ### Fixed

@@ -23,6 +23,12 @@ from .generation import (
     generate_manifest_document,
     write_generated_manifest,
 )
+from .integrity import (
+    audit_active_references,
+    cleanup_quarantine,
+    malformed_active_references,
+    repair_active_reference,
+)
 from .manifest import load_manifest, validate_name
 from .operations import (
     active_entrypoint,
@@ -116,8 +122,15 @@ def _print_models(root: Path, *, json_output: bool, local: bool = False) -> None
         ]
         print(json.dumps(payload, indent=2))
         return
+    malformed = malformed_active_references(root) if not local else []
     if not models:
         print(f"No active models in {root}.")
+        if malformed:
+            print(
+                f"warning: skipped {len(malformed)} malformed active "
+                "reference(s); run 'modelctl doctor' for details",
+                file=sys.stderr,
+            )
         return
     rows = [(model.name, model.runtime, model.repo) for model in models]
     headers = ("NAME", "RUNTIME", "REPOSITORY")
@@ -129,6 +142,12 @@ def _print_models(root: Path, *, json_output: bool, local: bool = False) -> None
     print(template.format(*headers))
     for row in rows:
         print(template.format(*row))
+    if malformed:
+        print(
+            f"warning: skipped {len(malformed)} malformed active "
+            "reference(s); run 'modelctl doctor' for details",
+            file=sys.stderr,
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -213,6 +232,64 @@ and incomplete staging downloads are excluded.""",
         "--cache-dir", metavar="PATH", help="Hugging Face cache used with --local"
     )
     list_models.add_argument("--json", action="store_true", help="emit JSON")
+
+    doctor = commands.add_parser(
+        "doctor",
+        help="audit active NAS references and canonical objects",
+        description=(
+            "Classify every active-store entry without following unsafe paths or "
+            "modifying the model store."
+        ),
+        formatter_class=HELP_FORMATTER,
+        epilog="""examples:
+  modelctl doctor --root /mnt/nas/llm-models
+  modelctl doctor --root /mnt/nas/llm-models --json
+
+Use repair-active for regular directories that doctor marks repairable.""",
+    )
+    doctor.add_argument("--json", action="store_true", help="emit JSON")
+    _add_root(doctor)
+
+    repair = commands.add_parser(
+        "repair-active",
+        help="replace validated active directory copies with symlinks",
+        description=(
+            "Cross-check the manifest, update journal, active-directory metadata, "
+            "and canonical object before quarantining a directory and publishing "
+            "the required symlink. Dry-run is the default."
+        ),
+        formatter_class=HELP_FORMATTER,
+        epilog="""examples:
+  modelctl repair-active --root /mnt/nas/llm-models
+  modelctl repair-active MODEL_NAME --root /mnt/nas/llm-models --apply
+
+Quarantined directories are retained until cleanup-quarantine is explicitly run.""",
+    )
+    repair.add_argument("names", nargs="*", metavar="NAME")
+    repair.add_argument(
+        "--apply", action="store_true", help="apply repairs (default: dry-run)"
+    )
+    repair.add_argument("--json", action="store_true", help="emit JSON")
+    _add_root(repair)
+
+    cleanup = commands.add_parser(
+        "cleanup-quarantine",
+        help="remove validated quarantined active-directory copies",
+        description=(
+            "Verify the repaired active symlink and every quarantined copy before "
+            "optionally deleting quarantine data. Dry-run is the default."
+        ),
+        formatter_class=HELP_FORMATTER,
+        epilog="""examples:
+  modelctl cleanup-quarantine MODEL_NAME --root /mnt/nas/llm-models
+  modelctl cleanup-quarantine MODEL_NAME --root /mnt/nas/llm-models --apply""",
+    )
+    cleanup.add_argument("name", metavar="NAME")
+    cleanup.add_argument(
+        "--apply", action="store_true", help="delete validated copies"
+    )
+    cleanup.add_argument("--json", action="store_true", help="emit JSON")
+    _add_root(cleanup)
 
     delete = commands.add_parser(
         "delete-local",
@@ -540,7 +617,67 @@ def run(argv: list[str] | None = None) -> int:
         return 0
 
     root = _root(args.root)
+    if args.command == "doctor":
+        results = audit_active_references(root)
+        if args.json:
+            print(json.dumps([item.to_dict() for item in results], indent=2))
+        else:
+            for item in results:
+                target = f" -> {item.object}" if item.object is not None else ""
+                detail = f" ({item.detail})" if item.detail else ""
+                print(f"[{item.status}] {item.name}{target}{detail}")
+            warnings = [item for item in results if item.status == "missing_journal"]
+            malformed = [
+                item
+                for item in results
+                if item.status
+                not in {"valid", "hidden_foreign_entry", "missing_journal"}
+            ]
+            healthy = len(results) - len(warnings) - len(malformed)
+            print(
+                f"doctor: {healthy} healthy/ignored, {len(warnings)} warning(s), "
+                f"{len(malformed)} malformed"
+            )
+        return 1 if any(
+            item.status not in {"valid", "hidden_foreign_entry"}
+            for item in results
+        ) else 0
+
+    if args.command == "repair-active":
+        names = list(args.names)
+        if not names:
+            names = [
+                item.name
+                for item in audit_active_references(root)
+                if item.status == "repairable_directory"
+            ]
+        results = [
+            repair_active_reference(root, name, apply=args.apply) for name in names
+        ]
+        if args.json:
+            print(json.dumps([item.to_dict() for item in results], indent=2))
+        else:
+            for item in results:
+                suffix = f"; quarantine: {item.quarantine}" if item.quarantine else ""
+                print(
+                    f"[{item.status}] {item.name}: {item.reference} -> "
+                    f"{item.object}{suffix}"
+                )
+        return 0
+
+    if args.command == "cleanup-quarantine":
+        paths = cleanup_quarantine(root, args.name, apply=args.apply)
+        if args.json:
+            print(json.dumps([str(path) for path in paths], indent=2))
+        else:
+            action = "removed" if args.apply else "would remove"
+            for path in paths:
+                print(f"[{action}] {path}")
+            print(f"cleanup: {len(paths)} quarantine path(s)")
+        return 0
+
     if args.command == "download":
+        validate_queue_root(root)
         manifest_path, active = download_from_hf(
             root,
             args.source,

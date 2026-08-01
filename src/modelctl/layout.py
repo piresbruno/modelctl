@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Iterator
+from uuid import uuid4
 
 from .errors import ModelctlError
 from .manifest import ModelManifest, validate_name
@@ -98,18 +99,42 @@ def assert_same_filesystem(staging: Path, final: Path) -> None:
         )
 
 
-def atomic_symlink(target: Path, link: Path) -> None:
-    """Atomically replace link with a symlink to target.
-
-    A relative target keeps a root movable and makes the temporary symlink valid
-    before os.replace publishes it.
-    """
-    link.parent.mkdir(parents=True, exist_ok=True)
-    temp = link.parent / f".{link.name}.tmp-{os.getpid()}"
+def verify_symlink(
+    link: Path,
+    target: Path,
+    *,
+    managed_root: Path | None = None,
+) -> Path:
+    """Prove that *link* is a symlink to the exact expected target."""
+    if not link.is_symlink():
+        raise ModelctlError(f"reference is not a symbolic link: {link}")
     try:
-        temp.unlink(missing_ok=True)
+        resolved = link.resolve(strict=True)
+        expected = target.resolve(strict=True)
+        if managed_root is not None:
+            root = managed_root.resolve(strict=True)
+            resolved.relative_to(root)
+            expected.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise ModelctlError(
+            f"reference {link} does not resolve inside the managed store"
+        ) from exc
+    if resolved != expected:
+        raise ModelctlError(
+            f"reference {link} resolves to {resolved}, expected {expected}"
+        )
+    return resolved
+
+
+def atomic_symlink(target: Path, link: Path) -> None:
+    """Atomically replace *link* with a verified relative symlink to *target*."""
+    link.parent.mkdir(parents=True, exist_ok=True)
+    temp = link.parent / f".{link.name}.tmp-{os.getpid()}-{uuid4().hex}"
+    try:
         relative = os.path.relpath(target, start=link.parent)
         temp.symlink_to(relative, target_is_directory=target.is_dir())
+        verify_symlink(temp, target)
         os.replace(temp, link)
+        verify_symlink(link, target)
     finally:
         temp.unlink(missing_ok=True)
