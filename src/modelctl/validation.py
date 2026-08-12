@@ -110,9 +110,15 @@ def resolve_entrypoint(
     if not ggufs:
         raise ValidationError("GGUF manifest selected no .gguf files")
 
+    companion_paths = {path for _, path in manifest.companions}
     selected = manifest.entrypoint
     if selected is None:
-        primary = [path for path in ggufs if not Path(path).name.lower().startswith("mmproj")]
+        primary = [
+            path
+            for path in ggufs
+            if path not in companion_paths
+            and not Path(path).name.lower().startswith("mmproj")
+        ]
         groups: dict[tuple[str, int, str], list[tuple[int, str]]] = {}
         standalone: list[str] = []
         for value in primary:
@@ -136,7 +142,10 @@ def resolve_entrypoint(
         raise ValidationError(f"GGUF entrypoint was not downloaded: {selected}")
 
     primary_files = {
-        value for value in ggufs if not Path(value).name.lower().startswith("mmproj")
+        value
+        for value in ggufs
+        if value not in companion_paths
+        and not Path(value).name.lower().startswith("mmproj")
     }
     match = _SHARD_RE.match(Path(selected).name)
     if match:

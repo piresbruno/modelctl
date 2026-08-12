@@ -5,10 +5,12 @@ import pytest
 
 from modelctl import __version__
 from modelctl.cards import CardResult
+from modelctl.catalog import load_catalog
 from modelctl.cli import DEFAULT_ROOT, _cache_dir, _local_root, _root, build_parser, run
 from modelctl.errors import ModelctlError
 from modelctl.integrity import RepairResult
 from modelctl.layout import Layout, atomic_symlink
+from modelctl.maintenance import StoreEntryAudit
 from modelctl.manifest import parse_manifest
 from modelctl.validation import ExpectedFile, write_metadata
 
@@ -119,6 +121,35 @@ def test_list_json_is_machine_readable(tmp_path, capsys):
             "repository": "org/model",
         }
     ]
+    assert load_catalog(tmp_path)["models"] == payload
+
+
+def test_catalog_commands_report_refresh_status_and_path(tmp_path, capsys):
+    _active_model(tmp_path)
+
+    assert run(["catalog", "refresh", "--root", str(tmp_path)]) == 0
+    assert "catalog: updated" in capsys.readouterr().out
+    assert run(["catalog", "status", "--root", str(tmp_path)]) == 0
+    assert "[ready]" in capsys.readouterr().out
+    assert run(["catalog", "path", "--root", str(tmp_path)]) == 0
+    assert capsys.readouterr().out == f"{tmp_path / 'catalog.json'}\n"
+
+
+def test_catalog_status_json_reports_stale_external_change(tmp_path, capsys):
+    _active_model(tmp_path)
+    run(["catalog", "refresh", "--root", str(tmp_path)])
+    capsys.readouterr()
+    (tmp_path / "active" / "foreign").mkdir()
+
+    assert run([
+        "catalog",
+        "status",
+        "--root",
+        str(tmp_path),
+        "--json",
+    ]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "stale"
 
 
 def test_list_ignores_hidden_entries_and_non_symlinks(tmp_path, capsys):
@@ -177,6 +208,40 @@ def test_repair_active_is_dry_run_by_default(tmp_path, monkeypatch, capsys):
     assert "[dry-run] demo" in capsys.readouterr().out
 
 
+def test_staging_audit_reports_relative_paths_and_sizes(tmp_path, monkeypatch, capsys):
+    path = tmp_path / ".staging" / "org" / "repo" / "object"
+    monkeypatch.setattr(
+        "modelctl.cli.audit_staging",
+        lambda root: [
+            StoreEntryAudit(path, "orphaned", 1024, detail="no journal")
+        ],
+    )
+
+    assert run(["staging-audit", "--root", str(tmp_path)]) == 0
+    output = capsys.readouterr().out
+    assert "[orphaned] org/repo/object" in output
+    assert "1.00 KiB" in output
+
+
+def test_cleanup_staging_is_dry_run_by_default(tmp_path, monkeypatch, capsys):
+    calls = []
+    path = tmp_path / ".staging" / "org" / "repo" / "object"
+
+    def fake_cleanup(root, selections, *, apply):
+        calls.append((root, selections, apply))
+        return [StoreEntryAudit(path, "orphaned", 1024)]
+
+    monkeypatch.setattr("modelctl.cli.cleanup_staging", fake_cleanup)
+    assert run([
+        "cleanup-staging",
+        "org/repo/object",
+        "--root",
+        str(tmp_path),
+    ]) == 0
+    assert calls == [(tmp_path.absolute(), ["org/repo/object"], False)]
+    assert "[would remove] org/repo/object" in capsys.readouterr().out
+
+
 def test_download_checks_symlink_support_before_remote_work(
     tmp_path, monkeypatch, capsys
 ):
@@ -228,13 +293,13 @@ def test_sync_local_uses_saved_nas_and_local_roots(tmp_path, monkeypatch, capsys
     capsys.readouterr()
     calls = []
 
-    def fake_sync(source_root, local_root, name, *, rsync):
-        calls.append((source_root, local_root, name, rsync))
+    def fake_sync(source_root, local_root, name, *, rsync, progress):
+        calls.append((source_root, local_root, name, rsync, callable(progress)))
         return local_root / "active" / name
 
     monkeypatch.setattr("modelctl.cli.sync_local", fake_sync)
     assert run(["sync-local", "demo"]) == 0
-    assert calls == [(nas, local, "demo", "rsync")]
+    assert calls == [(nas, local, "demo", "rsync", True)]
     assert capsys.readouterr().out == f"{local / 'active' / 'demo'}\n"
 
 
@@ -245,8 +310,8 @@ def test_sync_local_accepts_hugging_face_repository(
     cache = tmp_path / "hub"
     calls = []
 
-    def fake_sync(source_root, local_root, name, *, rsync):
-        calls.append((source_root, local_root, name, rsync))
+    def fake_sync(source_root, local_root, name, *, rsync, progress):
+        calls.append((source_root, local_root, name, rsync, callable(progress)))
         return local_root / "snapshot"
 
     monkeypatch.setattr("modelctl.cli.sync_local", fake_sync)
@@ -259,7 +324,13 @@ def test_sync_local_accepts_hugging_face_repository(
         str(cache),
     ]) == 0
     assert calls == [
-        (nas.absolute(), cache, "unsloth/DeepSeek-V4-Flash-0731", "rsync")
+        (
+            nas.absolute(),
+            cache,
+            "unsloth/DeepSeek-V4-Flash-0731",
+            "rsync",
+            True,
+        )
     ]
     assert capsys.readouterr().out == f"{cache / 'snapshot'}\n"
 
@@ -299,7 +370,7 @@ def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_version_uses_package_version(capsys):
-    assert __version__ == "0.9.6"
+    assert __version__ == "0.9.8"
     with pytest.raises(SystemExit) as exit_info:
         build_parser().parse_args(["--version"])
     assert exit_info.value.code == 0

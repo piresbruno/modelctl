@@ -217,6 +217,20 @@ def _verify_etag(path: Path, etag: str) -> None:
         )
 
 
+def _format_bytes(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{value:.2f} {unit}"
+        value /= 1024
+    raise AssertionError("unreachable")
+
+
+def _report(progress: Callable[[str], None] | None, message: str) -> None:
+    if progress is not None:
+        progress(message)
+
+
 def _selection(files: dict[str, str]) -> str:
     return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()[:16]
 
@@ -342,6 +356,7 @@ def sync_cache(
     *,
     rsync: str = "rsync",
     runner: Callable[..., Any] = subprocess.run,
+    progress: Callable[[str], None] | None = None,
 ) -> Path:
     validate_name(name)
     cache = canonical_cache(cache_dir)
@@ -381,7 +396,13 @@ def sync_cache(
             _ensure_real_directory(path)
         _ensure_real_directory(repository / ".modelctl-staging")
         staging.mkdir(parents=True, exist_ok=True)
+        total_bytes = sum(item.size or 0 for item in expected)
         _transition(cache, name, "RSYNC_TO_CACHE_STAGING", staging=str(staging))
+        _report(
+            progress,
+            f"sync-local: transferring {len(files)} files "
+            f"({_format_bytes(total_bytes)}) to cache staging",
+        )
         _write_file_list(file_list, sorted(files))
         command = [
             rsync,
@@ -405,25 +426,54 @@ def sync_cache(
         finally:
             file_list.unlink(missing_ok=True)
 
-        _transition(cache, name, "VALIDATING_STAGING")
-        for filename, etag in files.items():
+        _transition(
+            cache,
+            name,
+            "VALIDATING_STAGING",
+            files=len(files),
+            bytes=total_bytes,
+        )
+        _report(
+            progress,
+            f"sync-local: validating {len(files)} transferred files "
+            f"({_format_bytes(total_bytes)})",
+        )
+        for index, (filename, etag) in enumerate(files.items(), start=1):
+            _report(
+                progress,
+                f"sync-local: validating [{index}/{len(files)}] {filename}",
+            )
             _verify_etag(staging.joinpath(*PurePosixPath(filename).parts), etag)
 
+        _transition(
+            cache,
+            name,
+            "PUBLISHING_CACHE",
+            files=len(files),
+            bytes=total_bytes,
+        )
+        _report(progress, "sync-local: publishing verified blobs and snapshot")
         blobs = repository / "blobs"
         hf_locks = cache / ".locks" / repository.name
         _ensure_real_directory(cache / ".locks")
         _ensure_real_directory(hf_locks)
-        for filename, etag in files.items():
+        for index, (filename, etag) in enumerate(files.items(), start=1):
             staged = staging.joinpath(*PurePosixPath(filename).parts)
             blob = blobs / etag
             with WeakFileLock(hf_locks / f"{etag}.lock"):
                 if blob.exists():
+                    _report(
+                        progress,
+                        f"sync-local: checking existing blob "
+                        f"[{index}/{len(files)}] {filename}",
+                    )
                     _verify_etag(blob, etag)
                     staged.unlink()
                 else:
+                    # The staged file was verified immediately above. Atomic rename
+                    # preserves that same file while avoiding a second full hash pass.
                     os.replace(staged, blob)
                     _fsync_directory(blobs)
-                    _verify_etag(blob, etag)
 
         snapshot = repository / "snapshots" / commit
         if snapshot.exists():

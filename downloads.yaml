@@ -1,0 +1,16 @@
+# downloads.yaml
+# Every entry has a unique name so multiple quantizations and speculative
+# decoding models from the same repository can coexist.
+downloads:
+  - source: google/gemma-4-31B-it-qat-q4_0-gguf
+    name: gemma-4-31B-it-qat-q4_0-gguf
+    quantization: Q4_0
+    mmproj: gemma-4-31B-it-mmproj.gguf
+    runtime: llama.cpp
+
+  - source: unsloth/gemma-4-31B-it-qat-GGUF
+    name: gemma-4-31B-it-qat-GGUF-unsloth
+    quantization: UD-Q4_K_XL
+    mtp: mtp-gemma-4-31B-it.gguf
+    mmproj: mmproj-BF16.gguf
+    runtime: llama.cpp

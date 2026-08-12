@@ -62,6 +62,49 @@ def test_required_model_card_and_companions_must_be_selected(tmp_path):
         validate_artifacts(tmp_path, manifest, expected)
 
 
+@pytest.mark.parametrize(
+    "mtp_path",
+    ["mtp-model.gguf", "MTP/model-draft-Q8_0.gguf"],
+)
+def test_declared_gguf_companions_are_not_primary_quantizations(
+    tmp_path, mtp_path
+):
+    names = ["Model-Q4_K_M.gguf", "mmproj-F16.gguf", mtp_path]
+    expected = _touch(tmp_path, names)
+    manifest = parse_manifest(
+        {
+            "repo": "org/model",
+            "format": "gguf",
+            "include": names,
+            "companions": {
+                "mmproj": "mmproj-F16.gguf",
+                "mtp": mtp_path,
+            },
+        },
+        "model",
+    )
+
+    validate_artifacts(tmp_path, manifest, expected)
+    assert resolve_entrypoint(tmp_path, manifest, expected) == "Model-Q4_K_M.gguf"
+
+
+def test_explicit_entrypoint_ignores_declared_gguf_companions(tmp_path):
+    names = ["Model-Q4_K_M.gguf", "mtp-model.gguf"]
+    expected = _touch(tmp_path, names)
+    manifest = parse_manifest(
+        {
+            "repo": "org/model",
+            "format": "gguf",
+            "include": names,
+            "entrypoint": "Model-Q4_K_M.gguf",
+            "companions": {"mtp": "mtp-model.gguf"},
+        },
+        "model",
+    )
+
+    assert resolve_entrypoint(tmp_path, manifest, expected) == "Model-Q4_K_M.gguf"
+
+
 def test_independent_quantizations_are_ambiguous(tmp_path):
     expected = _touch(tmp_path, ["Model-Q4_K_M.gguf", "Model-Q8_0.gguf"])
     manifest = parse_manifest(

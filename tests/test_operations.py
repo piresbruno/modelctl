@@ -3,12 +3,15 @@ import json
 import shlex
 import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from huggingface_hub import scan_cache_dir
 
+from modelctl import catalog, hf_cache
+from modelctl.catalog import catalog_status, load_catalog
 from modelctl.errors import ModelctlError, ValidationError
 from modelctl.hf_cache import load_record, state_root
 from modelctl.layout import Layout, atomic_symlink
@@ -96,6 +99,9 @@ def test_update_publishes_before_switching_reference_and_reuses_valid_object(tmp
     ]
     assert snapshot.calls[0]["dry_run"] is True
     assert "dry_run" not in snapshot.calls[1]
+    assert load_catalog(tmp_path)["models"] == [
+        {"name": "demo", "runtime": "vllm", "repository": "org/demo"}
+    ]
 
     def should_not_download(**kwargs):
         raise AssertionError("valid content-addressed object should be reused")
@@ -104,6 +110,60 @@ def test_update_publishes_before_switching_reference_and_reuses_valid_object(tmp
         tmp_path, _manifest(), api=FakeApi("a" * 40), snapshot=should_not_download
     )
     assert reused == result
+
+
+def test_concurrent_updates_publish_complete_catalog(tmp_path):
+    def update(name, commit):
+        return update_model(
+            tmp_path,
+            _manifest(name),
+            api=FakeApi(commit * 40),
+            snapshot=FakeSnapshot({"config.json": name.encode()}),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                lambda item: update(*item),
+                [("alpha", "a"), ("beta", "b")],
+            )
+        )
+
+    assert len(results) == 2
+    assert [item["name"] for item in load_catalog(tmp_path)["models"]] == [
+        "alpha",
+        "beta",
+    ]
+
+
+def test_catalog_failure_does_not_roll_back_activated_model(tmp_path, monkeypatch):
+    update_model(
+        tmp_path,
+        _manifest("old"),
+        api=FakeApi("a" * 40),
+        snapshot=FakeSnapshot({"config.json": b"old"}),
+    )
+    catalog_path = tmp_path / "catalog.json"
+    previous = catalog_path.read_bytes()
+    real_atomic_json = catalog._atomic_json
+
+    def fail_catalog_write(path, payload):
+        if path == catalog_path:
+            raise OSError("simulated catalog failure")
+        real_atomic_json(path, payload)
+
+    monkeypatch.setattr(catalog, "_atomic_json", fail_catalog_write)
+    with pytest.raises(ModelctlError, match="was activated.*catalog"):
+        update_model(
+            tmp_path,
+            _manifest("new"),
+            api=FakeApi("b" * 40),
+            snapshot=FakeSnapshot({"config.json": b"new"}),
+        )
+
+    assert (tmp_path / "active" / "new").is_symlink()
+    assert catalog_path.read_bytes() == previous
+    assert catalog_status(tmp_path).status == "dirty"
 
 
 def test_failed_new_revision_does_not_change_active_reference(tmp_path):
@@ -272,8 +332,8 @@ def test_local_sync_resolves_hugging_face_repository_to_active_name(
         "modelctl.operations.list_active_models", lambda root: [model]
     )
 
-    def fake_sync(source, destination, name, *, rsync, runner):
-        calls.append((source, destination, name, rsync, runner))
+    def fake_sync(source, destination, name, *, rsync, runner, progress):
+        calls.append((source, destination, name, rsync, runner, progress))
         return destination / "snapshot"
 
     monkeypatch.setattr("modelctl.operations.sync_cache", fake_sync)
@@ -283,7 +343,7 @@ def test_local_sync_resolves_hugging_face_repository_to_active_name(
 
     assert result == cache / "snapshot"
     assert calls == [
-        (source_root, cache, "custom-name", "custom-rsync", shutil.copy)
+        (source_root, cache, "custom-name", "custom-rsync", shutil.copy, None)
     ]
 
 
@@ -313,7 +373,9 @@ def test_local_sync_reports_unknown_hugging_face_repository(
         sync_local(tmp_path / "nas", tmp_path / "hub", "org/missing")
 
 
-def test_local_sync_publishes_hf_cache_and_updates_record_last(tmp_path):
+def test_local_sync_publishes_hf_cache_and_updates_record_last(
+    tmp_path, monkeypatch
+):
     nas = tmp_path / "nas"
     cache = tmp_path / "hub"
     update_model(
@@ -332,9 +394,29 @@ def test_local_sync_publishes_hf_cache_and_updates_record_last(tmp_path):
         destination.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source / "config.json", destination / "config.json")
 
-    result = sync_local(nas, cache, "demo", runner=fake_rsync)
+    verified = []
+    real_verify = hf_cache._verify_etag
+
+    def track_verify(path, etag):
+        verified.append(path)
+        real_verify(path, etag)
+
+    monkeypatch.setattr("modelctl.hf_cache._verify_etag", track_verify)
+    progress = []
+    result = sync_local(
+        nas, cache, "demo", runner=fake_rsync, progress=progress.append
+    )
     snapshot = cache / "models--org--demo" / "snapshots" / ("d" * 40)
     assert result == snapshot.resolve()
+    assert len(verified) == 1
+    assert ".modelctl-staging" in verified[0].parts
+    assert verified[0].name == "config.json"
+    assert progress == [
+        "sync-local: transferring 1 files (4.00 B) to cache staging",
+        "sync-local: validating 1 transferred files (4.00 B)",
+        "sync-local: validating [1/1] config.json",
+        "sync-local: publishing verified blobs and snapshot",
+    ]
     assert (snapshot / "config.json").is_symlink()
     assert (cache / "models--org--demo" / "refs" / "main").read_text() == "d" * 40
     info = scan_cache_dir(cache)
@@ -343,6 +425,11 @@ def test_local_sync_publishes_hf_cache_and_updates_record_last(tmp_path):
     assert load_record(cache, "demo").snapshot == snapshot.resolve()
     state = json.loads((state_root(cache) / "state" / "demo.json").read_text())
     assert state["state"] == "READY_FOR_SERVICE_RESTART"
+    assert [item["state"] for item in state["history"]][-3:] == [
+        "VALIDATING_STAGING",
+        "PUBLISHING_CACHE",
+        "READY_FOR_SERVICE_RESTART",
+    ]
     inventory = list_cached_models(cache)
     assert [(item.name, item.repo, item.path) for item in inventory] == [
         ("demo", "org/demo", snapshot.resolve())

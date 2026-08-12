@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from .catalog import (
+    catalog_lock,
+    mark_catalog_dirty_locked,
+    refresh_catalog_locked,
+)
 from .errors import ModelctlError, ValidationError
 from .layout import Layout, atomic_symlink, model_lock, verify_symlink
 from .manifest import load_manifest, validate_name
@@ -219,6 +224,92 @@ def _quarantine_path(layout: Layout, name: str) -> Path:
     )
 
 
+def _apply_active_repair(
+    layout: Layout,
+    name: str,
+    reference: Path,
+    target: Path,
+) -> RepairResult:
+    quarantine = _quarantine_path(layout, name)
+    quarantine.parent.mkdir(parents=True, exist_ok=True)
+    repair_journal = StateJournal(
+        layout.state / "repairs" / f"{name}-{uuid4().hex}.json",
+        "repair-active",
+    )
+    repair_journal.transition("AUDITED", reference=str(reference), object=str(target))
+    os.rename(reference, quarantine)
+    _fsync_directory(reference.parent)
+    repair_journal.transition("QUARANTINED", quarantine=str(quarantine))
+    try:
+        atomic_symlink(target, reference)
+        verify_symlink(reference, target, managed_root=layout.models)
+        _fsync_directory(reference.parent)
+    except BaseException as exc:
+        rollback_error: str | None = None
+        try:
+            if os.path.lexists(reference):
+                if reference.is_dir() and not reference.is_symlink():
+                    failed = quarantine.with_name(
+                        f"{quarantine.name}-failed-publication"
+                    )
+                    os.rename(reference, failed)
+                else:
+                    reference.unlink(missing_ok=True)
+            os.rename(quarantine, reference)
+            _fsync_directory(reference.parent)
+        except Exception as recovery_exc:
+            rollback_error = f"{type(recovery_exc).__name__}: {recovery_exc}"
+        repair_journal.transition(
+            "ROLLED_BACK" if rollback_error is None else "ROLLBACK_FAILED",
+            error=f"{type(exc).__name__}: {exc}",
+            rollback_error=rollback_error,
+        )
+        raise ModelctlError(
+            f"failed to repair active reference for {name!r}: {exc}"
+            + (f"; rollback failed: {rollback_error}" if rollback_error else "")
+        ) from exc
+
+    if quarantine.is_dir():
+        try:
+            validate_object(quarantine, expected_name=name)
+        except (ModelctlError, ValidationError, OSError) as exc:
+            try:
+                retained_entries = any(quarantine.iterdir())
+            except OSError:
+                retained_entries = True
+            if retained_entries:
+                repair_journal.transition(
+                    "REPAIRED_QUARANTINE_INVALID",
+                    reference=str(reference),
+                    object=str(target),
+                    quarantine=str(quarantine),
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                return RepairResult(
+                    name,
+                    "repaired-invalid-quarantine",
+                    reference,
+                    target,
+                    quarantine,
+                )
+        else:
+            repair_journal.transition(
+                "REPAIRED",
+                reference=str(reference),
+                object=str(target),
+                quarantine=str(quarantine),
+            )
+            return RepairResult(name, "repaired", reference, target, quarantine)
+
+    repair_journal.transition(
+        "REPAIRED_QUARANTINE_MISSING",
+        reference=str(reference),
+        object=str(target),
+        expected_quarantine=str(quarantine),
+    )
+    return RepairResult(name, "repaired-no-quarantine", reference, target)
+
+
 def repair_active_reference(root: Path, name: str, *, apply: bool = False) -> RepairResult:
     layout = Layout(root)
     layout.prepare()
@@ -228,64 +319,18 @@ def repair_active_reference(root: Path, name: str, *, apply: bool = False) -> Re
         if not apply:
             return RepairResult(name, "dry-run", reference, target)
 
-        quarantine = _quarantine_path(layout, name)
-        quarantine.parent.mkdir(parents=True, exist_ok=True)
-        repair_journal = StateJournal(
-            layout.state / "repairs" / f"{name}-{uuid4().hex}.json",
-            "repair-active",
-        )
-        repair_journal.transition(
-            "AUDITED", reference=str(reference), object=str(target)
-        )
-        os.rename(reference, quarantine)
-        _fsync_directory(reference.parent)
-        repair_journal.transition("QUARANTINED", quarantine=str(quarantine))
-        try:
-            atomic_symlink(target, reference)
-            verify_symlink(reference, target, managed_root=layout.models)
-            _fsync_directory(reference.parent)
-        except BaseException as exc:
-            rollback_error: str | None = None
+        with catalog_lock(root):
+            mark_catalog_dirty_locked(root, f"repairing {name}")
+            result = _apply_active_repair(layout, name, reference, target)
             try:
-                if os.path.lexists(reference):
-                    if reference.is_dir() and not reference.is_symlink():
-                        failed = quarantine.with_name(
-                            f"{quarantine.name}-failed-publication"
-                        )
-                        os.rename(reference, failed)
-                    else:
-                        reference.unlink(missing_ok=True)
-                os.rename(quarantine, reference)
-                _fsync_directory(reference.parent)
-            except Exception as recovery_exc:
-                rollback_error = f"{type(recovery_exc).__name__}: {recovery_exc}"
-            repair_journal.transition(
-                "ROLLED_BACK" if rollback_error is None else "ROLLBACK_FAILED",
-                error=f"{type(exc).__name__}: {exc}",
-                rollback_error=rollback_error,
-            )
-            raise ModelctlError(
-                f"failed to repair active reference for {name!r}: {exc}"
-                + (f"; rollback failed: {rollback_error}" if rollback_error else "")
-            ) from exc
+                from .operations import list_active_models
 
-        if quarantine.is_dir():
-            validate_object(quarantine, expected_name=name)
-            repair_journal.transition(
-                "REPAIRED",
-                reference=str(reference),
-                object=str(target),
-                quarantine=str(quarantine),
-            )
-            return RepairResult(name, "repaired", reference, target, quarantine)
-
-        repair_journal.transition(
-            "REPAIRED_QUARANTINE_MISSING",
-            reference=str(reference),
-            object=str(target),
-            expected_quarantine=str(quarantine),
-        )
-        return RepairResult(name, "repaired-no-quarantine", reference, target)
+                refresh_catalog_locked(root, list_active_models)
+            except ModelctlError as exc:
+                raise ModelctlError(
+                    f"active reference {name!r} was repaired, but {exc}"
+                ) from exc
+            return result
 
 
 def cleanup_quarantine(root: Path, name: str, *, apply: bool = False) -> list[Path]:

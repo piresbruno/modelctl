@@ -7,6 +7,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from .catalog import (
+    catalog_lock,
+    mark_catalog_dirty_locked,
+    refresh_catalog_locked,
+)
 from .errors import ModelctlError, ValidationError
 from .generation import parse_hf_source
 from .hf_cache import (
@@ -226,10 +231,22 @@ def update_model(
             UpdateState.UPDATING_REFERENCE,
             reference=str(layout.active_path(manifest.name)),
         )
-        _activate_reference(layout, manifest.name, final, journal)
-        _fsync_directory(layout.active)
-        journal.transition(UpdateState.ACTIVE_ON_NAS, object=str(final), commit=commit)
-        metadata = validate_object(final, expected_commit=commit, expected_name=manifest.name)
+        with catalog_lock(root):
+            mark_catalog_dirty_locked(root, f"activating {manifest.name}")
+            _activate_reference(layout, manifest.name, final, journal)
+            _fsync_directory(layout.active)
+            journal.transition(
+                UpdateState.ACTIVE_ON_NAS, object=str(final), commit=commit
+            )
+            try:
+                refresh_catalog_locked(root, list_active_models)
+            except ModelctlError as exc:
+                raise ModelctlError(
+                    f"model {manifest.name!r} was activated, but {exc}"
+                ) from exc
+        metadata = validate_object(
+            final, expected_commit=commit, expected_name=manifest.name
+        )
         entrypoint = metadata["entrypoint"]
         return (final if entrypoint == "." else final / entrypoint).resolve(strict=True)
 
@@ -376,10 +393,16 @@ def sync_local(
     *,
     rsync: str = "rsync",
     runner: Callable[..., Any] = subprocess.run,
+    progress: Callable[[str], None] | None = None,
 ) -> Path:
     resolved_name = _resolve_active_name(source_root, name)
     return sync_cache(
-        source_root, local_root, resolved_name, rsync=rsync, runner=runner
+        source_root,
+        local_root,
+        resolved_name,
+        rsync=rsync,
+        runner=runner,
+        progress=progress,
     )
 
 

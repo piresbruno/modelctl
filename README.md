@@ -133,6 +133,7 @@ ROOT/
   active/NAME                          # atomically replaced symlink
   .staging/ORG/REPO/COMMIT--SELECTION/ # resumable, unpublished data
   state/NAME.json                      # state transition journal
+  catalog.json                         # generated active-model catalog
   cards/NAME -> .objects/NAME/COMMIT--HASH/
   cards/.objects/NAME/COMMIT--HASH/
     README.md                           # complete upstream model card
@@ -487,8 +488,13 @@ The command reads the NAS object's retained Hugging Face download metadata,
 verifies Git SHA-1 or LFS/Xet SHA-256 ETags, and publishes the standard
 `models--OWNER--REPO/blobs`, `snapshots/COMMIT`, and `refs` layout. The transfer
 is offline and resumable. While rsync is running, it displays aggregate bytes
-transferred, completion percentage, current speed, and ETA. The active modelctl
-registration changes only after all selected files and snapshot links validate.
+transferred, completion percentage, current speed, and ETA. After transfer,
+per-file validation and publication phases are reported while ETags are checked.
+New blobs are hashed once in staging and then published with an atomic rename.
+The active modelctl registration changes only after all selected files and
+snapshot links validate. Until that publication finishes, `hf cache list` may
+show the repository with size `0.0` because its files are still in modelctl
+staging rather than the standard cache snapshot.
 
 A manifest can select only part of a repository, such as one GGUF
 quantization. Such a revision is visible to `hf cache ls` and supports offline
@@ -535,6 +541,46 @@ runtime, and Hugging Face repository. NAS listings contain only active validated
 objects; local listings contain only validated modelctl cache registrations.
 Human NAS listings warn when malformed active references were skipped.
 
+### Generated model catalog
+
+NAS stores maintain `ROOT/catalog.json` as an atomically published, derived
+catalog for dashboards and other read-only integrations. Its `models` array is
+the same sorted projection emitted by `modelctl list --json`:
+
+```json
+{
+  "schema": 1,
+  "generation": 42,
+  "generated_at": "2026-08-11T21:00:00+00:00",
+  "active_fingerprint": "...",
+  "content_sha256": "...",
+  "models": [
+    {"name": "demo", "runtime": "vllm", "repository": "org/model"}
+  ]
+}
+```
+
+Successful activation and active-reference repair refresh the complete catalog
+under a global catalog lock. `modelctl list` also performs a live validated scan
+and refreshes the catalog, which repairs stale state caused by changes outside
+modelctl. Active symlinks and validated objects remain authoritative; do not edit
+`catalog.json` manually and do not use it for safety-sensitive path resolution.
+Local `list --local` registrations are not included.
+
+Inspect, rebuild, or locate the catalog explicitly:
+
+```bash
+modelctl catalog status --root /mnt/nas/llm-models
+modelctl catalog refresh --root /mnt/nas/llm-models
+modelctl catalog path --root /mnt/nas/llm-models
+jq -r '.models[].name' /mnt/nas/llm-models/catalog.json
+```
+
+Catalog writes use a temporary file, file and directory `fsync`, and atomic
+replacement. The file is not rewritten when its model projection and active
+fingerprint are unchanged. A failed refresh preserves the previous valid file
+and leaves a dirty marker for `catalog status` and the next refresh.
+
 Audit every active-store entry without modifying the store:
 
 ```bash
@@ -564,6 +610,31 @@ validated quarantines explicitly:
 modelctl cleanup-quarantine MODEL_NAME --root /mnt/nas/llm-models
 modelctl cleanup-quarantine MODEL_NAME --root /mnt/nas/llm-models --apply
 ```
+
+Audit unpublished staging data and immutable objects separately:
+
+```bash
+modelctl staging-audit --root /mnt/nas/llm-models
+modelctl objects-audit --root /mnt/nas/llm-models
+```
+
+Staging entries are classified as resumable, failed unpublished, published
+copies, journal-referenced, or orphaned. Published objects are classified as
+active, unreferenced, or invalid. Cleanup accepts only the exact three-part
+relative paths printed by the audit and is dry-run by default:
+
+```bash
+modelctl cleanup-staging OWNER/REPO/OBJECT --root /mnt/nas/llm-models
+modelctl cleanup-staging OWNER/REPO/OBJECT --root /mnt/nas/llm-models --apply
+modelctl gc-objects OWNER/REPO/OBJECT --root /mnt/nas/llm-models
+modelctl gc-objects OWNER/REPO/OBJECT --root /mnt/nas/llm-models --apply
+```
+
+`cleanup-staging` refuses resumable or otherwise live journal-referenced data.
+`gc-objects` revalidates each object under its model lock and refuses active or
+invalid objects. Stop modelctl writers and take a store snapshot before applying
+either cleanup, especially before removing unreferenced immutable revisions that
+might otherwise serve as manual rollback points.
 
 Unregister a synchronized model while preserving both its NAS source and shared
 Hugging Face cache data:

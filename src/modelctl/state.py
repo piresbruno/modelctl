@@ -40,6 +40,24 @@ class StateJournal:
     operation: str
     history: list[dict[str, Any]] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        """Continue a valid journal so failed retries retain activation evidence."""
+        if self.history or not self.path.is_file():
+            return
+        try:
+            document = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        existing = document.get("history")
+        if document.get("operation") != self.operation or not isinstance(existing, list):
+            return
+        if not all(
+            isinstance(event, dict) and isinstance(event.get("state"), str)
+            for event in existing
+        ):
+            return
+        self.history.extend(dict(event) for event in existing)
+
     def transition(self, state: StrEnum | str, **details: Any) -> None:
         event = {
             "state": str(state),

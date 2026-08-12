@@ -2,6 +2,36 @@
 
 This project follows semantic versioning.
 
+## 0.9.8
+
+### Added
+
+- Add an atomically maintained `catalog.json` whose model projection mirrors
+  `list --json`, plus `catalog status`, `catalog refresh`, and `catalog path`
+  commands for read-only integrations.
+
+### Fixed
+
+- Serialize catalog refreshes across concurrent activations, preserve the prior
+  valid catalog after publication failure, and detect dirty or externally stale
+  catalog state through active-reference fingerprints.
+
+## 0.9.7
+
+### Added
+
+- Add dry-run-first `staging-audit`, `cleanup-staging`, `objects-audit`, and
+  `gc-objects` commands for measuring and explicitly removing unpublished or
+  unreachable store data.
+
+### Fixed
+
+- Exclude declared GGUF companions from primary quantization validation, retain
+  successful activation history across failed update retries, and tolerate CIFS
+  servers that retain only an empty quarantine directory after active repair.
+- Report post-rsync validation and publication progress during `sync-local`,
+  and avoid hashing newly published cache blobs a redundant second time.
+
 ## 0.9.6
 
 ### Added

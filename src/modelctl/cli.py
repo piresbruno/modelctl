@@ -8,6 +8,7 @@ from pathlib import Path
 
 from . import __version__
 from .cards import sync_model_cards
+from .catalog import catalog_path, catalog_status, refresh_catalog
 from .config import load_local_root, load_root, save_local_root, save_root
 from .download_queue import (
     DownloadQueueError,
@@ -28,6 +29,12 @@ from .integrity import (
     cleanup_quarantine,
     malformed_active_references,
     repair_active_reference,
+)
+from .maintenance import (
+    audit_objects,
+    audit_staging,
+    cleanup_objects,
+    cleanup_staging,
 )
 from .manifest import load_manifest, validate_name
 from .operations import (
@@ -83,6 +90,16 @@ def _selected_cache(args: argparse.Namespace) -> Path:
     return _cache_dir(explicit or legacy)
 
 
+def _format_size(value: int) -> str:
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    size = float(value)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.2f} {unit}"
+        size /= 1024
+    raise AssertionError("unreachable")
+
+
 def _positive_int(value: str) -> int:
     number = int(value)
     if number < 1:
@@ -114,7 +131,17 @@ def _add_local_root(parser: argparse.ArgumentParser) -> None:
 
 
 def _print_models(root: Path, *, json_output: bool, local: bool = False) -> None:
-    models = list_cached_models(root) if local else list_active_models(root)
+    if local:
+        models = list_cached_models(root)
+    else:
+        try:
+            models, _ = refresh_catalog(root, list_active_models)
+        except ModelctlError as exc:
+            models = list_active_models(root)
+            print(
+                f"warning: live listing succeeded but catalog refresh failed: {exc}",
+                file=sys.stderr,
+            )
     if json_output:
         payload = [
             {"name": model.name, "runtime": model.runtime, "repository": model.repo}
@@ -233,6 +260,34 @@ and incomplete staging downloads are excluded.""",
     )
     list_models.add_argument("--json", action="store_true", help="emit JSON")
 
+    catalog = commands.add_parser(
+        "catalog",
+        help="inspect or refresh the generated active-model catalog",
+        description=(
+            "Manage ROOT/catalog.json, a derived catalog whose models array mirrors "
+            "modelctl list --json. Active references remain authoritative."
+        ),
+    )
+    catalog_commands = catalog.add_subparsers(dest="catalog_command", required=True)
+    catalog_status_command = catalog_commands.add_parser(
+        "status", help="check catalog schema, dirty state, and active fingerprint"
+    )
+    catalog_status_command.add_argument(
+        "--json", action="store_true", help="emit JSON"
+    )
+    _add_root(catalog_status_command)
+    catalog_refresh_command = catalog_commands.add_parser(
+        "refresh", help="rebuild the catalog from validated active references"
+    )
+    catalog_refresh_command.add_argument(
+        "--json", action="store_true", help="emit JSON"
+    )
+    _add_root(catalog_refresh_command)
+    catalog_path_command = catalog_commands.add_parser(
+        "path", help="print the generated catalog path"
+    )
+    _add_root(catalog_path_command)
+
     doctor = commands.add_parser(
         "doctor",
         help="audit active NAS references and canonical objects",
@@ -290,6 +345,55 @@ Quarantined directories are retained until cleanup-quarantine is explicitly run.
     )
     cleanup.add_argument("--json", action="store_true", help="emit JSON")
     _add_root(cleanup)
+
+    staging_audit = commands.add_parser(
+        "staging-audit",
+        help="classify unpublished and resumable staging data",
+        description=(
+            "Report staging objects as resumable, failed, published duplicates, "
+            "journal-referenced, or orphaned without modifying the store."
+        ),
+    )
+    staging_audit.add_argument("--json", action="store_true", help="emit JSON")
+    _add_root(staging_audit)
+
+    staging_cleanup = commands.add_parser(
+        "cleanup-staging",
+        help="remove explicitly selected audited staging objects",
+        description=(
+            "Re-audit explicitly selected paths and remove only failed, published-"
+            "duplicate, or orphaned staging objects. Dry-run is the default."
+        ),
+    )
+    staging_cleanup.add_argument("paths", nargs="+", metavar="OWNER/REPO/OBJECT")
+    staging_cleanup.add_argument(
+        "--apply", action="store_true", help="delete selected staging data"
+    )
+    staging_cleanup.add_argument("--json", action="store_true", help="emit JSON")
+    _add_root(staging_cleanup)
+
+    objects_audit = commands.add_parser(
+        "objects-audit",
+        help="classify active and unreferenced immutable objects",
+        description="Validate published objects and report active reachability.",
+    )
+    objects_audit.add_argument("--json", action="store_true", help="emit JSON")
+    _add_root(objects_audit)
+
+    object_cleanup = commands.add_parser(
+        "gc-objects",
+        help="remove explicitly selected unreferenced immutable objects",
+        description=(
+            "Revalidate explicitly selected objects and prove they are not active. "
+            "Dry-run is the default."
+        ),
+    )
+    object_cleanup.add_argument("paths", nargs="+", metavar="OWNER/REPO/OBJECT")
+    object_cleanup.add_argument(
+        "--apply", action="store_true", help="delete selected unreferenced objects"
+    )
+    object_cleanup.add_argument("--json", action="store_true", help="emit JSON")
+    _add_root(object_cleanup)
 
     delete = commands.add_parser(
         "delete-local",
@@ -562,8 +666,9 @@ Review a generated command before evaluating or executing it.""",
 Pass an active model name or its Hugging Face repository id. A repository id
 must identify exactly one active model. Selected repository files are published
 as HF blobs and snapshot symlinks. Partial selections remain partial snapshots.
-Transfer status includes bytes, completion, speed, and ETA. The inference service
-is not restarted.""",
+Transfer status includes bytes, completion, speed, and ETA; post-transfer ETag
+validation and publication phases are also reported. The inference service is
+not restarted.""",
     )
     sync.add_argument(
         "name", metavar="MODEL_OR_REPO",
@@ -612,11 +717,39 @@ def run(argv: list[str] | None = None) -> int:
             _selected_cache(args),
             args.name,
             rsync=args.rsync,
+            progress=lambda message: print(message, flush=True),
         )
         print(result)
         return 0
 
     root = _root(args.root)
+    if args.command == "catalog":
+        if args.catalog_command == "path":
+            print(catalog_path(root))
+            return 0
+        if args.catalog_command == "status":
+            status = catalog_status(root)
+            if args.json:
+                print(json.dumps(status.to_dict(), indent=2))
+            else:
+                detail = f" ({status.detail})" if status.detail else ""
+                print(f"[{status.status}] {status.path}{detail}")
+                if status.generation is not None:
+                    print(
+                        f"generation: {status.generation}; models: {status.models}"
+                    )
+            return 0 if status.status == "ready" else 1
+        _, result = refresh_catalog(root, list_active_models)
+        if args.json:
+            print(json.dumps(result.to_dict(), indent=2))
+        else:
+            action = "updated" if result.changed else "unchanged"
+            print(
+                f"catalog: {action}; generation {result.generation}; "
+                f"{len(result.models)} model(s); {result.path}"
+            )
+        return 0
+
     if args.command == "doctor":
         results = audit_active_references(root)
         if args.json:
@@ -674,6 +807,56 @@ def run(argv: list[str] | None = None) -> int:
             for path in paths:
                 print(f"[{action}] {path}")
             print(f"cleanup: {len(paths)} quarantine path(s)")
+        return 0
+
+    if args.command in {"staging-audit", "objects-audit"}:
+        results = (
+            audit_staging(root)
+            if args.command == "staging-audit"
+            else audit_objects(root)
+        )
+        if args.json:
+            print(json.dumps([item.to_dict() for item in results], indent=2))
+        else:
+            base = root / (
+                ".staging" if args.command == "staging-audit" else "models"
+            )
+            for item in results:
+                relative = item.path.relative_to(base)
+                name = f"; name: {item.name}" if item.name is not None else ""
+                detail = f"; {item.detail}" if item.detail else ""
+                print(
+                    f"[{item.status}] {relative} "
+                    f"({_format_size(item.bytes)}{name}{detail})"
+                )
+            print(
+                f"audit: {len(results)} path(s), "
+                f"{_format_size(sum(item.bytes for item in results))}"
+            )
+        return 0
+
+    if args.command in {"cleanup-staging", "gc-objects"}:
+        results = (
+            cleanup_staging(root, args.paths, apply=args.apply)
+            if args.command == "cleanup-staging"
+            else cleanup_objects(root, args.paths, apply=args.apply)
+        )
+        if args.json:
+            print(json.dumps([item.to_dict() for item in results], indent=2))
+        else:
+            base = root / (
+                ".staging" if args.command == "cleanup-staging" else "models"
+            )
+            action = "removed" if args.apply else "would remove"
+            for item in results:
+                print(
+                    f"[{action}] {item.path.relative_to(base)} "
+                    f"({_format_size(item.bytes)})"
+                )
+            print(
+                f"cleanup: {len(results)} path(s), "
+                f"{_format_size(sum(item.bytes for item in results))}"
+            )
         return 0
 
     if args.command == "download":

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from modelctl.catalog import load_catalog
 from modelctl.errors import ModelctlError
 from modelctl.integrity import (
     audit_active_references,
@@ -104,6 +105,9 @@ def test_repair_is_dry_run_by_default_and_apply_quarantines_copy(tmp_path):
     assert {item.name: item.status for item in audit_active_references(tmp_path)}[
         "demo"
     ] == "valid"
+    assert load_catalog(tmp_path)["models"] == [
+        {"name": "demo", "runtime": "vllm", "repository": "org/demo"}
+    ]
 
     quarantines = cleanup_quarantine(tmp_path, "demo")
     assert quarantines == [repaired.quarantine]
@@ -137,6 +141,61 @@ def test_repair_reports_when_filesystem_does_not_retain_quarantine(
     repair_journal = next((tmp_path / "state" / "repairs").glob("*.json"))
     assert json.loads(repair_journal.read_text())["state"] == (
         "REPAIRED_QUARANTINE_MISSING"
+    )
+
+
+def test_repair_reports_when_filesystem_retains_empty_quarantine_directory(
+    tmp_path, monkeypatch
+):
+    object_path, reference = _regular_active_copy(tmp_path)
+    real_atomic_symlink = atomic_symlink
+
+    def publish_then_empty_quarantine(target, link):
+        real_atomic_symlink(target, link)
+        parent = tmp_path / ".staging" / ".active-quarantine" / "demo"
+        for path in parent.iterdir():
+            if path.is_dir():
+                shutil.rmtree(path)
+                path.mkdir()
+
+    monkeypatch.setattr(
+        "modelctl.integrity.atomic_symlink", publish_then_empty_quarantine
+    )
+    result = repair_active_reference(tmp_path, "demo", apply=True)
+
+    assert result.status == "repaired-no-quarantine"
+    assert result.quarantine is None
+    assert reference.is_symlink()
+    assert reference.resolve() == object_path.resolve()
+    repair_journal = next((tmp_path / "state" / "repairs").glob("*.json"))
+    assert json.loads(repair_journal.read_text())["state"] == (
+        "REPAIRED_QUARANTINE_MISSING"
+    )
+
+
+def test_repair_reports_invalid_retained_quarantine(tmp_path, monkeypatch):
+    object_path, reference = _regular_active_copy(tmp_path)
+    real_atomic_symlink = atomic_symlink
+
+    def publish_then_corrupt_quarantine(target, link):
+        real_atomic_symlink(target, link)
+        parent = tmp_path / ".staging" / ".active-quarantine" / "demo"
+        quarantine = next(path for path in parent.iterdir() if path.is_dir())
+        (quarantine / ".modelctl.json").unlink()
+
+    monkeypatch.setattr(
+        "modelctl.integrity.atomic_symlink", publish_then_corrupt_quarantine
+    )
+    result = repair_active_reference(tmp_path, "demo", apply=True)
+
+    assert result.status == "repaired-invalid-quarantine"
+    assert result.quarantine is not None
+    assert result.quarantine.is_dir()
+    assert reference.is_symlink()
+    assert reference.resolve() == object_path.resolve()
+    repair_journal = next((tmp_path / "state" / "repairs").glob("*.json"))
+    assert json.loads(repair_journal.read_text())["state"] == (
+        "REPAIRED_QUARANTINE_INVALID"
     )
 
 
