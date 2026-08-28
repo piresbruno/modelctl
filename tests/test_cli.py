@@ -531,6 +531,7 @@ def test_list_local_warns_and_skips_broken_registration(
     captured = capsys.readouterr()
     assert "No active models" in captured.out
     assert "delete-local" in captured.err
+    assert "broken" in captured.err
 
 
 def test_sync_rejects_cache_dir_and_legacy_root_together(tmp_path):

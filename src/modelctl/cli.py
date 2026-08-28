@@ -154,19 +154,11 @@ def _print_models(root: Path, *, json_output: bool, local: bool = False) -> None
     malformed = (
         malformed_cached_records(root) if local else malformed_active_references(root)
     )
+    warning = _malformed_warning(malformed, local=local)
     if not models:
         print(f"No active models in {root}.")
-        if malformed:
-            hint = (
-                "use 'modelctl delete-local NAME' to remove them"
-                if local
-                else "run 'modelctl doctor' for details"
-            )
-            kind = "local registration(s)" if local else "active reference(s)"
-            print(
-                f"warning: skipped {len(malformed)} malformed {kind}; {hint}",
-                file=sys.stderr,
-            )
+        if warning:
+            print(warning, file=sys.stderr)
         return
     rows = [(model.name, model.runtime, model.repo) for model in models]
     headers = ("NAME", "RUNTIME", "REPOSITORY")
@@ -178,17 +170,26 @@ def _print_models(root: Path, *, json_output: bool, local: bool = False) -> None
     print(template.format(*headers))
     for row in rows:
         print(template.format(*row))
-    if malformed:
-        hint = (
-            "use 'modelctl delete-local NAME' to remove them"
-            if local
-            else "run 'modelctl doctor' for details"
+    if warning:
+        print(warning, file=sys.stderr)
+
+
+def _malformed_warning(malformed: list[str], *, local: bool) -> str | None:
+    """Actionable warning naming skipped malformed entries (local listings
+    name the stale registrations so they can be deleted)."""
+    if not malformed:
+        return None
+    if local:
+        names = ", ".join(sorted(set(malformed)))
+        return (
+            f"warning: skipped {len(malformed)} malformed local "
+            f"registration(s): {names}; use 'modelctl delete-local NAME' "
+            "to remove them"
         )
-        kind = "local registration(s)" if local else "active reference(s)"
-        print(
-            f"warning: skipped {len(malformed)} malformed {kind}; {hint}",
-            file=sys.stderr,
-        )
+    return (
+        f"warning: skipped {len(malformed)} malformed active reference(s); "
+        "run 'modelctl doctor' for details"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
