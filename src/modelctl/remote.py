@@ -134,12 +134,18 @@ def _remote_payload(stdout: str, host: str, *, command: str) -> dict[str, Any]:
 
 def _push_file_list(source: Path, metadata: dict[str, Any]) -> list[str]:
     """Every file rsync must move: the selected repository files, the object
-    metadata journal, and retained Hugging Face download metadata."""
+    metadata journal, and the retained per-file Hugging Face download metadata
+    used for remote ETag verification.
+
+    Other Hugging Face cache artifacts (for example xet tree JSONs under
+    ``.cache/huggingface/trees``) are not needed by ``receive-cache`` and can
+    carry unreadable permissions on NAS mounts, so they are excluded.
+    """
     names = [str(item["path"]) for item in metadata["files"]]
     names.append(".modelctl.json")
-    cache_root = source / ".cache"
-    if cache_root.is_dir():
-        for path in sorted(cache_root.rglob("*")):
+    metadata_root = source / ".cache" / "huggingface" / "download"
+    if metadata_root.is_dir():
+        for path in sorted(metadata_root.rglob("*")):
             if path.is_file():
                 names.append(path.relative_to(source).as_posix())
     return sorted(names)

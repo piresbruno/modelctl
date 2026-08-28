@@ -212,11 +212,10 @@ class FakeRunner:
         source = Path(command[-2].removesuffix("/"))
         destination = Path(command[-1].split(":", 1)[1].removesuffix("/"))
         destination.mkdir(parents=True, exist_ok=True)
-        for entry in source.rglob("*"):
-            if entry.is_file():
-                target = destination / entry.relative_to(source)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(entry, target)
+        for name in self.file_list:
+            staged = destination / name
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source / name, staged)
         return SimpleNamespace(returncode=0)
 
 
@@ -278,6 +277,21 @@ def test_push_orchestrates_probe_rsync_and_commit(tmp_path):
         ".modelctl.json",
         "config.json",
     ]
+
+
+def test_push_excludes_non_download_cache_metadata(tmp_path):
+    nas = _nas_object(tmp_path)
+    cache = tmp_path / "hub"
+    fake = FakeRunner(cache)
+    object_path = (nas / "active" / "demo").resolve()
+    tree = object_path / ".cache" / "huggingface" / "trees" / ("e" * 40 + ".json")
+    tree.parent.mkdir(parents=True, exist_ok=True)
+    tree.write_text("{}")
+    tree.chmod(0o000)
+    push_model(nas, cache, "demo", host="node-b", runner=fake)
+    transferred = [name for name in fake.file_list if name.startswith(".cache")]
+    assert transferred == [".cache/huggingface/download/config.json.metadata"]
+    assert all("trees" not in name for name in fake.file_list)
 
 
 def test_push_uses_port_identity_and_fabric_host(tmp_path):

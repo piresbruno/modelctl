@@ -6,6 +6,9 @@ This project follows semantic versioning.
 
 ### Added
 
+- `push` transfers only the retained per-file HF download metadata needed for
+  ETag verification, excluding unrelated cache artifacts such as xet tree
+  JSONs that can carry unreadable permissions on NAS mounts.
 - `push` now creates the remote cache staging directory and proves the cache
   is writable over ssh before transferring anything, failing with an
   actionable error instead of an opaque rsync receiver failure. rsync's
