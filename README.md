@@ -529,8 +529,9 @@ active model automatically (`modelctl push incoai/GLM-5.3-Flash-DFlash2
 - The destination also needs the `rsync` package (`sudo apt install rsync`),
   since rsync runs on both ends.
 - The remote cache directory must be creatable and writable by the ssh user.
-  `push` preflights it (`mkdir -p` plus a writability check) and fails with
-  an actionable error before transferring anything when it is not.
+  `push` preflights it (creating the remote staging directory plus a
+  writability check) and fails with an actionable error before transferring
+  anything when it is not.
 
 #### How it works
 
@@ -538,11 +539,13 @@ active model automatically (`modelctl push incoai/GLM-5.3-Flash-DFlash2
    Hugging Face download metadata.
 2. **Probe** — a JSON handshake over ssh (`receive-cache --probe`) verifies
    the remote modelctl protocol and returns the canonical remote cache path.
-3. **Preflight and transfer** — the remote cache directory is created and
-   checked, then only the object's selected files (plus `.modelctl.json` and
-   retained ETag metadata) are rsynced over `ssh -o Compression=no` into
-   deterministic remote staging. Interrupted transfers stay resumable in
-   remote staging; a rerun resumes them.
+3. **Preflight and transfer** — the remote cache staging directory is created
+   and checked, then only the object's selected files (plus `.modelctl.json`
+   and retained ETag metadata) are rsynced over `ssh -o Compression=no` into
+   that staging directory (rsync's receiver creates the destination root
+   without creating missing parents, so the path must already exist).
+   Interrupted transfers stay resumable in remote staging; a rerun resumes
+   them.
 4. **Commit** — the remote `receive-cache` re-derives the staging path from
    the transferred metadata (misplaced or tampered transfers are rejected),
    validates every file against its retained Hugging Face ETag, and

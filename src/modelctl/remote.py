@@ -69,26 +69,32 @@ def _run_ssh(
     return result.stdout
 
 
-def _prepare_remote_cache(
+def _prepare_remote_staging(
     ssh: str,
     host: str,
     port: int | None,
     identity: str | None,
+    staging: Path,
     cache: Path,
     runner: Callable[..., Any],
     progress: Callable[[str], None] | None,
 ) -> None:
-    """Ensure the remote cache directory exists and is writable before rsync.
+    """Create the remote staging directory and verify the cache is writable.
 
-    rsync fails with an opaque receiver error when the destination parent is
-    missing or unwritable; a short ``mkdir -p`` plus writability probe turns
-    that into an actionable preflight failure.
+    rsync's receiver creates the destination root with a single mkdir (no
+    ``-p``) under ``--files-from``, so the deep staging path must already
+    exist or the transfer fails with an opaque ENOENT. Creating it also proves
+    the cache tree is writable before any bytes move.
     """
     if progress is not None:
         progress(f"push: preparing {cache} on {host}")
-    script = 'mkdir -p "$1" && test -w "$1"'
+    script = 'mkdir -p "$1" && test -w "$2"'
     argv = _ssh_argv(
-        ssh, host, port, identity, ["sh", "-c", script, "sh", str(cache)]
+        ssh,
+        host,
+        port,
+        identity,
+        ["sh", "-c", script, "sh", str(staging), str(cache)],
     )
     try:
         result = runner(
@@ -248,8 +254,8 @@ def push_model(
     if not isinstance(payload.get("cache"), str) or not payload["cache"]:
         raise ModelctlError(f"{host} returned no cache path in its probe payload")
     remote_cache = Path(payload["cache"])
-    _prepare_remote_cache(ssh, host, port, identity, remote_cache, runner, progress)
     staging = staging_path_for(remote_cache, str(metadata["repo"]), commit, files)
+    _prepare_remote_staging(ssh, host, port, identity, staging, remote_cache, runner, progress)
 
     names = _push_file_list(object_path, metadata)
     descriptor, list_path = tempfile.mkstemp(prefix="modelctl-push-", suffix=".files")

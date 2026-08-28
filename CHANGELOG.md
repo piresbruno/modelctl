@@ -6,10 +6,11 @@ This project follows semantic versioning.
 
 ### Added
 
-- `push` now preflights the remote cache directory over ssh (`mkdir -p` plus
-  a writability check) before transferring anything, failing with an
-  actionable error when the cache cannot be created or written instead of an
-  opaque rsync receiver failure.
+- `push` now creates the remote cache staging directory and proves the cache
+  is writable over ssh before transferring anything, failing with an
+  actionable error instead of an opaque rsync receiver failure. rsync's
+  receiver creates the destination root with a single mkdir under
+  `--files-from`, so the deep staging path must already exist.
 - Document the full `push` workflow, prerequisites, options, fabric examples,
   and the `receive-cache` handshake and commit semantics in both the CLI help
   and the README.

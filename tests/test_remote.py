@@ -253,7 +253,8 @@ def test_push_orchestrates_probe_rsync_and_commit(tmp_path):
     assert prepare[:2] == ["ssh", "node-b"]
     assert prepare[2:4] == ["sh", "-c"]
     assert "mkdir -p" in prepare[4]
-    assert prepare[5:7] == ["sh", str(cache)]
+    assert prepare[5:7] == ["sh", str(staging)]
+    assert prepare[7] == str(cache)
     rsync = fake.calls[3]
     assert rsync[0] == "rsync"
     for flag in ("--archive", "--partial", "--delete", "--from0", "-e"):
@@ -496,7 +497,7 @@ def test_push_end_to_end_through_real_receive_cli(tmp_path, monkeypatch):
             ]
             if remote_args and remote_args[0] == "sh":
                 return subprocess.run(
-                    ["sh", "-c", remote_args[2], "sh", remote_args[4]],
+                    ["sh", "-c", remote_args[2], "sh", *remote_args[4:]],
                     capture_output=True,
                     text=True,
                 )
