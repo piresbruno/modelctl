@@ -3,20 +3,22 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
-from .errors import ModelctlError, ValidationError
+from .errors import ModelctlError
+from .generation import parse_hf_source
 from .hf_cache import (
     RECEIVE_PROTO,
-    read_source_etag,
+    list_records,
+    load_record,
     staging_path_for,
     write_transfer_file_list,
 )
-from .operations import active_object, resolve_active_name
-from .validation import ExpectedFile
+from .manifest import validate_name
 
 
 def _ssh_argv(
@@ -132,6 +134,65 @@ def _remote_payload(stdout: str, host: str, *, command: str) -> dict[str, Any]:
     return payload
 
 
+def _cache_source(
+    cache_dir: Path, selector: str
+) -> tuple[str, dict[str, Any], dict[str, str], str, Path]:
+    """Resolve a local HF cache registration and build a transfer overlay.
+
+    Returns ``(name, metadata, files, commit, overlay)``. The overlay is a
+    small directory whose entries are symlinks to the registered snapshot
+    files plus a generated ``.modelctl.json`` and retained ETag metadata, so
+    the remote ``receive-cache`` path validates and publishes the transfer
+    unchanged. Callers must remove the overlay afterwards.
+    """
+    if "/" not in selector:
+        record = load_record(cache_dir, validate_name(selector))
+    else:
+        repo, _ = parse_hf_source(selector)
+        matches = [item for item in list_records(cache_dir) if item.repo == repo]
+        if not matches:
+            raise ModelctlError(
+                f"repository {repo!r} has no local cache registration on this "
+                "host; run 'modelctl sync-local' first"
+            )
+        if len(matches) > 1:
+            names = ", ".join(repr(item.name) for item in matches)
+            raise ModelctlError(
+                f"repository {repo!r} is registered under multiple names: {names}"
+            )
+        record = matches[0]
+    overlay = Path(tempfile.mkdtemp(prefix="modelctl-push-cache-"))
+    commit = record.commit
+    try:
+        for path, etag in record.files.items():
+            relative = PurePosixPath(path)
+            source = record.snapshot.joinpath(*relative.parts)
+            link = overlay.joinpath(*relative.parts)
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(source)
+        metadata = dict(record.metadata)
+        metadata["commit"] = commit
+        (overlay / ".modelctl.json").write_text(
+            json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+        )
+        metadata_root = overlay / ".cache" / "huggingface" / "download"
+        for path, etag in record.files.items():
+            relative = PurePosixPath(path)
+            target = record.snapshot.joinpath(*relative.parts)
+            metadata_target = metadata_root.joinpath(*relative.parts).with_suffix(
+                relative.suffix + ".metadata"
+            )
+            metadata_target.parent.mkdir(parents=True, exist_ok=True)
+            timestamp = target.stat().st_mtime + 60
+            metadata_target.write_text(
+                f"{commit}\n{etag}\n{timestamp}\n", encoding="utf-8"
+            )
+        return record.name, metadata, dict(record.files), commit, overlay
+    except BaseException:
+        shutil.rmtree(overlay, ignore_errors=True)
+        raise
+
+
 def _push_file_list(source: Path, metadata: dict[str, Any]) -> list[str]:
     """Every file rsync must move: the selected repository files, the object
     metadata journal, and the retained per-file Hugging Face download metadata
@@ -216,8 +277,7 @@ def _remote_command(
 
 
 def push_model(
-    source_root: Path,
-    remote_cache_dir: Path,
+    local_cache_dir: Path,
     name: str,
     *,
     host: str,
@@ -229,80 +289,83 @@ def push_model(
     runner: Callable[..., Any] = subprocess.run,
     progress: Callable[[str], None] | None = None,
 ) -> str:
-    """Copy one active NAS model into another host's Hugging Face cache over ssh.
+    """Copy one model from the local Hugging Face cache into another host's
+    Hugging Face cache over ssh.
 
-    The source is always the local managed store. The remote
-    ``modelctl receive-cache`` binary is auto-discovered (or taken from
-    ``remote_modelctl``), rsync transfers the object's selected files into the
-    remote cache staging area, and the remote validates and publishes blobs, a
-    snapshot, refs, and a registration record. Interrupted transfers remain
-    resumable in remote staging.
+    The model must already have a modelctl registration in the local cache
+    (for example from ``modelctl sync-local`` or an earlier push); push reads
+    that snapshot and transfers only its files through the remote
+    ``receive-cache`` validation and publication path. Interrupted transfers
+    remain resumable in remote staging.
     """
-    resolved = resolve_active_name(source_root, name)
-    object_path, metadata = active_object(source_root, resolved)
-    commit = str(metadata.get("commit", ""))
-    if not commit:
-        raise ValidationError("active object metadata has no commit")
-    expected = [ExpectedFile.from_dict(item) for item in metadata["files"]]
-    files = {
-        item.path: read_source_etag(object_path, item.path, commit)
-        for item in expected
-    }
-    if remote_modelctl is not None:
-        modelctl_bin = str(remote_modelctl)
-    else:
-        modelctl_bin = _discover_remote_modelctl(ssh, host, port, identity, runner)
-    probe_args = _remote_command(modelctl_bin, resolved, remote_cache_dir, probe=True)
+    resolved, metadata, files, commit, overlay = _cache_source(local_cache_dir, name)
     if progress is not None:
-        progress(f"push: probing {host} for receive-cache support")
-    stdout = _run_ssh(ssh, host, port, identity, probe_args, runner)
-    payload = _remote_payload(stdout, host, command="receive-cache --probe")
-    if not isinstance(payload.get("cache"), str) or not payload["cache"]:
-        raise ModelctlError(f"{host} returned no cache path in its probe payload")
-    remote_cache = Path(payload["cache"])
-    staging = staging_path_for(remote_cache, str(metadata["repo"]), commit, files)
-    _prepare_remote_staging(ssh, host, port, identity, staging, remote_cache, runner, progress)
-
-    names = _push_file_list(object_path, metadata)
-    descriptor, list_path = tempfile.mkstemp(prefix="modelctl-push-", suffix=".files")
-    os.close(descriptor)
+        progress(f"push: reading {resolved} from the local Hugging Face cache")
     try:
-        write_transfer_file_list(Path(list_path), names)
+        if remote_modelctl is not None:
+            modelctl_bin = str(remote_modelctl)
+        else:
+            modelctl_bin = _discover_remote_modelctl(ssh, host, port, identity, runner)
+        probe_args = _remote_command(
+            modelctl_bin, resolved, local_cache_dir, probe=True
+        )
         if progress is not None:
-            progress(
-                f"push: transferring {len(files)} selected files "
-                f"(+{len(names) - len(files)} metadata files) to {host}:{staging}"
-            )
-        command = [
-            rsync,
-            "--archive",
-            "--partial",
-            "--delete",
-            "--human-readable",
-            "--info=progress2",
-            "--from0",
-            f"--files-from={list_path}",
-            "-e",
-            _ssh_transport(ssh, port, identity),
-            f"{object_path}/",
-            f"{host}:{shlex.quote(str(staging) + '/')}",
-        ]
-        try:
-            runner(command, check=True)
-        except BaseException as exc:
-            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                raise
-            raise ModelctlError(
-                f"rsync to {host} failed; remote staging is resumable: {exc}"
-            ) from exc
-    finally:
-        Path(list_path).unlink(missing_ok=True)
+            progress(f"push: probing {host} for receive-cache support")
+        stdout = _run_ssh(ssh, host, port, identity, probe_args, runner)
+        payload = _remote_payload(stdout, host, command="receive-cache --probe")
+        if not isinstance(payload.get("cache"), str) or not payload["cache"]:
+            raise ModelctlError(f"{host} returned no cache path in its probe payload")
+        remote_cache = Path(payload["cache"])
+        staging = staging_path_for(remote_cache, str(metadata["repo"]), commit, files)
+        _prepare_remote_staging(
+            ssh, host, port, identity, staging, remote_cache, runner, progress
+        )
 
-    commit_args = _remote_command(modelctl_bin, resolved, remote_cache_dir, staging=staging)
-    if progress is not None:
-        progress(f"push: validating and publishing on {host}")
-    stdout = _run_ssh(ssh, host, port, identity, commit_args, runner)
-    payload = _remote_payload(stdout, host, command="receive-cache")
-    if not isinstance(payload.get("snapshot"), str) or not payload["snapshot"]:
-        raise ModelctlError(f"{host} returned no snapshot path after publication")
-    return payload["snapshot"]
+        names = _push_file_list(overlay, metadata)
+        descriptor, list_path = tempfile.mkstemp(prefix="modelctl-push-", suffix=".files")
+        os.close(descriptor)
+        try:
+            write_transfer_file_list(Path(list_path), names)
+            if progress is not None:
+                progress(
+                    f"push: transferring {len(files)} files "
+                    f"(+{len(names) - len(files)} metadata files) to {host}:{staging}"
+                )
+            command = [
+                rsync,
+                "--archive",
+                "--copy-links",
+                "--partial",
+                "--delete",
+                "--human-readable",
+                "--info=progress2",
+                "--from0",
+                f"--files-from={list_path}",
+                "-e",
+                _ssh_transport(ssh, port, identity),
+                f"{overlay}/",
+                f"{host}:{shlex.quote(str(staging) + '/')}",
+            ]
+            try:
+                runner(command, check=True)
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                raise ModelctlError(
+                    f"rsync to {host} failed; remote staging is resumable: {exc}"
+                ) from exc
+        finally:
+            Path(list_path).unlink(missing_ok=True)
+
+        commit_args = _remote_command(
+            modelctl_bin, resolved, local_cache_dir, staging=staging
+        )
+        if progress is not None:
+            progress(f"push: validating and publishing on {host}")
+        stdout = _run_ssh(ssh, host, port, identity, commit_args, runner)
+        payload = _remote_payload(stdout, host, command="receive-cache")
+        if not isinstance(payload.get("snapshot"), str) or not payload["snapshot"]:
+            raise ModelctlError(f"{host} returned no snapshot path after publication")
+        return payload["snapshot"]
+    finally:
+        shutil.rmtree(overlay, ignore_errors=True)

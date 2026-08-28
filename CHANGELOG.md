@@ -2,6 +2,18 @@
 
 This project follows semantic versioning.
 
+## 0.12.0
+
+### Added
+
+- `push` now always sources from the local Hugging Face cache: the model must
+  have a modelctl registration there (`modelctl sync-local` or a prior
+  copy), and the command builds a small transfer overlay from the registered
+  snapshot (symlinks plus generated ETag metadata) before rsyncing it to the
+  destination over ssh. This makes head-node fan-out over a fast
+  interconnect the primary workflow, avoiding slow NAS reads on every node.
+  The `--source-root` NAS-store option was removed.
+
 ## 0.11.1
 
 ### Added

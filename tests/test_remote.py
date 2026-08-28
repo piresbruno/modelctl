@@ -17,7 +17,7 @@ from modelctl.hf_cache import (
     state_root,
 )
 from modelctl.manifest import parse_manifest
-from modelctl.operations import update_model
+from modelctl.operations import sync_local, update_model
 from modelctl.remote import push_model
 
 COMMIT = "d" * 40
@@ -87,6 +87,33 @@ def _stage_transfer(nas, cache, name="demo", *, staging=None):
     staging.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(object_path, staging)
     return staging
+
+
+def _local_cache(tmp_path, name="demo", files=None):
+    """Build a NAS object and sync it into a local HF cache registration."""
+    nas = _nas_object(tmp_path, name=name, files=files)
+    cache = tmp_path / "hub"
+
+    def copy(command, check):
+        source = Path(command[-2].removesuffix("/"))
+        destination = Path(command[-1].removesuffix("/"))
+        list_arg = next(
+            argument for argument in command if argument.startswith("--files-from=")
+        )
+        names = [
+            entry.decode()
+            for entry in Path(list_arg.split("=", 1)[1])
+            .read_bytes()
+            .split(b"\0")
+            if entry
+        ]
+        for entry in names:
+            staged = destination / entry
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source / entry, staged)
+
+    sync_local(nas, cache, name, runner=copy)
+    return cache
 
 
 def test_receive_probe_is_read_only(tmp_path):
@@ -220,18 +247,12 @@ class FakeRunner:
 
 
 def test_push_orchestrates_probe_rsync_and_commit(tmp_path):
-    nas = _nas_object(tmp_path)
-    cache = tmp_path / "hub"
-    object_path = (nas / "active" / "demo").resolve()
-    metadata = json.loads((object_path / ".modelctl.json").read_text())
-    files = {
-        item["path"]: read_source_etag(object_path, item["path"], metadata["commit"])
-        for item in metadata["files"]
-    }
-    staging = staging_path_for(cache, metadata["repo"], metadata["commit"], files)
+    cache = _local_cache(tmp_path)
+    record = load_record(cache, "demo")
+    staging = staging_path_for(cache, record.repo, record.commit, record.files)
 
     fake = FakeRunner(cache)
-    result = push_model(nas, cache, "demo", host="node-b", runner=fake)
+    result = push_model(cache, "demo", host="node-b", runner=fake)
 
     assert result == str(cache / "models--org--demo" / "snapshots" / COMMIT)
     assert fake.calls[0][:2] == ["ssh", "node-b"]
@@ -256,10 +277,18 @@ def test_push_orchestrates_probe_rsync_and_commit(tmp_path):
     assert prepare[7] == str(cache)
     rsync = fake.calls[3]
     assert rsync[0] == "rsync"
-    for flag in ("--archive", "--partial", "--delete", "--from0", "-e"):
+    for flag in (
+        "--archive",
+        "--copy-links",
+        "--partial",
+        "--delete",
+        "--from0",
+        "-e",
+    ):
         assert flag in rsync
     assert rsync[rsync.index("-e") + 1] == "ssh -o Compression=no"
-    assert rsync[-2] == f"{object_path}/"
+    overlay = Path(rsync[-2].removesuffix("/"))
+    assert overlay.name.startswith("modelctl-push-cache-")
     assert rsync[-1] == f"node-b:{staging}/"
     assert fake.calls[4] == [
         "ssh",
@@ -277,29 +306,20 @@ def test_push_orchestrates_probe_rsync_and_commit(tmp_path):
         ".modelctl.json",
         "config.json",
     ]
+    assert not overlay.exists()
 
 
-def test_push_excludes_non_download_cache_metadata(tmp_path):
-    nas = _nas_object(tmp_path)
+def test_push_requires_local_cache_record(tmp_path):
     cache = tmp_path / "hub"
     fake = FakeRunner(cache)
-    object_path = (nas / "active" / "demo").resolve()
-    tree = object_path / ".cache" / "huggingface" / "trees" / ("e" * 40 + ".json")
-    tree.parent.mkdir(parents=True, exist_ok=True)
-    tree.write_text("{}")
-    tree.chmod(0o000)
-    push_model(nas, cache, "demo", host="node-b", runner=fake)
-    transferred = [name for name in fake.file_list if name.startswith(".cache")]
-    assert transferred == [".cache/huggingface/download/config.json.metadata"]
-    assert all("trees" not in name for name in fake.file_list)
+    with pytest.raises(ModelctlError, match="no valid local cache record"):
+        push_model(cache, "demo", host="node-b", runner=fake)
 
 
 def test_push_uses_port_identity_and_fabric_host(tmp_path):
-    nas = _nas_object(tmp_path)
-    cache = tmp_path / "hub"
+    cache = _local_cache(tmp_path)
     fake = FakeRunner(cache)
     push_model(
-        nas,
         cache,
         "demo",
         host="user@10.0.0.2",
@@ -327,11 +347,9 @@ def test_push_uses_port_identity_and_fabric_host(tmp_path):
 
 
 def test_push_uses_remote_modelctl_override(tmp_path):
-    nas = _nas_object(tmp_path)
-    cache = tmp_path / "hub"
+    cache = _local_cache(tmp_path)
     fake = FakeRunner(cache)
     push_model(
-        nas,
         cache,
         "demo",
         host="node-b",
@@ -352,28 +370,25 @@ def test_push_uses_remote_modelctl_override(tmp_path):
 
 
 def test_push_fails_when_remote_modelctl_missing(tmp_path):
-    nas = _nas_object(tmp_path)
-
     def not_found(command, **kwargs):
         return SimpleNamespace(returncode=1, stdout="", stderr="")
 
     with pytest.raises(ModelctlError, match="--remote-modelctl"):
-        push_model(nas, tmp_path / "hub", "demo", host="node-b", runner=not_found)
+        push_model(
+            _local_cache(tmp_path), "demo", host="node-b", runner=not_found
+        )
 
 
-def test_push_resolves_repository_id_to_active_name(tmp_path):
-    nas = _nas_object(tmp_path)
-    cache = tmp_path / "hub"
+def test_push_resolves_repository_id_to_registered_name(tmp_path):
+    cache = _local_cache(tmp_path)
     fake = FakeRunner(cache)
-    push_model(nas, cache, "org/demo", host="node-b", runner=fake)
+    push_model(cache, "org/demo", host="node-b", runner=fake)
     probe = fake.calls[1]
     assert "--probe" in probe
     assert probe[probe.index("--probe") + 1] == "demo"
 
 
 def test_push_fails_when_remote_unreachable(tmp_path):
-    nas = _nas_object(tmp_path)
-
     def refused(command, **kwargs):
         return SimpleNamespace(
             returncode=255,
@@ -382,12 +397,12 @@ def test_push_fails_when_remote_unreachable(tmp_path):
         )
 
     with pytest.raises(ModelctlError, match="node-b"):
-        push_model(nas, tmp_path / "hub", "demo", host="node-b", runner=refused)
+        push_model(
+            _local_cache(tmp_path), "demo", host="node-b", runner=refused
+        )
 
 
 def test_push_fails_on_protocol_mismatch(tmp_path):
-    nas = _nas_object(tmp_path)
-
     def old_probe(command, **kwargs):
         return SimpleNamespace(
             returncode=0,
@@ -396,11 +411,13 @@ def test_push_fails_on_protocol_mismatch(tmp_path):
         )
 
     with pytest.raises(ModelctlError, match="incompatible"):
-        push_model(nas, tmp_path / "hub", "demo", host="node-b", runner=old_probe)
+        push_model(
+            _local_cache(tmp_path), "demo", host="node-b", runner=old_probe
+        )
 
 
 def test_push_reports_resumable_rsync_failure(tmp_path):
-    nas = _nas_object(tmp_path)
+    cache = _local_cache(tmp_path)
 
     def fail_rsync(command, **kwargs):
         if any(
@@ -418,17 +435,17 @@ def test_push_reports_resumable_rsync_failure(tmp_path):
         if "receive-cache" in command:
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps({"proto": 1, "cache": str(tmp_path / "hub")}),
+                stdout=json.dumps({"proto": 1, "cache": str(cache)}),
                 stderr="",
             )
         raise RuntimeError("rsync error 23")
 
     with pytest.raises(ModelctlError, match="resumable"):
-        push_model(nas, tmp_path / "hub", "demo", host="node-b", runner=fail_rsync)
+        push_model(cache, "demo", host="node-b", runner=fail_rsync)
 
 
 def test_push_fails_when_remote_cache_not_writable(tmp_path):
-    nas = _nas_object(tmp_path)
+    cache = _local_cache(tmp_path)
 
     def deny_cache(command, **kwargs):
         if any(
@@ -448,13 +465,13 @@ def test_push_fails_when_remote_cache_not_writable(tmp_path):
         if "receive-cache" in command and "--probe" in command:
             return SimpleNamespace(
                 returncode=0,
-                stdout=json.dumps({"proto": 1, "cache": str(tmp_path / "hub")}),
+                stdout=json.dumps({"proto": 1, "cache": str(cache)}),
                 stderr="",
             )
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     with pytest.raises(ModelctlError, match="not writable on node-b"):
-        push_model(nas, tmp_path / "hub", "demo", host="node-b", runner=deny_cache)
+        push_model(cache, "demo", host="node-b", runner=deny_cache)
 
 
 def test_push_end_to_end_through_real_receive_cli(tmp_path, monkeypatch):
@@ -466,10 +483,9 @@ def test_push_end_to_end_through_real_receive_cli(tmp_path, monkeypatch):
     import sys
 
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
-    nas = _nas_object(
+    cache = _local_cache(
         tmp_path, files={"config.json": b"data", "README.md": b"#"}
     )
-    cache = tmp_path / "hub"
 
     class LocalSsh:
         def __init__(self):
@@ -524,7 +540,7 @@ def test_push_end_to_end_through_real_receive_cli(tmp_path, monkeypatch):
             )
 
     local_ssh = LocalSsh()
-    result = push_model(nas, cache, "demo", host="node-b", runner=local_ssh)
+    result = push_model(cache, "demo", host="node-b", runner=local_ssh)
 
     snapshot = cache / "models--org--demo" / "snapshots" / COMMIT
     assert result == str(snapshot)

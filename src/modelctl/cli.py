@@ -687,27 +687,29 @@ not restarted.""",
     push = commands.add_parser(
         "push",
         aliases=["sync-remote"],
-        help="copy an active NAS model into another host's HF cache over ssh",
+        help="copy a locally cached model into another host's HF cache over ssh",
         description=(
-            "Copy one validated NAS object into another host's Hugging Face "
-            "cache over ssh without re-downloading it. The source is always "
-            "the local managed store. The command auto-discovers the remote "
-            "modelctl binary, preflights the remote cache directory, rsyncs "
-            "only the model's selected files, and has receive-cache validate "
-            "and atomically publish blobs, a snapshot, refs, and a local "
+            "Copy a model from the local Hugging Face cache into another "
+            "host's Hugging Face cache over ssh. The model must already be "
+            "registered in the local cache (for example via modelctl "
+            "sync-local). The command auto-discovers the remote modelctl "
+            "binary, preflights the remote cache directory, rsyncs only the "
+            "registered snapshot's files, and has receive-cache validate and "
+            "atomically publish blobs, a snapshot, refs, and a local "
             "registration on the destination."
         ),
         formatter_class=HELP_FORMATTER,
         epilog="""examples:
+  # Register a model in the local cache once, then fan it out over the fabric
+  modelctl sync-local incoai/GLM-5.3-Flash-DFlash2 --source-root /mnt/nas/llm-models
+  modelctl push incoai/GLM-5.3-Flash-DFlash2 --host 10.100.24.1
+
   # Minimal: the remote cache directory defaults to this host's cache path
   modelctl push qwen3-8b-vllm --host node-b
 
-  # Over an interconnect fabric (for example ConnectX-7) with custom ssh
-  modelctl push incoai/GLM-5.3-Flash-DFlash2 --host 10.100.24.1 \\
-    --port 2222 --identity ~/.ssh/connectx
-
-  # Explicit remote cache directory and remote modelctl install
+  # Custom ssh identity and explicit remote cache directory
   modelctl push model-q4 --host node-b \\
+    --port 2222 --identity ~/.ssh/connectx \\
     --cache-dir /srv/huggingface/hub \\
     --remote-modelctl /opt/modelctl/bin/modelctl
 
@@ -716,12 +718,13 @@ not restarted.""",
 
 How it works:
   1. Resolve an active model name (or a unique Hugging Face repository id) in
-     the local managed store and read its retained download metadata.
+     the local Hugging Face cache; the model must already be registered there
+     (modelctl sync-local or a prior push).
   2. Discover the remote modelctl binary, then run receive-cache --probe over
      ssh for a JSON handshake: protocol version and canonical cache path.
   3. Preflight the remote cache directory (create it and prove it is
-     writable), then rsync only the object's selected files plus metadata over
-     'ssh -o Compression=no' into deterministic remote staging.
+     writable), then rsync only the registered snapshot's files plus metadata
+     over 'ssh -o Compression=no' into deterministic remote staging.
   4. Run receive-cache over ssh: the remote re-derives the staging path from
      the transferred metadata, validates every file against its retained
      Hugging Face ETag, and atomically publishes blobs, a commit snapshot,
@@ -738,11 +741,7 @@ rerun resumes them.""",
     )
     push.add_argument(
         "name", metavar="MODEL_OR_REPO",
-        help="active model name or unique Hugging Face repository id",
-    )
-    push.add_argument(
-        "--source-root", "--from-root", metavar="PATH", dest="source_root",
-        help="source store root (default: configured NAS root)",
+        help="registered cache model name or unique Hugging Face repository id",
     )
     push.add_argument(
         "--host", required=True,
@@ -847,7 +846,6 @@ def run(argv: list[str] | None = None) -> int:
 
     if args.command == "push":
         result = push_model(
-            _root(args.source_root),
             _cache_dir(args.cache_dir),
             args.name,
             host=args.host,

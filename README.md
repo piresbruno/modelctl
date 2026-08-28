@@ -505,22 +505,27 @@ commit through its own registration state.
 
 ### Copy active models to another instance over SSH
 
-`push` copies one validated NAS object into another host's Hugging Face cache
-without re-downloading it — for example, node A pulls a model from the NAS
-once, then fans it out to the other nodes over a fast interconnect:
+`push` copies a model from **this host's Hugging Face cache** into another
+host's Hugging Face cache over ssh — the head node pulls a model once (from
+the NAS or Hugging Face), then fans it out to the other nodes over a fast
+interconnect instead of each node re-downloading:
 
 ```bash
 modelctl push qwen3-8b-vllm --host node-b
 ```
 
-The source is always the local managed store. Pass an active model name or a
-unique Hugging Face repository id; a repository id is resolved to the matching
-active model automatically (`modelctl push incoai/GLM-5.3-Flash-DFlash2
---host node-b`).
+The source is always the local Hugging Face cache: the model must already be
+**registered there** (for example by `modelctl sync-local` or owning a record
+from a previous load). Pass a registered model name or a unique Hugging Face
+repository id; a repository id is resolved to the matching registration
+automatically (`modelctl push incoai/GLM-5.3-Flash-DFlash2 --host node-b`).
 
 #### Prerequisites
 
-- This host needs `ssh` and `rsync`.
+- This host needs `ssh` and `rsync`, and the model must be registered in the
+  local Hugging Face cache (`modelctl sync-local incoai/GLM-5.3-Flash-DFlash2
+  --source-root /mnt/nas/llm-models` pulls it from the NAS once and registers
+  it).
 - The destination needs `modelctl` — a plain `uv tool install` is enough.
   `push` auto-discovers it at `~/.local/bin/modelctl`,
   `/usr/local/bin/modelctl`, or `/usr/bin/modelctl` (non-interactive ssh
@@ -535,17 +540,17 @@ active model automatically (`modelctl push incoai/GLM-5.3-Flash-DFlash2
 
 #### How it works
 
-1. **Resolve** the active model in the local store and read its retained
-   Hugging Face download metadata.
+1. **Resolve** the model registration in the local Hugging Face cache and
+   build a small transfer overlay of the registered snapshot.
 2. **Probe** — a JSON handshake over ssh (`receive-cache --probe`) verifies
    the remote modelctl protocol and returns the canonical remote cache path.
 3. **Preflight and transfer** — the remote cache staging directory is created
-   and checked, then only the object's selected files (plus `.modelctl.json`
-   and retained ETag metadata) are rsynced over `ssh -o Compression=no` into
-   that staging directory (rsync's receiver creates the destination root
-   without creating missing parents, so the path must already exist).
-   Interrupted transfers stay resumable in remote staging; a rerun resumes
-   them.
+   and checked, then only the registered snapshot's files (plus
+   `.modelctl.json` and retained ETag metadata) are rsynced over
+   `ssh -o Compression=no` into that staging directory (rsync's receiver
+   creates the destination root without creating missing parents, so the
+   path must already exist). Interrupted transfers stay resumable in remote
+   staging; a rerun resumes them.
 4. **Commit** — the remote `receive-cache` re-derives the staging path from
    the transferred metadata (misplaced or tampered transfers are rejected),
    validates every file against its retained Hugging Face ETag, and
@@ -561,8 +566,7 @@ work on the destination immediately.
 | Option | Meaning |
 | --- | --- |
 | `--host HOST` | ssh destination: hostname, `user@host`, or ssh-config alias (required) |
-| `--source-root`, `--from-root PATH` | source NAS store root (default: configured root) |
-| `--cache-dir PATH` | remote HF cache directory (default: **this host's** cache path, so identical nodes need no flag) |
+| `--cache-dir PATH` | HF cache directory on this host and the remote default (default: this host's cache path) |
 | `--port PORT` | ssh port |
 | `--identity KEY` | ssh identity file |
 | `--ssh SSH` | ssh executable (default: `ssh`) |
@@ -572,14 +576,14 @@ work on the destination immediately.
 #### Examples
 
 ```bash
+# Register the model in the local cache once, then fan it out over the fabric
+modelctl sync-local incoai/GLM-5.3-Flash-DFlash2 --source-root /mnt/nas/llm-models
+modelctl push incoai/GLM-5.3-Flash-DFlash2 --host 10.100.24.1
+
 # Two identical nodes: only --host is needed
 modelctl push qwen3-8b-vllm --host node-b
 
-# Ship from the NAS node to a remote inference host over the ConnectX-7 fabric
-modelctl push incoai/GLM-5.3-Flash-DFlash2 --host 10.100.24.1 \
-  --port 2222 --identity ~/.ssh/connectx
-
-# Explicit remote cache path and custom remote modelctl install
+# Explicit cache path and custom remote modelctl install
 modelctl push model-q4 --host node-b \
   --cache-dir /srv/huggingface/hub \
   --remote-modelctl /opt/modelctl/bin/modelctl
@@ -889,7 +893,8 @@ active-model listings began ignoring hidden and unmanaged entries in `0.9.4`.
 SSH push of active NAS models into another host's Hugging Face cache was added
 in `0.10.0`. `push` gained remote `modelctl` binary auto-discovery in `0.11.0`,
 and remote cache staging preflight plus a narrowed transfer file list in
-`0.11.1`.
+`0.11.1`. In `0.12.0` `push` sources from the local Hugging Face cache
+registration (a `sync-local` record) instead of the NAS store.
 
 `src/modelctl/__init__.py` is the single version source. Hatch reads it when
 building the package, and `modelctl --version` imports the same value so package

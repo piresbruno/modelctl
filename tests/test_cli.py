@@ -370,7 +370,7 @@ def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_version_uses_package_version(capsys):
-    assert __version__ == "0.11.1"
+    assert __version__ == "0.12.0"
     with pytest.raises(SystemExit) as exit_info:
         build_parser().parse_args(["--version"])
     assert exit_info.value.code == 0
@@ -443,25 +443,19 @@ def test_hf_cache_precedence(tmp_path, monkeypatch):
     assert _cache_dir(str(tmp_path / "argument")) == tmp_path / "argument"
 
 
-def test_push_uses_local_default_cache_path_and_source_root(
-    tmp_path, monkeypatch, capsys
-):
-    nas = tmp_path / "nas"
+def test_push_uses_local_default_cache_path(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
-    run(["config", "set-root", str(nas)])
-    capsys.readouterr()
     calls = []
 
-    def fake_push(source_root, remote_cache, name, **kwargs):
-        calls.append((source_root, remote_cache, name, kwargs))
-        return remote_cache / "snapshot"
+    def fake_push(local_cache, name, **kwargs):
+        calls.append((local_cache, name, kwargs))
+        return local_cache / "snapshot"
 
     monkeypatch.setattr("modelctl.cli.push_model", fake_push)
     assert run(["push", "demo", "--host", "node-b"]) == 0
-    source, remote_cache, name, options = calls[0]
-    assert source == nas
-    assert remote_cache == tmp_path / "hub"
+    local_cache, name, options = calls[0]
+    assert local_cache == tmp_path / "hub"
     assert name == "demo"
     assert options["host"] == "node-b"
     assert options["ssh"] == "ssh"
@@ -469,28 +463,26 @@ def test_push_uses_local_default_cache_path_and_source_root(
     assert capsys.readouterr().out == f"{tmp_path / 'hub' / 'snapshot'}\n"
 
 
-def test_push_passes_explicit_cache_dir_and_source_root(tmp_path, monkeypatch, capsys):
-    nas = tmp_path / "nas"
+def test_push_passes_explicit_cache_dir_and_ssh_options(tmp_path, monkeypatch, capsys):
     cache = tmp_path / "custom-cache"
     monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "ignored"))
     calls = []
 
-    def fake_push(source_root, remote_cache, name, **kwargs):
-        calls.append((source_root, remote_cache, name, kwargs))
-        return remote_cache / "snapshot"
+    def fake_push(local_cache, name, **kwargs):
+        calls.append((local_cache, name, kwargs))
+        return local_cache / "snapshot"
 
     monkeypatch.setattr("modelctl.cli.push_model", fake_push)
     assert run([
         "push", "demo", "--host", "node-b",
-        "--source-root", str(nas),
         "--cache-dir", str(cache),
         "--port", "2222",
         "--identity", "/keys/id",
         "--remote-modelctl", "/opt/modelctl/bin/modelctl",
     ]) == 0
-    source, remote_cache, name, options = calls[0]
-    assert source == nas
-    assert remote_cache == cache
+    local_cache, name, options = calls[0]
+    assert local_cache == cache
+    assert name == "demo"
     assert options["port"] == 2222
     assert options["identity"] == "/keys/id"
     assert options["remote_modelctl"] == "/opt/modelctl/bin/modelctl"
