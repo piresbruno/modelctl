@@ -496,6 +496,17 @@ def _broken_record(cache, name="broken"):
     )
 
 
+def test_load_record_hints_recovery_for_missing_snapshot(tmp_path):
+    cache = tmp_path / "hub"
+    repository = cache / "models--org--broken"
+    (repository / "blobs").mkdir(parents=True)
+    (repository / "snapshots").mkdir()
+    (repository / "refs").mkdir()
+    _broken_record(cache)
+    with pytest.raises(ModelctlError, match="sync-local"):
+        load_record(cache, "broken")
+
+
 def test_local_listing_skips_broken_registration(tmp_path):
     cache = tmp_path / "hub"
     _broken_record(cache)

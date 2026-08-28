@@ -677,7 +677,13 @@ def load_record(cache_dir: Path, name: str) -> CacheRecord:
     for structural in (repository, repository / "snapshots", repository / "blobs"):
         _ensure_real_directory(structural, create=False)
     if snapshot.is_symlink() or not snapshot.is_dir():
-        raise ModelctlError(f"local snapshot is not a real directory: {snapshot}")
+        raise ModelctlError(
+            f"local snapshot is not a real directory: {snapshot} (the cache "
+            f"was pruned or moved after registration; run 'modelctl sync-local "
+            f"{name}' to re-register the current revision, or 'modelctl "
+            "delete-local "
+            f"{name}' to drop this registration)"
+        )
     try:
         snapshot.resolve(strict=True).relative_to(
             (repository / "snapshots").resolve(strict=True)
