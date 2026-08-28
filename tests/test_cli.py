@@ -370,7 +370,7 @@ def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_version_uses_package_version(capsys):
-    assert __version__ == "0.9.8"
+    assert __version__ == "0.10.0"
     with pytest.raises(SystemExit) as exit_info:
         build_parser().parse_args(["--version"])
     assert exit_info.value.code == 0
@@ -417,6 +417,7 @@ def test_top_level_help_has_description_and_examples(capsys):
         ("path", "MODEL_PATH=$(modelctl path"),
         ("serve-command", "modelctl serve-command model-q4"),
         ("sync-local", "modelctl sync-local qwen3-8b-vllm"),
+        ("receive-cache", "modelctl receive-cache --probe qwen3-8b-vllm"),
     ],
 )
 def test_subcommand_help_has_description_and_examples(command, example, capsys):
@@ -438,6 +439,13 @@ def test_hf_cache_precedence(tmp_path, monkeypatch):
     monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "explicit-env"))
     assert _cache_dir(None) == tmp_path / "explicit-env"
     assert _cache_dir(str(tmp_path / "argument")) == tmp_path / "argument"
+
+
+def test_receive_cache_probe_prints_json(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
+    assert run(["receive-cache", "--probe", "demo"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"proto": 1, "cache": str(tmp_path / "hub")}
 
 
 def test_sync_rejects_cache_dir_and_legacy_root_together(tmp_path):

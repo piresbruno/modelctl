@@ -24,6 +24,7 @@ _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _ETAG_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 _RECORD_SCHEMA = 1
 _REFS_SCHEMA = 1
+RECEIVE_PROTO = 1
 
 
 @dataclass(frozen=True)
@@ -604,6 +605,60 @@ def publish_synced_staging(
     return (
         snapshot if entrypoint == "." else snapshot.joinpath(*PurePosixPath(entrypoint).parts)
     ).resolve(strict=True)
+
+
+def receive_staged_cache(
+    cache_dir: Path,
+    name: str,
+    *,
+    probe: bool = False,
+    staging: Path | None = None,
+) -> dict[str, Any]:
+    """Remote half of ``modelctl push``.
+
+    With ``probe=True`` this prints a handshake and mutates nothing. With a
+    ``staging`` directory it validates the staged transfer against its own
+    metadata and publishes blobs, a snapshot, refs, and a registration record
+    for the named model."""
+    validate_name(name)
+    cache = canonical_cache(cache_dir)
+    if probe:
+        return {"proto": RECEIVE_PROTO, "cache": str(cache)}
+    if staging is None:
+        raise ModelctlError(
+            "receive-cache requires --staging; normally invoked by 'modelctl push'"
+        )
+    if staging.is_symlink() or not staging.is_dir():
+        raise ValidationError(f"staged transfer is not a real directory: {staging}")
+    metadata = validate_object(staging, expected_name=name)
+    commit = str(metadata.get("commit", ""))
+    if not _COMMIT_RE.fullmatch(commit):
+        raise ValidationError(
+            f"invalid Hugging Face commit in staged metadata: {commit!r}"
+        )
+    repo = str(metadata.get("repo", ""))
+    with _lock(_name_lock(cache, name)), _lock(_repo_lock(cache, repo)):
+        files = {
+            item.path: _read_etag(staging, item.path, commit)
+            for item in (ExpectedFile.from_dict(item) for item in metadata["files"])
+        }
+        derived = staging_path_for(cache, repo, commit, files)
+        if Path(derived) != staging:
+            raise ValidationError(
+                f"staged transfer path {staging} does not match its metadata; "
+                f"expected {derived}: re-run 'modelctl push'"
+            )
+        entrypoint = publish_synced_staging(
+            cache, name, metadata, files, staging, label="receive-cache"
+        )
+    snapshot = repo_path(cache, repo) / "snapshots" / commit
+    return {
+        "proto": RECEIVE_PROTO,
+        "cache": str(cache),
+        "staging": str(staging),
+        "snapshot": str(snapshot),
+        "entrypoint": str(entrypoint),
+    }
 
 
 def load_record(cache_dir: Path, name: str) -> CacheRecord:

@@ -24,6 +24,7 @@ from .generation import (
     generate_manifest_document,
     write_generated_manifest,
 )
+from .hf_cache import receive_staged_cache
 from .integrity import (
     audit_active_references,
     cleanup_quarantine,
@@ -680,6 +681,37 @@ not restarted.""",
     )
     sync.add_argument("--rsync", default="rsync", help="rsync executable")
     _add_local_root(sync)
+
+    receive = commands.add_parser(
+        "receive-cache",
+        help="validate and publish a staged cache transfer on this host",
+        description=(
+            "The remote half of 'modelctl push'. --probe prints a JSON "
+            "handshake; otherwise the staged rsync data is validated and "
+            "published as blobs, a snapshot, refs, and a registration record. "
+            "Normally invoked over ssh by push."
+        ),
+        formatter_class=HELP_FORMATTER,
+        epilog="""examples:
+  modelctl receive-cache --probe qwen3-8b-vllm
+  modelctl receive-cache qwen3-8b-vllm --staging /cache/models--Qwen--Qwen3-8B/.modelctl-staging/COMMIT--SELECTION
+
+Run over ssh by 'modelctl push'; use --probe for the handshake and --staging
+for the directory rsync left in this host's cache staging area.""",
+    )
+    receive.add_argument("name", metavar="NAME")
+    receive.add_argument(
+        "--cache-dir", metavar="PATH",
+        help="Hugging Face cache directory (default: HF default)",
+    )
+    receive.add_argument(
+        "--probe", action="store_true",
+        help="print the JSON handshake without mutating anything",
+    )
+    receive.add_argument(
+        "--staging", metavar="PATH",
+        help="staged transfer directory placed by rsync (provided by push)",
+    )
     return parser
 
 
@@ -720,6 +752,16 @@ def run(argv: list[str] | None = None) -> int:
             progress=lambda message: print(message, flush=True),
         )
         print(result)
+        return 0
+
+    if args.command == "receive-cache":
+        result = receive_staged_cache(
+            _cache_dir(args.cache_dir),
+            args.name,
+            probe=args.probe,
+            staging=Path(args.staging) if args.staging else None,
+        )
+        print(json.dumps(result, indent=2))
         return 0
 
     root = _root(args.root)
