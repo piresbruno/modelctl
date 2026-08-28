@@ -2,8 +2,8 @@
 
 `modelctl` atomically downloads Hugging Face model snapshots to a NAS model
 store, activates validated revisions, synchronizes selected files into the local
-Hugging Face cache with resumable `rsync`, and emits service commands without
-starting a server.
+Hugging Face cache with resumable `rsync`, copies active models between
+instances over ssh, and emits service commands without starting a server.
 This was developed with the focus on the homelab, someone with a  local NAS 
 that stores AI models and uses `modelctl` syncs those to the local inference 
 machines, leaving the NAS as source of truth for available models and their 
@@ -12,7 +12,8 @@ versioning, copying only as needed models to the inference machine.
 ## Install
 
 Python 3.11 or newer is required. `rsync` is also required when using
-`sync-local` to populate a Hugging Face cache from the NAS. The recommended
+`sync-local` or `push` to transfer models, and the destination host of
+`push` must have `modelctl` installed. The recommended
 installation method is an isolated uv tool.
 
 From the project folder:
@@ -502,6 +503,44 @@ access to the synchronized files, but it is not a complete repository snapshot.
 Foreign branch or tag refs are preserved; modelctl resolves its exact cached
 commit through its own registration state.
 
+### Copy active models to another instance over SSH
+
+`push` copies one validated NAS object into another host's Hugging Face cache
+without re-downloading it:
+
+```bash
+modelctl push qwen3-8b-vllm --host node-b
+```
+
+The source is always the local managed store, for example the NAS node that
+already downloaded the model. This host needs `ssh` and `rsync`; the
+destination host needs `modelctl` installed. The remote cache directory
+defaults to the same path this host resolves (`HF_HUB_CACHE`, `HF_HOME/hub`,
+or the platform default), so two identical inference nodes need only
+`--host`. Override the remote cache explicitly when the destination differs:
+
+```bash
+modelctl push unsloth/DeepSeek-V4-Flash-0731 \
+  --host user@10.18.0.2 --port 2222 --identity ~/.ssh/connectx \
+  --cache-dir /srv/huggingface/hub
+```
+
+Point `--host` at the fast fabric interface (for example the ConnectX-7 IP)
+when the hostname resolves to a slower path. `push` performs a short JSON
+handshake against the remote `receive-cache` probe, rsyncs only the object's
+selected files (plus its retained Hugging Face metadata) into the remote cache
+staging area over `ssh -o Compression=no`, and then asks the remote
+`receive-cache` to validate every file against its retained Hugging Face ETag
+and publish the standard `models--OWNER--REPO/blobs`, `snapshots/COMMIT`, and
+`refs` layout plus a modelctl registration. Interrupted transfers stay
+resumable in remote staging and a rerun resumes them. When publication
+finishes, `modelctl path NAME --local` and `serve-command NAME --local` work
+on the destination immediately.
+
+`receive-cache` is the remote half; it is normally invoked over ssh by `push`
+and is available for manual inspection (`--probe`) or review before a manual
+rsync.
+
 Save the NAS model store once and omit `--root` from subsequent commands:
 
 ```bash
@@ -763,6 +802,8 @@ modelctl update --help
 modelctl path --help
 modelctl serve-command --help
 modelctl sync-local --help
+modelctl push --help
+modelctl receive-cache --help
 ```
 
 From a source checkout, prefix these commands with `uv run`.
@@ -784,6 +825,8 @@ configuration and migration documentation was clarified in `0.9.1`. Aggregate
 transfer progress, speed, and ETA were added to `sync-local` in `0.9.2`. MTP
 companion discovery for GGUFs stored under `MTP/` was fixed in `0.9.3`, and
 active-model listings began ignoring hidden and unmanaged entries in `0.9.4`.
+SSH push of active NAS models into another host's Hugging Face cache was added
+in `0.10.0`.
 
 `src/modelctl/__init__.py` is the single version source. Hatch reads it when
 building the package, and `modelctl --version` imports the same value so package

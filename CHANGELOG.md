@@ -2,6 +2,23 @@
 
 This project follows semantic versioning.
 
+## 0.10.0
+
+### Added
+
+- Add `push` (alias `sync-remote`) to copy one active NAS model into another
+  host's Hugging Face cache over ssh. A JSON handshake against the remote
+  probe resolves the canonical cache path, a resumable
+  `rsync --files-from` transfer moves only the object's selected files over
+  `ssh -o Compression=no`, and a remote `receive-cache` commit validates every
+  transferred file against its retained Hugging Face ETag before publishing
+  blobs, snapshot links, refs, and a local registration atomically. The remote
+  cache directory defaults to the same path as the local host, and `--host`
+  can target an interconnect interface such as ConnectX-7.
+- Factor the `sync-local` publication tail into a shared
+  `publish_synced_staging` used by both local cache sync and the remote
+  receive path.
+
 ## 0.9.8
 
 ### Added

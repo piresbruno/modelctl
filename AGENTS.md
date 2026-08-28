@@ -18,6 +18,8 @@ package uses a `src/` layout and exposes the `modelctl` command through
 - `src/modelctl/manifest.py`: immutable manifest models and parsing.
 - `src/modelctl/operations.py`: update, activation, local sync, deletion, and
   serve-command workflows.
+- `src/modelctl/remote.py`: `push` orchestration over ssh and rsync, plus the
+  `receive-cache` remote-half entry points.
 - `src/modelctl/layout.py`: managed-store paths, locks, and atomic symlinks.
 - `src/modelctl/validation.py`: artifact checks and object metadata.
 - `src/modelctl/state.py`: durable state-transition journals.
