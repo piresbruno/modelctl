@@ -514,7 +514,12 @@ modelctl push qwen3-8b-vllm --host node-b
 
 The source is always the local managed store, for example the NAS node that
 already downloaded the model. This host needs `ssh` and `rsync`; the
-destination host needs `modelctl` installed. The remote cache directory
+destination host needs `modelctl` installed, which `push` auto-discovers at
+`~/.local/bin/modelctl`, `/usr/local/bin/modelctl`, or `/usr/bin/modelctl`
+(or via `--remote-modelctl PATH`), so a plain `uv tool install` on the remote
+is enough — no shell PATH or symlink setup is required for ssh use. With the
+default cache path, `receive-cache` creates the cache directories itself on
+publication. The remote cache directory
 defaults to the same path this host resolves (`HF_HUB_CACHE`, `HF_HOME/hub`,
 or the platform default), so two identical inference nodes need only
 `--host`. Override the remote cache explicitly when the destination differs:

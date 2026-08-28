@@ -2,6 +2,18 @@
 
 This project follows semantic versioning.
 
+## 0.11.0
+
+### Added
+
+- `push` now auto-discovers the remote `modelctl` binary, so a plain
+  `uv tool install` on the destination host is sufficient for ssh
+  deployments. Non-interactive ssh shells ignore shell rc files, so the
+  probe checks the standard install locations (`~/.local/bin/modelctl`,
+  `/usr/local/bin/modelctl`, `/usr/bin/modelctl`) explicitly and uses the
+  resolved absolute path for the probe and commit commands. A new
+  `--remote-modelctl PATH` option overrides discovery for custom installs.
+
 ## 0.10.0
 
 ### Added
