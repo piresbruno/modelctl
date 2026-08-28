@@ -101,14 +101,62 @@ def _push_file_list(source: Path, metadata: dict[str, Any]) -> list[str]:
     return sorted(names)
 
 
+_REMOTE_MODELCTL_CANDIDATES = (
+    '"$HOME/.local/bin/modelctl"',
+    "/usr/local/bin/modelctl",
+    "/usr/bin/modelctl",
+)
+
+
+def _discover_remote_modelctl(
+    ssh: str,
+    host: str,
+    port: int | None,
+    identity: str | None,
+    runner: Callable[..., Any],
+) -> str:
+    """Locate the remote modelctl binary without relying on ssh PATH setup.
+
+    Non-interactive ssh commands run without the user's shell rc files, so
+    ``uv tool install`` binaries under ``~/.local/bin`` are invisible to PATH.
+    Probe the standard install locations explicitly; ``$HOME`` expands inside
+    the remote ``sh -c`` script.
+    """
+    script = (
+        "cd; for p in "
+        + " ".join(_REMOTE_MODELCTL_CANDIDATES)
+        + "; do [ -x \"$p\" ] && { echo \"$p\"; exit 0; }; done; exit 1"
+    )
+    argv = _ssh_argv(ssh, host, port, identity, ["sh", "-c", script])
+    try:
+        result = runner(
+            argv, check=False, capture_output=True, text=True, errors="replace"
+        )
+    except BaseException as exc:
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        raise ModelctlError(f"cannot reach {host}: {exc}") from exc
+    if result.returncode != 0:
+        raise ModelctlError(
+            f"modelctl is not installed on {host}; install it with "
+            "'uv tool install modelctl' on the remote or pass "
+            "--remote-modelctl PATH"
+        )
+    path = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+    if not path:
+        raise ModelctlError(f"modelctl not found on {host}")
+    return path
+
+
 def _remote_command(
+    modelctl_bin: str,
     name: str,
     cache_dir: Path,
     *,
     probe: bool = False,
     staging: Path | None = None,
 ) -> list[str]:
-    args = ["modelctl", "receive-cache"]
+    args = [str(modelctl_bin), "receive-cache"]
     if probe:
         args.append("--probe")
     args += [str(name), "--cache-dir", str(cache_dir)]
@@ -127,16 +175,18 @@ def push_model(
     identity: str | None = None,
     ssh: str = "ssh",
     rsync: str = "rsync",
+    remote_modelctl: str | None = None,
     runner: Callable[..., Any] = subprocess.run,
     progress: Callable[[str], None] | None = None,
 ) -> str:
     """Copy one active NAS model into another host's Hugging Face cache over ssh.
 
-    The source is always the local managed store. The remote runs
-    ``modelctl receive-cache``, rsync transfers the object's selected files
-    into the remote cache staging area, and the remote validates and publishes
-    blobs, a snapshot, refs, and a registration record. Interrupted transfers
-    remain resumable in remote staging.
+    The source is always the local managed store. The remote
+    ``modelctl receive-cache`` binary is auto-discovered (or taken from
+    ``remote_modelctl``), rsync transfers the object's selected files into the
+    remote cache staging area, and the remote validates and publishes blobs, a
+    snapshot, refs, and a registration record. Interrupted transfers remain
+    resumable in remote staging.
     """
     resolved = resolve_active_name(source_root, name)
     object_path, metadata = active_object(source_root, resolved)
@@ -148,7 +198,11 @@ def push_model(
         item.path: read_source_etag(object_path, item.path, commit)
         for item in expected
     }
-    probe_args = _remote_command(resolved, remote_cache_dir, probe=True)
+    if remote_modelctl is not None:
+        modelctl_bin = str(remote_modelctl)
+    else:
+        modelctl_bin = _discover_remote_modelctl(ssh, host, port, identity, runner)
+    probe_args = _remote_command(modelctl_bin, resolved, remote_cache_dir, probe=True)
     if progress is not None:
         progress(f"push: probing {host} for receive-cache support")
     stdout = _run_ssh(ssh, host, port, identity, probe_args, runner)
@@ -193,7 +247,7 @@ def push_model(
     finally:
         Path(list_path).unlink(missing_ok=True)
 
-    commit_args = _remote_command(resolved, remote_cache_dir, staging=staging)
+    commit_args = _remote_command(modelctl_bin, resolved, remote_cache_dir, staging=staging)
     if progress is not None:
         progress(f"push: validating and publishing on {host}")
     stdout = _run_ssh(ssh, host, port, identity, commit_args, runner)

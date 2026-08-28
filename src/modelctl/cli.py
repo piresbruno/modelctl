@@ -703,8 +703,9 @@ not restarted.""",
   modelctl sync-remote qwen3-8b-vllm --host node-b
 
 Pass an active model name or its Hugging Face repository id. ssh and rsync are
-required on this host; modelctl must be installed on the remote. The remote
-cache directory defaults to the same path this host uses, so two identical DGX
+required on this host; modelctl must be installed on the remote and is
+auto-discovered (or set with --remote-modelctl PATH). The remote cache
+directory defaults to the same path this host uses, so two identical DGX
 Spark nodes need only --host. Point --host at the fabric interface (for
 example the ConnectX-7 IP) when the hostname resolves to a slower path.
 Interrupted transfers remain resumable in remote staging.""",
@@ -725,6 +726,10 @@ Interrupted transfers remain resumable in remote staging.""",
     push.add_argument("--identity", metavar="KEY", help="ssh identity file")
     push.add_argument("--ssh", default="ssh", help="ssh executable (default: ssh)")
     push.add_argument("--rsync", default="rsync", help="rsync executable (default: rsync)")
+    push.add_argument(
+        "--remote-modelctl", metavar="PATH",
+        help="remote modelctl executable (default: auto-discovered)",
+    )
     push.add_argument(
         "--cache-dir", metavar="PATH",
         help="remote Hugging Face cache directory (default: this host's default cache path)",
@@ -812,6 +817,7 @@ def run(argv: list[str] | None = None) -> int:
             identity=args.identity,
             ssh=args.ssh,
             rsync=args.rsync,
+            remote_modelctl=args.remote_modelctl,
             progress=lambda message: print(message, flush=True),
         )
         print(result)

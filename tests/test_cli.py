@@ -370,7 +370,7 @@ def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_version_uses_package_version(capsys):
-    assert __version__ == "0.10.0"
+    assert __version__ == "0.11.0"
     with pytest.raises(SystemExit) as exit_info:
         build_parser().parse_args(["--version"])
     assert exit_info.value.code == 0
@@ -486,12 +486,14 @@ def test_push_passes_explicit_cache_dir_and_source_root(tmp_path, monkeypatch, c
         "--cache-dir", str(cache),
         "--port", "2222",
         "--identity", "/keys/id",
+        "--remote-modelctl", "/opt/modelctl/bin/modelctl",
     ]) == 0
     source, remote_cache, name, options = calls[0]
     assert source == nas
     assert remote_cache == cache
     assert options["port"] == 2222
     assert options["identity"] == "/keys/id"
+    assert options["remote_modelctl"] == "/opt/modelctl/bin/modelctl"
 
 
 def test_receive_cache_probe_prints_json(tmp_path, monkeypatch, capsys):

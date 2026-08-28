@@ -177,6 +177,13 @@ class FakeRunner:
                 self.file_list = [
                     name.decode() for name in path.read_bytes().split(b"\0") if name
                 ]
+        if any(
+            isinstance(argument, str) and "cd; for p in " in argument
+            for argument in command
+        ):
+            return SimpleNamespace(
+                returncode=0, stdout="/usr/local/bin/modelctl\n", stderr=""
+            )
         if "receive-cache" in command and "--probe" in command:
             return SimpleNamespace(
                 returncode=0,
@@ -223,27 +230,31 @@ def test_push_orchestrates_probe_rsync_and_commit(tmp_path):
     result = push_model(nas, cache, "demo", host="node-b", runner=fake)
 
     assert result == str(cache / "models--org--demo" / "snapshots" / COMMIT)
-    assert fake.calls[0] == [
+    assert fake.calls[0][:2] == ["ssh", "node-b"]
+    assert fake.calls[0][2:4] == ["sh", "-c"]
+    script = fake.calls[0][4]
+    assert "$HOME/.local/bin/modelctl" in script
+    assert fake.calls[1] == [
         "ssh",
         "node-b",
-        "modelctl",
+        "/usr/local/bin/modelctl",
         "receive-cache",
         "--probe",
         "demo",
         "--cache-dir",
         str(cache),
     ]
-    rsync = fake.calls[1]
+    rsync = fake.calls[2]
     assert rsync[0] == "rsync"
     for flag in ("--archive", "--partial", "--delete", "--from0", "-e"):
         assert flag in rsync
     assert rsync[rsync.index("-e") + 1] == "ssh -o Compression=no"
     assert rsync[-2] == f"{object_path}/"
     assert rsync[-1] == f"node-b:{staging}/"
-    assert fake.calls[2] == [
+    assert fake.calls[3] == [
         "ssh",
         "node-b",
-        "modelctl",
+        "/usr/local/bin/modelctl",
         "receive-cache",
         "demo",
         "--cache-dir",
@@ -271,23 +282,58 @@ def test_push_uses_port_identity_and_fabric_host(tmp_path):
         identity="/keys/connectx",
         runner=fake,
     )
-    assert fake.calls[0] == [
+    assert fake.calls[1] == [
         "ssh",
         "-p",
         "2222",
         "-i",
         "/keys/connectx",
         "user@10.0.0.2",
-        "modelctl",
+        "/usr/local/bin/modelctl",
         "receive-cache",
         "--probe",
         "demo",
         "--cache-dir",
         str(cache),
     ]
-    assert fake.calls[1][fake.calls[1].index("-e") + 1] == (
+    assert fake.calls[2][fake.calls[2].index("-e") + 1] == (
         "ssh -p 2222 -i /keys/connectx -o Compression=no"
     )
+
+
+def test_push_uses_remote_modelctl_override(tmp_path):
+    nas = _nas_object(tmp_path)
+    cache = tmp_path / "hub"
+    fake = FakeRunner(cache)
+    push_model(
+        nas,
+        cache,
+        "demo",
+        host="node-b",
+        remote_modelctl="/opt/modelctl/bin/modelctl",
+        runner=fake,
+    )
+    assert fake.calls[0][2:4] != ["sh", "-c"]
+    assert fake.calls[0] == [
+        "ssh",
+        "node-b",
+        "/opt/modelctl/bin/modelctl",
+        "receive-cache",
+        "--probe",
+        "demo",
+        "--cache-dir",
+        str(cache),
+    ]
+
+
+def test_push_fails_when_remote_modelctl_missing(tmp_path):
+    nas = _nas_object(tmp_path)
+
+    def not_found(command, **kwargs):
+        return SimpleNamespace(returncode=1, stdout="", stderr="")
+
+    with pytest.raises(ModelctlError, match="--remote-modelctl"):
+        push_model(nas, tmp_path / "hub", "demo", host="node-b", runner=not_found)
 
 
 def test_push_resolves_repository_id_to_active_name(tmp_path):
@@ -295,8 +341,9 @@ def test_push_resolves_repository_id_to_active_name(tmp_path):
     cache = tmp_path / "hub"
     fake = FakeRunner(cache)
     push_model(nas, cache, "org/demo", host="node-b", runner=fake)
-    assert "--probe" in fake.calls[0]
-    assert fake.calls[0][fake.calls[0].index("--probe") + 1] == "demo"
+    probe = fake.calls[1]
+    assert "--probe" in probe
+    assert probe[probe.index("--probe") + 1] == "demo"
 
 
 def test_push_fails_when_remote_unreachable(tmp_path):
@@ -331,6 +378,13 @@ def test_push_reports_resumable_rsync_failure(tmp_path):
     nas = _nas_object(tmp_path)
 
     def fail_rsync(command, **kwargs):
+        if any(
+            isinstance(argument, str) and "cd; for p in " in argument
+            for argument in command
+        ):
+            return SimpleNamespace(
+                returncode=0, stdout="/usr/local/bin/modelctl\n", stderr=""
+            )
         if "receive-cache" in command:
             return SimpleNamespace(
                 returncode=0,
@@ -385,11 +439,20 @@ def test_push_end_to_end_through_real_receive_cli(tmp_path, monkeypatch):
                     staged.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(source / name, staged)
                 return SimpleNamespace(returncode=0)
+            if any(
+                isinstance(argument, str) and "cd; for p in " in argument
+                for argument in command
+            ):
+                return SimpleNamespace(
+                    returncode=0, stdout="/usr/local/bin/modelctl\n", stderr=""
+                )
             remote_args = [
                 argument.strip("'") for argument in command[command.index("node-b") + 1 :]
             ]
+            if remote_args and remote_args[0] != "receive-cache":
+                remote_args = remote_args[1:]
             return subprocess.run(
-                [sys.executable, "-m", *remote_args],
+                [sys.executable, "-m", "modelctl", *remote_args],
                 capture_output=True,
                 text=True,
             )
