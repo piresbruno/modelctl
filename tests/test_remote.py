@@ -391,6 +391,59 @@ def test_push_round_robins_streams_over_three_hosts(tmp_path):
     hosts = [call[-1].split(":", 1)[0] for call in rsync_calls]
     assert hosts == ["h1", "h2", "h3", "h1", "h2"]
 
+
+def test_push_jobs_clamps_streams_to_file_count(tmp_path):
+    cache = _local_cache(
+        tmp_path,
+        files={"a.bin": b"1", "b.bin": b"2", "c.bin": b"3", "d.bin": b"4"},
+    )
+    fake = FakeRunner(cache)
+    push_model(cache, "demo", host="node-b", jobs=50, runner=fake)
+    rsync_calls = [call for call in fake.calls if call[0] == "rsync"]
+    assert len(rsync_calls) == 9  # 4 files + 4 metadata + .modelctl.json
+    assert all(len(names) == 1 for names in fake.file_lists)
+
+
+def test_push_jobs_reports_resumable_error_when_stream_fails(tmp_path):
+    cache = _local_cache(
+        tmp_path,
+        files={"a.bin": b"1", "b.bin": b"2", "c.bin": b"3", "d.bin": b"4"},
+    )
+
+    def failing(command, **kwargs):
+        if command[0] == "rsync":
+            raise RuntimeError("stream transfer failed")
+        if any(
+            isinstance(argument, str) and "cd; for p in " in argument
+            for argument in command
+        ):
+            return SimpleNamespace(
+                returncode=0, stdout="/usr/local/bin/modelctl\n", stderr=""
+            )
+        if any(
+            isinstance(argument, str) and "mkdir -p" in argument
+            for argument in command
+        ):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "--probe" in command:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"proto": 1, "cache": str(cache)}),
+                stderr="",
+            )
+        if "receive-cache" in command:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {"proto": 1, "cache": str(cache), "snapshot": "/snap"}
+                ),
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with pytest.raises(ModelctlError, match="resumable"):
+        push_model(cache, "demo", host="node-b", jobs=2, runner=failing)
+
 def test_push_requires_local_cache_record(tmp_path):
     cache = tmp_path / "hub"
     fake = FakeRunner(cache)
