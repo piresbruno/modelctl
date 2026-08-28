@@ -506,45 +506,98 @@ commit through its own registration state.
 ### Copy active models to another instance over SSH
 
 `push` copies one validated NAS object into another host's Hugging Face cache
-without re-downloading it:
+without re-downloading it — for example, node A pulls a model from the NAS
+once, then fans it out to the other nodes over a fast interconnect:
 
 ```bash
 modelctl push qwen3-8b-vllm --host node-b
 ```
 
-The source is always the local managed store, for example the NAS node that
-already downloaded the model. This host needs `ssh` and `rsync`; the
-destination host needs `modelctl` installed, which `push` auto-discovers at
-`~/.local/bin/modelctl`, `/usr/local/bin/modelctl`, or `/usr/bin/modelctl`
-(or via `--remote-modelctl PATH`), so a plain `uv tool install` on the remote
-is enough — no shell PATH or symlink setup is required for ssh use. With the
-default cache path, `receive-cache` creates the cache directories itself on
-publication. The remote cache directory
-defaults to the same path this host resolves (`HF_HUB_CACHE`, `HF_HOME/hub`,
-or the platform default), so two identical inference nodes need only
-`--host`. Override the remote cache explicitly when the destination differs:
+The source is always the local managed store. Pass an active model name or a
+unique Hugging Face repository id; a repository id is resolved to the matching
+active model automatically (`modelctl push incoai/GLM-5.3-Flash-DFlash2
+--host node-b`).
+
+#### Prerequisites
+
+- This host needs `ssh` and `rsync`.
+- The destination needs `modelctl` — a plain `uv tool install` is enough.
+  `push` auto-discovers it at `~/.local/bin/modelctl`,
+  `/usr/local/bin/modelctl`, or `/usr/bin/modelctl` (non-interactive ssh
+  shells ignore shell rc files, so no PATH, symlink, or sshd setup is
+  required), or accepts an explicit `--remote-modelctl PATH`.
+- The destination also needs the `rsync` package (`sudo apt install rsync`),
+  since rsync runs on both ends.
+- The remote cache directory must be creatable and writable by the ssh user.
+  `push` preflights it (`mkdir -p` plus a writability check) and fails with
+  an actionable error before transferring anything when it is not.
+
+#### How it works
+
+1. **Resolve** the active model in the local store and read its retained
+   Hugging Face download metadata.
+2. **Probe** — a JSON handshake over ssh (`receive-cache --probe`) verifies
+   the remote modelctl protocol and returns the canonical remote cache path.
+3. **Preflight and transfer** — the remote cache directory is created and
+   checked, then only the object's selected files (plus `.modelctl.json` and
+   retained ETag metadata) are rsynced over `ssh -o Compression=no` into
+   deterministic remote staging. Interrupted transfers stay resumable in
+   remote staging; a rerun resumes them.
+4. **Commit** — the remote `receive-cache` re-derives the staging path from
+   the transferred metadata (misplaced or tampered transfers are rejected),
+   validates every file against its retained Hugging Face ETag, and
+   atomically publishes blobs, a commit snapshot, refs, and a registration
+   record, journaled `READY_FOR_SERVICE_RESTART` last.
+
+When publication finishes, the command prints the remote snapshot path and
+`modelctl list --local`, `path NAME --local`, and `serve-command NAME --local`
+work on the destination immediately.
+
+#### Options
+
+| Option | Meaning |
+| --- | --- |
+| `--host HOST` | ssh destination: hostname, `user@host`, or ssh-config alias (required) |
+| `--source-root`, `--from-root PATH` | source NAS store root (default: configured root) |
+| `--cache-dir PATH` | remote HF cache directory (default: **this host's** cache path, so identical nodes need no flag) |
+| `--port PORT` | ssh port |
+| `--identity KEY` | ssh identity file |
+| `--ssh SSH` | ssh executable (default: `ssh`) |
+| `--rsync RSYNC` | rsync executable (default: `rsync`) |
+| `--remote-modelctl PATH` | remote modelctl executable (default: auto-discovered) |
+
+#### Examples
 
 ```bash
-modelctl push unsloth/DeepSeek-V4-Flash-0731 \
-  --host user@10.18.0.2 --port 2222 --identity ~/.ssh/connectx \
-  --cache-dir /srv/huggingface/hub
+# Two identical nodes: only --host is needed
+modelctl push qwen3-8b-vllm --host node-b
+
+# Ship from the NAS node to a remote inference host over the ConnectX-7 fabric
+modelctl push incoai/GLM-5.3-Flash-DFlash2 --host 10.100.24.1 \
+  --port 2222 --identity ~/.ssh/connectx
+
+# Explicit remote cache path and custom remote modelctl install
+modelctl push model-q4 --host node-b \
+  --cache-dir /srv/huggingface/hub \
+  --remote-modelctl /opt/modelctl/bin/modelctl
 ```
 
-Point `--host` at the fast fabric interface (for example the ConnectX-7 IP)
-when the hostname resolves to a slower path. `push` performs a short JSON
-handshake against the remote `receive-cache` probe, rsyncs only the object's
-selected files (plus its retained Hugging Face metadata) into the remote cache
-staging area over `ssh -o Compression=no`, and then asks the remote
-`receive-cache` to validate every file against its retained Hugging Face ETag
-and publish the standard `models--OWNER--REPO/blobs`, `snapshots/COMMIT`, and
-`refs` layout plus a modelctl registration. Interrupted transfers stay
-resumable in remote staging and a rerun resumes them. When publication
-finishes, `modelctl path NAME --local` and `serve-command NAME --local` work
-on the destination immediately.
+The remote cache directory defaults to the same path this host resolves
+(`HF_HUB_CACHE`, `HF_HOME/hub`, or the platform default), so identical node
+images make the push a single command. Point `--host` at a fabric interface
+(for example the ConnectX-7 IP) when the hostname resolves to a slower path.
+The transfer is a single rsync stream; MTU 9000 and `tcp_bbr` on both fabric
+ends improve throughput, and parallel-stream `--jobs` support is planned for
+saturating 200 Gb/s links.
 
-`receive-cache` is the remote half; it is normally invoked over ssh by `push`
-and is available for manual inspection (`--probe`) or review before a manual
-rsync.
+#### receive-cache
+
+`receive-cache` is the remote half, normally invoked over ssh by `push`.
+`receive-cache --probe NAME` prints the read-only JSON handshake
+(`{"proto": 1, "cache": ...}`) without mutating anything. A standalone
+`receive-cache NAME --staging PATH` validates and publishes a directory that
+rsync left behind, which is useful for manual inspection or reviewing a
+manually placed transfer before committing it.
 
 Save the NAS model store once and omit `--root` from subsequent commands:
 

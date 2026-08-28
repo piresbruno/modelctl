@@ -689,26 +689,52 @@ not restarted.""",
         aliases=["sync-remote"],
         help="copy an active NAS model into another host's HF cache over ssh",
         description=(
-            "Validate the active NAS object, rsync its selected files over ssh "
-            "into the remote host's cache staging area, and atomically publish "
-            "blobs, a commit snapshot, refs, and a local registration there. "
-            "The source is always the local managed store."
+            "Copy one validated NAS object into another host's Hugging Face "
+            "cache over ssh without re-downloading it. The source is always "
+            "the local managed store. The command auto-discovers the remote "
+            "modelctl binary, preflights the remote cache directory, rsyncs "
+            "only the model's selected files, and has receive-cache validate "
+            "and atomically publish blobs, a snapshot, refs, and a local "
+            "registration on the destination."
         ),
         formatter_class=HELP_FORMATTER,
         epilog="""examples:
+  # Minimal: the remote cache directory defaults to this host's cache path
   modelctl push qwen3-8b-vllm --host node-b
-  modelctl push unsloth/DeepSeek-V4-Flash-0731 \\
-    --host user@10.18.0.2 --port 2222 --identity ~/.ssh/connectx
-  modelctl push model-q4 --host node-b --cache-dir /srv/huggingface/hub
+
+  # Over an interconnect fabric (for example ConnectX-7) with custom ssh
+  modelctl push incoai/GLM-5.3-Flash-DFlash2 --host 10.100.24.1 \\
+    --port 2222 --identity ~/.ssh/connectx
+
+  # Explicit remote cache directory and remote modelctl install
+  modelctl push model-q4 --host node-b \\
+    --cache-dir /srv/huggingface/hub \\
+    --remote-modelctl /opt/modelctl/bin/modelctl
+
+  # Alias
   modelctl sync-remote qwen3-8b-vllm --host node-b
 
-Pass an active model name or its Hugging Face repository id. ssh and rsync are
-required on this host; modelctl must be installed on the remote and is
-auto-discovered (or set with --remote-modelctl PATH). The remote cache
-directory defaults to the same path this host uses, so two identical DGX
-Spark nodes need only --host. Point --host at the fabric interface (for
-example the ConnectX-7 IP) when the hostname resolves to a slower path.
-Interrupted transfers remain resumable in remote staging.""",
+How it works:
+  1. Resolve an active model name (or a unique Hugging Face repository id) in
+     the local managed store and read its retained download metadata.
+  2. Discover the remote modelctl binary, then run receive-cache --probe over
+     ssh for a JSON handshake: protocol version and canonical cache path.
+  3. Preflight the remote cache directory (create it and prove it is
+     writable), then rsync only the object's selected files plus metadata over
+     'ssh -o Compression=no' into deterministic remote staging.
+  4. Run receive-cache over ssh: the remote re-derives the staging path from
+     the transferred metadata, validates every file against its retained
+     Hugging Face ETag, and atomically publishes blobs, a commit snapshot,
+     refs, and a local registration.
+
+ssh and rsync are required on this host. The remote needs modelctl (a plain
+'uv tool install' is enough; push auto-discovers ~/.local/bin/modelctl,
+/usr/local/bin/modelctl, or /usr/bin/modelctl, or use --remote-modelctl) and
+the rsync package. The remote cache directory defaults to the same path this
+host uses, so two identical nodes need only --host. Point --host at a fabric
+interface (for example the ConnectX-7 IP) when the hostname resolves to a
+slower path. Interrupted transfers remain resumable in remote staging and a
+rerun resumes them.""",
     )
     push.add_argument(
         "name", metavar="MODEL_OR_REPO",
@@ -746,11 +772,23 @@ Interrupted transfers remain resumable in remote staging.""",
         ),
         formatter_class=HELP_FORMATTER,
         epilog="""examples:
+  # Read-only handshake: prints protocol version and canonical cache path
   modelctl receive-cache --probe qwen3-8b-vllm
+
+  # Commit a staged transfer that rsync left in this host's cache staging
   modelctl receive-cache qwen3-8b-vllm --staging /cache/models--Qwen--Qwen3-8B/.modelctl-staging/COMMIT--SELECTION
 
-Run over ssh by 'modelctl push'; use --probe for the handshake and --staging
-for the directory rsync left in this host's cache staging area.""",
+How it works:
+  --probe prints {"proto": 1, "cache": ...} and mutates nothing.
+  Otherwise the staged directory's own metadata is validated first; the
+  staging path is re-derived from that metadata and must match --staging
+  (misplaced or tampered transfers are rejected). Every selected file is then
+  verified against its retained Hugging Face ETag before blobs, a commit
+  snapshot, refs, and a modelctl registration are published atomically, with
+  the journal closed as READY_FOR_SERVICE_RESTART last.
+
+Normally invoked over ssh by 'modelctl push'; useful standalone for manual
+inspection or reviewing a manually rsynced staging directory.""",
     )
     receive.add_argument("name", metavar="NAME")
     receive.add_argument(

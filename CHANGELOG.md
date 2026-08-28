@@ -2,6 +2,18 @@
 
 This project follows semantic versioning.
 
+## 0.11.1
+
+### Added
+
+- `push` now preflights the remote cache directory over ssh (`mkdir -p` plus
+  a writability check) before transferring anything, failing with an
+  actionable error when the cache cannot be created or written instead of an
+  opaque rsync receiver failure.
+- Document the full `push` workflow, prerequisites, options, fabric examples,
+  and the `receive-cache` handshake and commit semantics in both the CLI help
+  and the README.
+
 ## 0.11.0
 
 ### Added
