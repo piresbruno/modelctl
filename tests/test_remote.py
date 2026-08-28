@@ -255,9 +255,15 @@ def test_push_orchestrates_probe_rsync_and_commit(tmp_path):
     staging = staging_path_for(cache, record.repo, record.commit, record.files)
 
     fake = FakeRunner(cache)
-    result = push_model(cache, "demo", host="node-b", runner=fake)
+    messages = []
+    result = push_model(
+        cache, "demo", host="node-b", runner=fake, progress=messages.append
+    )
 
     assert result == str(cache / "models--org--demo" / "snapshots" / COMMIT)
+    assert messages[3] == (
+        f"push: transferring 1 files (+2 metadata files) to node-b:{staging}"
+    )
     assert fake.calls[0][:2] == ["ssh", "node-b"]
     assert fake.calls[0][2:4] == ["sh", "-c"]
     script = fake.calls[0][4]

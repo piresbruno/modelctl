@@ -391,12 +391,17 @@ def push_model(
                     ]
                 )
             if progress is not None:
-                links = ", ".join(stream_hosts)
-                progress(
-                    f"push: transferring {len(files)} files "
-                    f"(+{len(names) - len(files)} metadata files) to {links} "
-                    f"with {len(commands)} rsync stream(s)"
-                )
+                if len(commands) == 1:
+                    progress(
+                        f"push: transferring {len(files)} files "
+                        f"(+{len(names) - len(files)} metadata files) to {host}:{staging}"
+                    )
+                else:
+                    progress(
+                        f"push: transferring {len(files)} files "
+                        f"(+{len(names) - len(files)} metadata files) to "
+                        f"{', '.join(stream_hosts)} with {len(commands)} rsync streams"
+                    )
             _run_rsync_streams(commands, runner, host)
         finally:
             for list_path in list_paths:
