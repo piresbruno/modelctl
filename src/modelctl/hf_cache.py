@@ -72,6 +72,24 @@ def repo_path(cache_dir: Path, repo: str) -> Path:
     return canonical_cache(cache_dir) / f"models--{'--'.join(parts)}"
 
 
+def _cache_staging_path(repository: Path, commit: str, files: dict[str, str]) -> Path:
+    return repository / ".modelctl-staging" / f"{commit}-{_selection(files)}"
+
+
+def staging_path_for(
+    cache_dir: Path, repo: str, commit: str, files: dict[str, str]
+) -> Path:
+    """Deterministic cache staging path for a pending transfer.
+
+    ``sync_cache`` and the SSH push protocol derive the same path from the same
+    metadata, so the receiving side can verify exactly where transferred data
+    was placed before publishing it.
+    """
+    return _cache_staging_path(
+        repo_path(canonical_cache(cache_dir), repo), commit, files
+    )
+
+
 def _safe_relative(value: str, label: str) -> PurePosixPath:
     path = PurePosixPath(value)
     if (
@@ -193,6 +211,11 @@ def _read_etag(source: Path, filename: str, commit: str) -> str:
     return etag.lower()
 
 
+def read_source_etag(source: Path, filename: str, commit: str) -> str:
+    """Read the retained Hugging Face ETag for one managed object file."""
+    return _read_etag(source, filename, commit)
+
+
 def _digest_for_etag(path: Path, etag: str) -> str:
     if len(etag) == 64:
         digest = hashlib.sha256()
@@ -238,6 +261,11 @@ def _selection(files: dict[str, str]) -> str:
 def _write_file_list(path: Path, filenames: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"\0".join(name.encode() for name in filenames) + b"\0")
+
+
+def write_transfer_file_list(path: Path, filenames: list[str]) -> None:
+    """Write a NUL-delimited file list for rsync ``--files-from --from0``."""
+    _write_file_list(path, filenames)
 
 
 def _snapshot_pointer(snapshot: Path, filename: str) -> Path:
@@ -375,12 +403,12 @@ def sync_cache(
         raise ValidationError(f"invalid Hugging Face commit in object metadata: {commit!r}")
     expected = [ExpectedFile.from_dict(item) for item in metadata["files"]]
     files = {
-        item.path: _read_etag(source, item.path, commit)
+        item.path: read_source_etag(source, item.path, commit)
         for item in expected
     }
     repository = repo_path(cache, str(metadata.get("repo", "")))
     selection = _selection(files)
-    staging = repository / ".modelctl-staging" / f"{commit}-{selection}"
+    staging = staging_path_for(cache, str(metadata.get("repo", "")), commit, files)
     file_list = staging.parent / f".{selection}.files"
 
     with _lock(_name_lock(cache, name)), _lock(
@@ -403,7 +431,7 @@ def sync_cache(
             f"sync-local: transferring {len(files)} files "
             f"({_format_bytes(total_bytes)}) to cache staging",
         )
-        _write_file_list(file_list, sorted(files))
+        write_transfer_file_list(file_list, sorted(files))
         command = [
             rsync,
             "--archive",
@@ -425,123 +453,157 @@ def sync_cache(
             raise ModelctlError(f"rsync failed; staging is resumable: {exc}") from exc
         finally:
             file_list.unlink(missing_ok=True)
-
-        _transition(
-            cache,
-            name,
-            "VALIDATING_STAGING",
-            files=len(files),
-            bytes=total_bytes,
+        return publish_synced_staging(
+            cache, name, metadata, files, staging, progress=progress
         )
+
+
+def publish_synced_staging(
+    cache_dir: Path,
+    name: str,
+    metadata: dict[str, Any],
+    files: dict[str, str],
+    staging: Path,
+    *,
+    progress: Callable[[str], None] | None = None,
+    label: str = "sync-local",
+) -> Path:
+    """Validate a fully transferred staging directory and publish it as an HF
+    cache snapshot, refs, blobs, and a registration record.
+
+    Callers must hold the per-name and per-repo cache locks. The staging path
+    must be the one derived from ``metadata`` and ``files`` so a misplaced or
+    tampered transfer cannot be published."""
+    cache = canonical_cache(cache_dir)
+    repository = repo_path(cache, str(metadata["repo"]))
+    commit = str(metadata["commit"])
+    derived = _cache_staging_path(repository, commit, files)
+    if staging != derived:
+        raise ValidationError(
+            f"staged transfer path {staging} does not match its derived path {derived}"
+        )
+    if staging.is_symlink() or not staging.is_dir():
+        raise ValidationError(f"staged transfer is not a real directory: {staging}")
+    for path in (
+        cache,
+        repository,
+        repository / "blobs",
+        repository / "snapshots",
+        repository / "refs",
+    ):
+        _ensure_real_directory(path)
+    total_bytes = sum(
+        item.size or 0
+        for item in (ExpectedFile.from_dict(entry) for entry in metadata["files"])
+    )
+    _transition(cache, name, "VALIDATING_STAGING", files=len(files), bytes=total_bytes)
+    _report(
+        progress,
+        f"{label}: validating {len(files)} transferred files "
+        f"({_format_bytes(total_bytes)})",
+    )
+    for index, (filename, etag) in enumerate(files.items(), start=1):
         _report(
             progress,
-            f"sync-local: validating {len(files)} transferred files "
-            f"({_format_bytes(total_bytes)})",
+            f"{label}: validating [{index}/{len(files)}] {filename}",
         )
-        for index, (filename, etag) in enumerate(files.items(), start=1):
-            _report(
-                progress,
-                f"sync-local: validating [{index}/{len(files)}] {filename}",
-            )
-            _verify_etag(staging.joinpath(*PurePosixPath(filename).parts), etag)
+        _verify_etag(staging.joinpath(*PurePosixPath(filename).parts), etag)
 
-        _transition(
-            cache,
-            name,
-            "PUBLISHING_CACHE",
-            files=len(files),
-            bytes=total_bytes,
-        )
-        _report(progress, "sync-local: publishing verified blobs and snapshot")
-        blobs = repository / "blobs"
-        hf_locks = cache / ".locks" / repository.name
-        _ensure_real_directory(cache / ".locks")
-        _ensure_real_directory(hf_locks)
-        for index, (filename, etag) in enumerate(files.items(), start=1):
-            staged = staging.joinpath(*PurePosixPath(filename).parts)
-            blob = blobs / etag
-            with WeakFileLock(hf_locks / f"{etag}.lock"):
-                if blob.exists():
-                    _report(
-                        progress,
-                        f"sync-local: checking existing blob "
-                        f"[{index}/{len(files)}] {filename}",
-                    )
-                    _verify_etag(blob, etag)
-                    staged.unlink()
-                else:
-                    # The staged file was verified immediately above. Atomic rename
-                    # preserves that same file while avoiding a second full hash pass.
-                    os.replace(staged, blob)
-                    _fsync_directory(blobs)
-
-        snapshot = repository / "snapshots" / commit
-        if snapshot.exists():
-            _ensure_real_directory(snapshot, create=False)
-            for filename, etag in files.items():
-                pointer = _snapshot_pointer(snapshot, filename)
-                target = os.path.relpath(blobs / etag, start=pointer.parent)
-                if pointer.is_symlink():
-                    try:
-                        matches = pointer.resolve(strict=True) == (blobs / etag)
-                    except OSError:
-                        matches = False
-                    if not matches:
-                        raise ValidationError(
-                            f"snapshot path already points to different content: {pointer}"
-                        )
-                elif pointer.exists():
-                    raise ValidationError(f"snapshot path is not a symlink: {pointer}")
-                else:
-                    _atomic_symlink_text(target, pointer)
-        else:
-            staged_snapshot = repository / ".modelctl-staging" / f".snapshot-{commit}-{selection}"
-            if staged_snapshot.exists():
-                shutil.rmtree(staged_snapshot)
-            staged_snapshot.mkdir(parents=True)
-            for filename, etag in files.items():
-                staged_pointer = staged_snapshot.joinpath(*PurePosixPath(filename).parts)
-                final_pointer = snapshot.joinpath(*PurePosixPath(filename).parts)
-                staged_pointer.parent.mkdir(parents=True, exist_ok=True)
-                staged_pointer.symlink_to(
-                    os.path.relpath(blobs / etag, start=final_pointer.parent)
+    _transition(cache, name, "PUBLISHING_CACHE", files=len(files), bytes=total_bytes)
+    _report(progress, f"{label}: publishing verified blobs and snapshot")
+    blobs = repository / "blobs"
+    hf_locks = cache / ".locks" / repository.name
+    _ensure_real_directory(cache / ".locks")
+    _ensure_real_directory(hf_locks)
+    for index, (filename, etag) in enumerate(files.items(), start=1):
+        staged = staging.joinpath(*PurePosixPath(filename).parts)
+        blob = blobs / etag
+        with WeakFileLock(hf_locks / f"{etag}.lock"):
+            if blob.exists():
+                _report(
+                    progress,
+                    f"{label}: checking existing blob "
+                    f"[{index}/{len(files)}] {filename}",
                 )
-            try:
-                os.rename(staged_snapshot, snapshot)
-                _fsync_directory(snapshot.parent)
-            except FileExistsError:
-                shutil.rmtree(staged_snapshot)
-                raise ModelctlError(
-                    f"cache snapshot appeared concurrently at {snapshot}; retry sync"
-                )
+                _verify_etag(blob, etag)
+                staged.unlink()
+            else:
+                # The staged file was verified immediately above. Atomic rename
+                # preserves that same file while avoiding a second full hash pass.
+                os.replace(staged, blob)
+                _fsync_directory(blobs)
 
+    snapshot = repository / "snapshots" / commit
+    if snapshot.exists():
+        _ensure_real_directory(snapshot, create=False)
         for filename, etag in files.items():
-            pointer = snapshot.joinpath(*PurePosixPath(filename).parts)
-            try:
-                resolved = pointer.resolve(strict=True)
-                resolved.relative_to(blobs.resolve(strict=True))
-            except (OSError, ValueError) as exc:
-                raise ValidationError(f"snapshot pointer escapes cache blobs: {pointer}") from exc
-            if resolved != (blobs / etag).resolve(strict=True):
-                raise ValidationError(f"snapshot pointer has unexpected target: {pointer}")
+            pointer = _snapshot_pointer(snapshot, filename)
+            target = os.path.relpath(blobs / etag, start=pointer.parent)
+            if pointer.is_symlink():
+                try:
+                    matches = pointer.resolve(strict=True) == (blobs / etag)
+                except OSError:
+                    matches = False
+                if not matches:
+                    raise ValidationError(
+                        f"snapshot path already points to different content: {pointer}"
+                    )
+            elif pointer.exists():
+                raise ValidationError(f"snapshot path is not a symlink: {pointer}")
+            else:
+                _atomic_symlink_text(target, pointer)
+    else:
+        staged_snapshot = (
+            repository / ".modelctl-staging" / f".snapshot-{commit}-{_selection(files)}"
+        )
+        if staged_snapshot.exists():
+            shutil.rmtree(staged_snapshot)
+        staged_snapshot.mkdir(parents=True)
+        for filename, etag in files.items():
+            staged_pointer = staged_snapshot.joinpath(*PurePosixPath(filename).parts)
+            final_pointer = snapshot.joinpath(*PurePosixPath(filename).parts)
+            staged_pointer.parent.mkdir(parents=True, exist_ok=True)
+            staged_pointer.symlink_to(
+                os.path.relpath(blobs / etag, start=final_pointer.parent)
+            )
+        try:
+            os.rename(staged_snapshot, snapshot)
+            _fsync_directory(snapshot.parent)
+        except FileExistsError:
+            shutil.rmtree(staged_snapshot)
+            raise ModelctlError(
+                f"cache snapshot appeared concurrently at {snapshot}; retry sync"
+            )
 
-        _publish_ref(
-            cache,
-            repository,
-            str(metadata["repo"]),
-            str(metadata["revision"]),
-            commit,
-        )
-        _atomic_json(
-            _record_path(cache, name),
-            _record_payload(cache, name, metadata, files, snapshot),
-        )
-        _transition(cache, name, "READY_FOR_SERVICE_RESTART", snapshot=str(snapshot))
-        shutil.rmtree(staging, ignore_errors=True)
-        entrypoint = str(metadata["entrypoint"])
-        return (
-            snapshot if entrypoint == "." else snapshot.joinpath(*PurePosixPath(entrypoint).parts)
-        ).resolve(strict=True)
+    for filename, etag in files.items():
+        pointer = snapshot.joinpath(*PurePosixPath(filename).parts)
+        try:
+            resolved = pointer.resolve(strict=True)
+            resolved.relative_to(blobs.resolve(strict=True))
+        except (OSError, ValueError) as exc:
+            raise ValidationError(
+                f"snapshot pointer escapes cache blobs: {pointer}"
+            ) from exc
+        if resolved != (blobs / etag).resolve(strict=True):
+            raise ValidationError(f"snapshot pointer has unexpected target: {pointer}")
+
+    _publish_ref(
+        cache,
+        repository,
+        str(metadata["repo"]),
+        str(metadata["revision"]),
+        commit,
+    )
+    _atomic_json(
+        _record_path(cache, name),
+        _record_payload(cache, name, metadata, files, snapshot),
+    )
+    _transition(cache, name, "READY_FOR_SERVICE_RESTART", snapshot=str(snapshot))
+    shutil.rmtree(staging, ignore_errors=True)
+    entrypoint = str(metadata["entrypoint"])
+    return (
+        snapshot if entrypoint == "." else snapshot.joinpath(*PurePosixPath(entrypoint).parts)
+    ).resolve(strict=True)
 
 
 def load_record(cache_dir: Path, name: str) -> CacheRecord:
