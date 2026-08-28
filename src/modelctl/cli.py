@@ -726,6 +726,9 @@ not restarted.""",
     --cache-dir /srv/huggingface/hub \\
     --remote-modelctl /opt/modelctl/bin/modelctl
 
+  # Parallel rsync streams for many-file models on a fast fabric
+  modelctl push glm-5.3-flash-exl3-q4 --host node-b --jobs 4
+
   # Alias
   modelctl sync-remote qwen3-8b-vllm --host node-b
 
@@ -750,7 +753,8 @@ the rsync package. The remote cache directory defaults to the same path this
 host uses, so two identical nodes need only --host. Point --host at a fabric
 interface (for example the ConnectX-7 IP) when the hostname resolves to a
 slower path. Interrupted transfers remain resumable in remote staging and a
-rerun resumes them.""",
+rerun resumes them. --jobs N runs up to N concurrent rsync streams into the
+same staging directory; raise it for many-file models on fast fabrics.""",
     )
     push.add_argument(
         "name", metavar="MODEL_OR_REPO",
@@ -764,6 +768,13 @@ rerun resumes them.""",
     push.add_argument("--identity", metavar="KEY", help="ssh identity file")
     push.add_argument("--ssh", default="ssh", help="ssh executable (default: ssh)")
     push.add_argument("--rsync", default="rsync", help="rsync executable (default: rsync)")
+    push.add_argument(
+        "--jobs",
+        type=_positive_int,
+        default=1,
+        metavar="N",
+        help="maximum concurrent rsync streams (default: 1; raise for many-file models)",
+    )
     push.add_argument(
         "--remote-modelctl", metavar="PATH",
         help="remote modelctl executable (default: auto-discovered)",
@@ -867,6 +878,7 @@ def run(argv: list[str] | None = None) -> int:
             ssh=args.ssh,
             rsync=args.rsync,
             remote_modelctl=args.remote_modelctl,
+            jobs=args.jobs,
             progress=lambda message: print(message, flush=True),
         )
         print(result)

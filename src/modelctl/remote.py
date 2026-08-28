@@ -6,6 +6,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
@@ -276,6 +277,36 @@ def _remote_command(
     return args
 
 
+def _run_rsync_streams(
+    commands: list[list[str]], runner: Callable[..., Any], host: str
+) -> None:
+    """Run one or more rsync argv lists, concurrently."""
+    if len(commands) == 1:
+        try:
+            runner(commands[0], check=True)
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise ModelctlError(
+                f"rsync to {host} failed; remote staging is resumable: {exc}"
+            ) from exc
+        return
+    errors: list[BaseException] = []
+    with ThreadPoolExecutor(max_workers=len(commands)) as pool:
+        futures = [pool.submit(runner, command, check=True) for command in commands]
+        for future in futures:
+            try:
+                future.result()
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                errors.append(exc)
+    if errors:
+        raise ModelctlError(
+            f"rsync to {host} failed; remote staging is resumable: {errors[0]}"
+        ) from errors[0]
+
+
 def push_model(
     local_cache_dir: Path,
     name: str,
@@ -286,6 +317,7 @@ def push_model(
     ssh: str = "ssh",
     rsync: str = "rsync",
     remote_modelctl: str | None = None,
+    jobs: int = 1,
     runner: Callable[..., Any] = subprocess.run,
     progress: Callable[[str], None] | None = None,
 ) -> str:
@@ -295,8 +327,10 @@ def push_model(
     The model must already have a modelctl registration in the local cache
     (for example from ``modelctl sync-local`` or an earlier push); push reads
     that snapshot and transfers only its files through the remote
-    ``receive-cache`` validation and publication path. Interrupted transfers
-    remain resumable in remote staging.
+    ``receive-cache`` validation and publication path. With ``jobs`` greater
+    than one the transfer is split into that many independent rsync streams
+    into the same staging directory, which helps many-file models saturate a
+    fast fabric. Interrupted transfers remain resumable in remote staging.
     """
     resolved, metadata, files, commit, overlay = _cache_source(local_cache_dir, name)
     if progress is not None:
@@ -322,40 +356,45 @@ def push_model(
         )
 
         names = _push_file_list(overlay, metadata)
-        descriptor, list_path = tempfile.mkstemp(prefix="modelctl-push-", suffix=".files")
-        os.close(descriptor)
+        stream_count = min(max(jobs, 1), len(names))
+        chunks = [names[index::stream_count] for index in range(stream_count)]
+        commands: list[list[str]] = []
+        list_paths: list[Path] = []
         try:
-            write_transfer_file_list(Path(list_path), names)
+            for index, chunk in enumerate(chunks):
+                descriptor, list_path = tempfile.mkstemp(
+                    prefix=f"modelctl-push-{index}-", suffix=".files"
+                )
+                os.close(descriptor)
+                list_paths.append(Path(list_path))
+                write_transfer_file_list(Path(list_path), chunk)
+                commands.append(
+                    [
+                        rsync,
+                        "--archive",
+                        "--copy-links",
+                        "--partial",
+                        "--delete",
+                        "--human-readable",
+                        "--info=progress2",
+                        "--from0",
+                        f"--files-from={list_path}",
+                        "-e",
+                        _ssh_transport(ssh, port, identity),
+                        f"{overlay}/",
+                        f"{host}:{shlex.quote(str(staging) + '/')}",
+                    ]
+                )
             if progress is not None:
                 progress(
                     f"push: transferring {len(files)} files "
-                    f"(+{len(names) - len(files)} metadata files) to {host}:{staging}"
+                    f"(+{len(names) - len(files)} metadata files) to {host}:{staging} "
+                    f"with {len(commands)} rsync stream(s)"
                 )
-            command = [
-                rsync,
-                "--archive",
-                "--copy-links",
-                "--partial",
-                "--delete",
-                "--human-readable",
-                "--info=progress2",
-                "--from0",
-                f"--files-from={list_path}",
-                "-e",
-                _ssh_transport(ssh, port, identity),
-                f"{overlay}/",
-                f"{host}:{shlex.quote(str(staging) + '/')}",
-            ]
-            try:
-                runner(command, check=True)
-            except BaseException as exc:
-                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                    raise
-                raise ModelctlError(
-                    f"rsync to {host} failed; remote staging is resumable: {exc}"
-                ) from exc
+            _run_rsync_streams(commands, runner, host)
         finally:
-            Path(list_path).unlink(missing_ok=True)
+            for list_path in list_paths:
+                list_path.unlink(missing_ok=True)
 
         commit_args = _remote_command(
             modelctl_bin, resolved, local_cache_dir, staging=staging

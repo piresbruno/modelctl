@@ -894,7 +894,9 @@ SSH push of active NAS models into another host's Hugging Face cache was added
 in `0.10.0`. `push` gained remote `modelctl` binary auto-discovery in `0.11.0`,
 and remote cache staging preflight plus a narrowed transfer file list in
 `0.11.1`. In `0.12.0` `push` sources from the local Hugging Face cache
-registration (a `sync-local` record) instead of the NAS store.
+registration (a `sync-local` record) instead of the NAS store, and `list
+--local` tolerates stale registrations. Parallel `--jobs` rsync streams for
+`push` were added in `0.13.0`.
 
 `src/modelctl/__init__.py` is the single version source. Hatch reads it when
 building the package, and `modelctl --version` imports the same value so package

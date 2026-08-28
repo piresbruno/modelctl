@@ -195,15 +195,18 @@ class FakeRunner:
         self.cache = cache
         self.calls = []
         self.file_list = []
+        self.file_lists = []
 
     def __call__(self, command, **kwargs):
         self.calls.append(command)
         for argument in command:
             if argument.startswith("--files-from="):
                 path = Path(argument.split("=", 1)[1])
-                self.file_list = [
+                names = [
                     name.decode() for name in path.read_bytes().split(b"\0") if name
                 ]
+                self.file_list = names
+                self.file_lists.append(names)
         if any(
             isinstance(argument, str) and "cd; for p in " in argument
             for argument in command
@@ -308,6 +311,42 @@ def test_push_orchestrates_probe_rsync_and_commit(tmp_path):
     ]
     assert not overlay.exists()
 
+
+def test_push_jobs_splits_transfer_into_parallel_streams(tmp_path):
+    cache = _local_cache(
+        tmp_path,
+        files={"a.bin": b"1", "b.bin": b"2", "c.bin": b"3", "d.bin": b"4"},
+    )
+    fake = FakeRunner(cache)
+    push_model(cache, "demo", host="node-b", jobs=3, runner=fake)
+
+    rsync_calls = [call for call in fake.calls if call[0] == "rsync"]
+    assert len(rsync_calls) == 3
+    assert all(call[-1] == rsync_calls[0][-1] for call in rsync_calls)
+    assert all(
+        Path(call[-2].removesuffix("/")).name.startswith("modelctl-push-cache-")
+        for call in rsync_calls
+    )
+    commit = fake.calls[-1]
+    assert commit[2] == "/usr/local/bin/modelctl"
+    assert "receive-cache" in commit
+    transferred = set()
+    for names in fake.file_lists:
+        assert names
+        assert names == sorted(names)
+        transferred.update(names)
+    assert transferred == {
+        ".cache/huggingface/download/a.bin.metadata",
+        ".cache/huggingface/download/b.bin.metadata",
+        ".cache/huggingface/download/c.bin.metadata",
+        ".cache/huggingface/download/d.bin.metadata",
+        ".modelctl.json",
+        "a.bin",
+        "b.bin",
+        "c.bin",
+        "d.bin",
+    }
+    assert all(call[-1] == rsync_calls[0][-1] for call in rsync_calls)
 
 def test_push_requires_local_cache_record(tmp_path):
     cache = tmp_path / "hub"

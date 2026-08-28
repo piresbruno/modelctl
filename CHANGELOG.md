@@ -2,6 +2,15 @@
 
 This project follows semantic versioning.
 
+## 0.13.0
+
+### Added
+
+- Add `--jobs N` to `push`: the transfer is split into up to N concurrent
+  rsync streams into the same remote staging directory, sharply reducing
+  wall time for many-file models over fast fabrics (defaults to the previous
+  single-stream behavior when omitted).
+
 ## 0.12.0
 
 ### Added
