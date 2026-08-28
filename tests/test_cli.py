@@ -417,6 +417,8 @@ def test_top_level_help_has_description_and_examples(capsys):
         ("path", "MODEL_PATH=$(modelctl path"),
         ("serve-command", "modelctl serve-command model-q4"),
         ("sync-local", "modelctl sync-local qwen3-8b-vllm"),
+        ("push", "modelctl push qwen3-8b-vllm --host node-b"),
+        ("sync-remote", "modelctl sync-remote qwen3-8b-vllm --host node-b"),
         ("receive-cache", "modelctl receive-cache --probe qwen3-8b-vllm"),
     ],
 )
@@ -439,6 +441,57 @@ def test_hf_cache_precedence(tmp_path, monkeypatch):
     monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "explicit-env"))
     assert _cache_dir(None) == tmp_path / "explicit-env"
     assert _cache_dir(str(tmp_path / "argument")) == tmp_path / "argument"
+
+
+def test_push_uses_local_default_cache_path_and_source_root(
+    tmp_path, monkeypatch, capsys
+):
+    nas = tmp_path / "nas"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
+    run(["config", "set-root", str(nas)])
+    capsys.readouterr()
+    calls = []
+
+    def fake_push(source_root, remote_cache, name, **kwargs):
+        calls.append((source_root, remote_cache, name, kwargs))
+        return remote_cache / "snapshot"
+
+    monkeypatch.setattr("modelctl.cli.push_model", fake_push)
+    assert run(["push", "demo", "--host", "node-b"]) == 0
+    source, remote_cache, name, options = calls[0]
+    assert source == nas
+    assert remote_cache == tmp_path / "hub"
+    assert name == "demo"
+    assert options["host"] == "node-b"
+    assert options["ssh"] == "ssh"
+    assert options["rsync"] == "rsync"
+    assert capsys.readouterr().out == f"{tmp_path / 'hub' / 'snapshot'}\n"
+
+
+def test_push_passes_explicit_cache_dir_and_source_root(tmp_path, monkeypatch, capsys):
+    nas = tmp_path / "nas"
+    cache = tmp_path / "custom-cache"
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "ignored"))
+    calls = []
+
+    def fake_push(source_root, remote_cache, name, **kwargs):
+        calls.append((source_root, remote_cache, name, kwargs))
+        return remote_cache / "snapshot"
+
+    monkeypatch.setattr("modelctl.cli.push_model", fake_push)
+    assert run([
+        "push", "demo", "--host", "node-b",
+        "--source-root", str(nas),
+        "--cache-dir", str(cache),
+        "--port", "2222",
+        "--identity", "/keys/id",
+    ]) == 0
+    source, remote_cache, name, options = calls[0]
+    assert source == nas
+    assert remote_cache == cache
+    assert options["port"] == 2222
+    assert options["identity"] == "/keys/id"
 
 
 def test_receive_cache_probe_prints_json(tmp_path, monkeypatch, capsys):

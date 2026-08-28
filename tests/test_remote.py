@@ -18,6 +18,7 @@ from modelctl.hf_cache import (
 )
 from modelctl.manifest import parse_manifest
 from modelctl.operations import update_model
+from modelctl.remote import push_model
 
 COMMIT = "d" * 40
 
@@ -160,3 +161,252 @@ def test_receive_rejects_corrupted_transfer_without_publishing(tmp_path):
     assert not (repository / "blobs").exists()
     assert not (state_root(cache) / "active" / "demo.json").exists()
     assert staging.exists()
+
+
+class FakeRunner:
+    def __init__(self, cache):
+        self.cache = cache
+        self.calls = []
+        self.file_list = []
+
+    def __call__(self, command, **kwargs):
+        self.calls.append(command)
+        for argument in command:
+            if argument.startswith("--files-from="):
+                path = Path(argument.split("=", 1)[1])
+                self.file_list = [
+                    name.decode() for name in path.read_bytes().split(b"\0") if name
+                ]
+        if "receive-cache" in command and "--probe" in command:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"proto": 1, "cache": str(self.cache)}),
+                stderr="",
+            )
+        if "receive-cache" in command:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "proto": 1,
+                        "cache": str(self.cache),
+                        "snapshot": str(
+                            self.cache / "models--org--demo" / "snapshots" / COMMIT
+                        ),
+                    }
+                ),
+                stderr="",
+            )
+        source = Path(command[-2].removesuffix("/"))
+        destination = Path(command[-1].split(":", 1)[1].removesuffix("/"))
+        destination.mkdir(parents=True, exist_ok=True)
+        for entry in source.rglob("*"):
+            if entry.is_file():
+                target = destination / entry.relative_to(source)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(entry, target)
+        return SimpleNamespace(returncode=0)
+
+
+def test_push_orchestrates_probe_rsync_and_commit(tmp_path):
+    nas = _nas_object(tmp_path)
+    cache = tmp_path / "hub"
+    object_path = (nas / "active" / "demo").resolve()
+    metadata = json.loads((object_path / ".modelctl.json").read_text())
+    files = {
+        item["path"]: read_source_etag(object_path, item["path"], metadata["commit"])
+        for item in metadata["files"]
+    }
+    staging = staging_path_for(cache, metadata["repo"], metadata["commit"], files)
+
+    fake = FakeRunner(cache)
+    result = push_model(nas, cache, "demo", host="node-b", runner=fake)
+
+    assert result == str(cache / "models--org--demo" / "snapshots" / COMMIT)
+    assert fake.calls[0] == [
+        "ssh",
+        "node-b",
+        "modelctl",
+        "receive-cache",
+        "--probe",
+        "demo",
+        "--cache-dir",
+        str(cache),
+    ]
+    rsync = fake.calls[1]
+    assert rsync[0] == "rsync"
+    for flag in ("--archive", "--partial", "--delete", "--from0", "-e"):
+        assert flag in rsync
+    assert rsync[rsync.index("-e") + 1] == "ssh -o Compression=no"
+    assert rsync[-2] == f"{object_path}/"
+    assert rsync[-1] == f"node-b:{staging}/"
+    assert fake.calls[2] == [
+        "ssh",
+        "node-b",
+        "modelctl",
+        "receive-cache",
+        "demo",
+        "--cache-dir",
+        str(cache),
+        "--staging",
+        str(staging),
+    ]
+    assert sorted(fake.file_list) == [
+        ".cache/huggingface/download/config.json.metadata",
+        ".modelctl.json",
+        "config.json",
+    ]
+
+
+def test_push_uses_port_identity_and_fabric_host(tmp_path):
+    nas = _nas_object(tmp_path)
+    cache = tmp_path / "hub"
+    fake = FakeRunner(cache)
+    push_model(
+        nas,
+        cache,
+        "demo",
+        host="user@10.0.0.2",
+        port=2222,
+        identity="/keys/connectx",
+        runner=fake,
+    )
+    assert fake.calls[0] == [
+        "ssh",
+        "-p",
+        "2222",
+        "-i",
+        "/keys/connectx",
+        "user@10.0.0.2",
+        "modelctl",
+        "receive-cache",
+        "--probe",
+        "demo",
+        "--cache-dir",
+        str(cache),
+    ]
+    assert fake.calls[1][fake.calls[1].index("-e") + 1] == (
+        "ssh -p 2222 -i /keys/connectx -o Compression=no"
+    )
+
+
+def test_push_resolves_repository_id_to_active_name(tmp_path):
+    nas = _nas_object(tmp_path)
+    cache = tmp_path / "hub"
+    fake = FakeRunner(cache)
+    push_model(nas, cache, "org/demo", host="node-b", runner=fake)
+    assert "--probe" in fake.calls[0]
+    assert fake.calls[0][fake.calls[0].index("--probe") + 1] == "demo"
+
+
+def test_push_fails_when_remote_unreachable(tmp_path):
+    nas = _nas_object(tmp_path)
+
+    def refused(command, **kwargs):
+        return SimpleNamespace(
+            returncode=255,
+            stdout="",
+            stderr="ssh: connect to host node-b port 22: Connection refused",
+        )
+
+    with pytest.raises(ModelctlError, match="node-b"):
+        push_model(nas, tmp_path / "hub", "demo", host="node-b", runner=refused)
+
+
+def test_push_fails_on_protocol_mismatch(tmp_path):
+    nas = _nas_object(tmp_path)
+
+    def old_probe(command, **kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"proto": 99, "cache": ""}),
+            stderr="",
+        )
+
+    with pytest.raises(ModelctlError, match="incompatible"):
+        push_model(nas, tmp_path / "hub", "demo", host="node-b", runner=old_probe)
+
+
+def test_push_reports_resumable_rsync_failure(tmp_path):
+    nas = _nas_object(tmp_path)
+
+    def fail_rsync(command, **kwargs):
+        if "receive-cache" in command:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"proto": 1, "cache": str(tmp_path / "hub")}),
+                stderr="",
+            )
+        raise RuntimeError("rsync error 23")
+
+    with pytest.raises(ModelctlError, match="resumable"):
+        push_model(nas, tmp_path / "hub", "demo", host="node-b", runner=fail_rsync)
+
+
+def test_push_end_to_end_through_real_receive_cli(tmp_path, monkeypatch):
+    """The ssh argv contract: the remote 'modelctl receive-cache' invocation
+    published by push must be a valid local modelctl invocation. The ssh
+    transport is emulated locally, so this exercises the real probe and commit
+    CLI paths plus the rsync file-list placement."""
+    import subprocess
+    import sys
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
+    nas = _nas_object(
+        tmp_path, files={"config.json": b"data", "README.md": b"#"}
+    )
+    cache = tmp_path / "hub"
+
+    class LocalSsh:
+        def __init__(self):
+            self.calls = []
+            self.file_list = []
+
+        def __call__(self, command, **kwargs):
+            self.calls.append(command)
+            if command[0] == "rsync":
+                source = Path(command[-2].removesuffix("/"))
+                destination = Path(command[-1].split(":", 1)[1].removesuffix("/"))
+                list_arg = next(
+                    argument
+                    for argument in command
+                    if argument.startswith("--files-from=")
+                )
+                names = [
+                    name.decode()
+                    for name in Path(list_arg.split("=", 1)[1])
+                    .read_bytes()
+                    .split(b"\0")
+                    if name
+                ]
+                self.file_list = names
+                for name in names:
+                    staged = destination / name
+                    staged.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source / name, staged)
+                return SimpleNamespace(returncode=0)
+            remote_args = [
+                argument.strip("'") for argument in command[command.index("node-b") + 1 :]
+            ]
+            return subprocess.run(
+                [sys.executable, "-m", *remote_args],
+                capture_output=True,
+                text=True,
+            )
+
+    local_ssh = LocalSsh()
+    result = push_model(nas, cache, "demo", host="node-b", runner=local_ssh)
+
+    snapshot = cache / "models--org--demo" / "snapshots" / COMMIT
+    assert result == str(snapshot)
+    assert (snapshot / "config.json").is_symlink()
+    assert (snapshot / "README.md").is_symlink()
+    assert (cache / "models--org--demo" / "refs" / "main").read_text() == COMMIT
+    assert load_record(cache, "demo").snapshot == snapshot.resolve()
+    assert sorted(local_ssh.file_list) == [
+        ".cache/huggingface/download/README.md.metadata",
+        ".cache/huggingface/download/config.json.metadata",
+        ".modelctl.json",
+        "README.md",
+        "config.json",
+    ]

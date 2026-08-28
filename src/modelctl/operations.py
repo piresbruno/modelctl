@@ -364,7 +364,15 @@ def serve_command(root: Path, name: str) -> str:
     return shlex.join(serve_argv(root, name))
 
 
-def _resolve_active_name(source_root: Path, selector: str) -> str:
+def active_object(root: Path, name: str) -> tuple[Path, dict[str, Any]]:
+    """Resolve and validate the active object for *name*.
+
+    Returns ``(object_path, metadata)``; the active reference must be a symlink
+    that resolves inside the managed model store."""
+    return _active_object(Layout(root), name)
+
+
+def resolve_active_name(source_root: Path, selector: str) -> str:
     if "/" not in selector:
         return validate_name(selector)
 
@@ -395,7 +403,7 @@ def sync_local(
     runner: Callable[..., Any] = subprocess.run,
     progress: Callable[[str], None] | None = None,
 ) -> Path:
-    resolved_name = _resolve_active_name(source_root, name)
+    resolved_name = resolve_active_name(source_root, name)
     return sync_cache(
         source_root,
         local_root,

@@ -49,6 +49,7 @@ from .operations import (
     sync_local,
     update_model,
 )
+from .remote import push_model
 
 DEFAULT_ROOT = "/var/lib/llm-models"
 HELP_FORMATTER = argparse.RawDescriptionHelpFormatter
@@ -194,6 +195,7 @@ def build_parser() -> argparse.ArgumentParser:
   modelctl path qwen3-8b --root /mnt/nas/llm-models
   modelctl serve-command qwen3-8b --root /mnt/nas/llm-models
   modelctl sync-local qwen3-8b --source-root /mnt/nas/llm-models --cache-dir ~/.cache/huggingface/hub
+  modelctl push qwen3-8b --host node-b
 
 Use 'modelctl COMMAND --help' for command-specific examples.
 Use 'modelctl config set-root PATH' to save the NAS root once.""",
@@ -682,6 +684,52 @@ not restarted.""",
     sync.add_argument("--rsync", default="rsync", help="rsync executable")
     _add_local_root(sync)
 
+    push = commands.add_parser(
+        "push",
+        aliases=["sync-remote"],
+        help="copy an active NAS model into another host's HF cache over ssh",
+        description=(
+            "Validate the active NAS object, rsync its selected files over ssh "
+            "into the remote host's cache staging area, and atomically publish "
+            "blobs, a commit snapshot, refs, and a local registration there. "
+            "The source is always the local managed store."
+        ),
+        formatter_class=HELP_FORMATTER,
+        epilog="""examples:
+  modelctl push qwen3-8b-vllm --host node-b
+  modelctl push unsloth/DeepSeek-V4-Flash-0731 \\
+    --host user@10.18.0.2 --port 2222 --identity ~/.ssh/connectx
+  modelctl push model-q4 --host node-b --cache-dir /srv/huggingface/hub
+  modelctl sync-remote qwen3-8b-vllm --host node-b
+
+Pass an active model name or its Hugging Face repository id. ssh and rsync are
+required on this host; modelctl must be installed on the remote. The remote
+cache directory defaults to the same path this host uses, so two identical DGX
+Spark nodes need only --host. Point --host at the fabric interface (for
+example the ConnectX-7 IP) when the hostname resolves to a slower path.
+Interrupted transfers remain resumable in remote staging.""",
+    )
+    push.add_argument(
+        "name", metavar="MODEL_OR_REPO",
+        help="active model name or unique Hugging Face repository id",
+    )
+    push.add_argument(
+        "--source-root", "--from-root", metavar="PATH", dest="source_root",
+        help="source store root (default: configured NAS root)",
+    )
+    push.add_argument(
+        "--host", required=True,
+        help="ssh destination, for example node-b or user@10.18.0.2",
+    )
+    push.add_argument("--port", type=_positive_int, help="ssh port")
+    push.add_argument("--identity", metavar="KEY", help="ssh identity file")
+    push.add_argument("--ssh", default="ssh", help="ssh executable (default: ssh)")
+    push.add_argument("--rsync", default="rsync", help="rsync executable (default: rsync)")
+    push.add_argument(
+        "--cache-dir", metavar="PATH",
+        help="remote Hugging Face cache directory (default: this host's default cache path)",
+    )
+
     receive = commands.add_parser(
         "receive-cache",
         help="validate and publish a staged cache transfer on this host",
@@ -748,6 +796,21 @@ def run(argv: list[str] | None = None) -> int:
             _root(args.source_root),
             _selected_cache(args),
             args.name,
+            rsync=args.rsync,
+            progress=lambda message: print(message, flush=True),
+        )
+        print(result)
+        return 0
+
+    if args.command == "push":
+        result = push_model(
+            _root(args.source_root),
+            _cache_dir(args.cache_dir),
+            args.name,
+            host=args.host,
+            port=args.port,
+            identity=args.identity,
+            ssh=args.ssh,
             rsync=args.rsync,
             progress=lambda message: print(message, flush=True),
         )
