@@ -9,6 +9,7 @@ from modelctl.catalog import load_catalog
 from modelctl.cli import DEFAULT_ROOT, _cache_dir, _local_root, _root, build_parser, run
 from modelctl.errors import ModelctlError
 from modelctl.integrity import RepairResult
+from modelctl.hf_cache import state_root
 from modelctl.layout import Layout, atomic_symlink
 from modelctl.maintenance import StoreEntryAudit
 from modelctl.manifest import parse_manifest
@@ -493,6 +494,43 @@ def test_receive_cache_probe_prints_json(tmp_path, monkeypatch, capsys):
     assert run(["receive-cache", "--probe", "demo"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload == {"proto": 1, "cache": str(tmp_path / "hub")}
+
+
+def test_list_local_warns_and_skips_broken_registration(
+    tmp_path, monkeypatch, capsys
+):
+    cache = tmp_path / "hub"
+    active = state_root(cache) / "active"
+    active.mkdir(parents=True, exist_ok=True)
+    (active / "broken.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "cache": str(cache),
+                "name": "broken",
+                "repo": "org/broken",
+                "revision": "main",
+                "commit": "e" * 40,
+                "files": {"config.json": "e" * 40},
+                "snapshot": str(
+                    cache / "models--org--broken" / "snapshots" / ("e" * 40)
+                ),
+                "metadata": {
+                    "name": "broken",
+                    "repo": "org/broken",
+                    "revision": "main",
+                    "commit": "e" * 40,
+                    "entrypoint": ".",
+                    "companions": {},
+                },
+            }
+        )
+    )
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache))
+    assert run(["list", "--local"]) == 0
+    captured = capsys.readouterr()
+    assert "No active models" in captured.out
+    assert "delete-local" in captured.err
 
 
 def test_sync_rejects_cache_dir_and_legacy_root_together(tmp_path):

@@ -13,6 +13,9 @@ This project follows semantic versioning.
   destination over ssh. This makes head-node fan-out over a fast
   interconnect the primary workflow, avoiding slow NAS reads on every node.
   The `--source-root` NAS-store option was removed.
+- Local listings (`list --local`) now skip broken registrations whose cache
+  data is missing, with an actionable warning, and `delete-local` can remove
+  the stale records so they stop blocking cache-native workflows.
 
 ## 0.11.1
 

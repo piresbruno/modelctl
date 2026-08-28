@@ -24,13 +24,13 @@ from .generation import (
     generate_manifest_document,
     write_generated_manifest,
 )
-from .hf_cache import receive_staged_cache
 from .integrity import (
     audit_active_references,
     cleanup_quarantine,
     malformed_active_references,
     repair_active_reference,
 )
+from .hf_cache import malformed_cached_records, receive_staged_cache
 from .maintenance import (
     audit_objects,
     audit_staging,
@@ -151,13 +151,20 @@ def _print_models(root: Path, *, json_output: bool, local: bool = False) -> None
         ]
         print(json.dumps(payload, indent=2))
         return
-    malformed = malformed_active_references(root) if not local else []
+    malformed = (
+        malformed_cached_records(root) if local else malformed_active_references(root)
+    )
     if not models:
         print(f"No active models in {root}.")
         if malformed:
+            hint = (
+                "use 'modelctl delete-local NAME' to remove them"
+                if local
+                else "run 'modelctl doctor' for details"
+            )
+            kind = "local registration(s)" if local else "active reference(s)"
             print(
-                f"warning: skipped {len(malformed)} malformed active "
-                "reference(s); run 'modelctl doctor' for details",
+                f"warning: skipped {len(malformed)} malformed {kind}; {hint}",
                 file=sys.stderr,
             )
         return
@@ -172,9 +179,14 @@ def _print_models(root: Path, *, json_output: bool, local: bool = False) -> None
     for row in rows:
         print(template.format(*row))
     if malformed:
+        hint = (
+            "use 'modelctl delete-local NAME' to remove them"
+            if local
+            else "run 'modelctl doctor' for details"
+        )
+        kind = "local registration(s)" if local else "active reference(s)"
         print(
-            f"warning: skipped {len(malformed)} malformed active "
-            "reference(s); run 'modelctl doctor' for details",
+            f"warning: skipped {len(malformed)} malformed {kind}; {hint}",
             file=sys.stderr,
         )
 

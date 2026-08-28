@@ -739,21 +739,58 @@ def cached_entrypoint(cache_dir: Path, name: str) -> Path:
     ).resolve(strict=True)
 
 
-def list_records(cache_dir: Path) -> list[CacheRecord]:
+def malformed_cached_records(cache_dir: Path) -> list[str]:
+    """Names of local registrations whose cache data is broken.
+
+    Mirrors ``malformed_active_references`` for NAS stores so local listings
+    can warn about skipped records instead of failing."""
     active = state_root(cache_dir) / "active"
     if not active.exists():
         return []
-    return [load_record(cache_dir, path.stem) for path in sorted(active.glob("*.json"))]
+    broken = []
+    for path in sorted(active.glob("*.json")):
+        try:
+            load_record(cache_dir, path.stem)
+        except ModelctlError:
+            broken.append(path.stem)
+    return broken
+
+
+def list_records(cache_dir: Path) -> list[CacheRecord]:
+    """Valid local registrations.
+
+    Records whose snapshot or files are broken (for example the cache content
+    was pruned or moved outside modelctl) are skipped so listings never fail
+    on foreign or partial cache state."""
+    active = state_root(cache_dir) / "active"
+    if not active.exists():
+        return []
+    records = []
+    for path in sorted(active.glob("*.json")):
+        try:
+            records.append(load_record(cache_dir, path.stem))
+        except ModelctlError:
+            continue
+    return records
 
 
 def delete_record(cache_dir: Path, name: str) -> Path:
     with _lock(_name_lock(cache_dir, name)):
-        record = load_record(cache_dir, name)
         path = _record_path(cache_dir, name)
+        if not path.exists():
+            raise ModelctlError(
+                f"model {name!r} has no local cache record at {path}"
+            )
+        try:
+            record = load_record(cache_dir, name)
+        except ModelctlError:
+            # A stale registration must still be removable so it stops
+            # blocking listings; cache data is never touched.
+            record = None
         path.unlink()
         _fsync_directory(path.parent)
         journal = _journal_path(cache_dir, name)
         journal.unlink(missing_ok=True)
         if journal.parent.exists():
             _fsync_directory(journal.parent)
-        return record.snapshot
+        return record.snapshot if record is not None else path

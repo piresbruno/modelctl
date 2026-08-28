@@ -13,7 +13,7 @@ from huggingface_hub import scan_cache_dir
 from modelctl import catalog, hf_cache
 from modelctl.catalog import catalog_status, load_catalog
 from modelctl.errors import ModelctlError, ValidationError
-from modelctl.hf_cache import load_record, state_root
+from modelctl.hf_cache import list_records, load_record, malformed_cached_records, state_root
 from modelctl.layout import Layout, atomic_symlink
 from modelctl.manifest import parse_manifest
 from modelctl.operations import (
@@ -463,8 +463,54 @@ def test_delete_local_unregisters_model_and_preserves_cache_and_nas(tmp_path):
 
 def test_delete_local_only_removes_one_shared_record(tmp_path):
     cache = tmp_path / "hub"
-    with pytest.raises(ModelctlError, match="no valid local cache record"):
+    with pytest.raises(ModelctlError, match="no local cache record"):
         delete_local(cache, "demo")
+
+
+def _broken_record(cache, name="broken"):
+    active = state_root(cache) / "active"
+    active.mkdir(parents=True, exist_ok=True)
+    (active / f"{name}.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "cache": str(cache),
+                "name": name,
+                "repo": "org/broken",
+                "revision": "main",
+                "commit": "e" * 40,
+                "files": {"config.json": "e" * 40},
+                "snapshot": str(
+                    cache / "models--org--broken" / "snapshots" / ("e" * 40)
+                ),
+                "metadata": {
+                    "name": name,
+                    "repo": "org/broken",
+                    "revision": "main",
+                    "commit": "e" * 40,
+                    "entrypoint": ".",
+                    "companions": {},
+                },
+            }
+        )
+    )
+
+
+def test_local_listing_skips_broken_registration(tmp_path):
+    cache = tmp_path / "hub"
+    _broken_record(cache)
+    assert list_records(cache) == []
+    assert malformed_cached_records(cache) == ["broken"]
+
+
+def test_delete_local_removes_broken_registration(tmp_path):
+    cache = tmp_path / "hub"
+    _broken_record(cache)
+    removed = delete_local(cache, "broken")
+    assert removed.name == "broken.json"
+    assert not (state_root(cache) / "active" / "broken.json").exists()
+    with pytest.raises(ModelctlError, match="no local cache record"):
+        delete_local(cache, "broken")
 
 
 def test_interrupted_local_sync_keeps_previous_cache_record(tmp_path):
