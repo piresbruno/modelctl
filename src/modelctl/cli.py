@@ -729,6 +729,10 @@ not restarted.""",
   # Parallel rsync streams for many-file models on a fast fabric
   modelctl push glm-5.3-flash-exl3-q4 --host node-b --jobs 4
 
+  # Both CX7 links: distribute streams across both fabric interfaces
+  modelctl push glm-5.3-flash-exl3-q4 \\
+    --host 10.100.24.1 --host 10.100.25.1 --jobs 8
+
   # Alias
   modelctl sync-remote qwen3-8b-vllm --host node-b
 
@@ -753,16 +757,25 @@ the rsync package. The remote cache directory defaults to the same path this
 host uses, so two identical nodes need only --host. Point --host at a fabric
 interface (for example the ConnectX-7 IP) when the hostname resolves to a
 slower path. Interrupted transfers remain resumable in remote staging and a
-rerun resumes them. --jobs N runs up to N concurrent rsync streams into the
-same staging directory; raise it for many-file models on fast fabrics.""",
+rerun resumes them. --jobs N runs up to N concurrent rsync streams; repeating
+--host distributes those streams round-robin over several fabric interfaces
+of the same destination. When a node exposes multiple links (for example two
+ConnectX-7 interfaces), use one --host per link to double aggregate
+throughput.""",
     )
     push.add_argument(
         "name", metavar="MODEL_OR_REPO",
         help="registered cache model name or unique Hugging Face repository id",
     )
     push.add_argument(
-        "--host", required=True,
-        help="ssh destination, for example node-b or user@10.18.0.2",
+        "--host",
+        action="append",
+        required=True,
+        metavar="HOST",
+        help=(
+            "ssh destination (repeatable): the first runs the handshake and "
+            "activation, all hosts share the transfer streams"
+        ),
     )
     push.add_argument("--port", type=_positive_int, help="ssh port")
     push.add_argument("--identity", metavar="KEY", help="ssh identity file")
@@ -869,10 +882,12 @@ def run(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "push":
+        hosts = args.host
         result = push_model(
             _cache_dir(args.cache_dir),
             args.name,
-            host=args.host,
+            host=hosts[0],
+            job_hosts=hosts[1:] or None,
             port=args.port,
             identity=args.identity,
             ssh=args.ssh,

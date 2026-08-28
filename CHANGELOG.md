@@ -9,7 +9,9 @@ This project follows semantic versioning.
 - Add `--jobs N` to `push`: the transfer is split into up to N concurrent
   rsync streams into the same remote staging directory, sharply reducing
   wall time for many-file models over fast fabrics (defaults to the previous
-  single-stream behavior when omitted).
+  single-stream behavior when omitted). Repeating `--host` distributes the
+  streams round-robin over several fabric interfaces of the same
+  destination, so a node with two ConnectX-7 links can use both at once.
 
 ## 0.12.0
 

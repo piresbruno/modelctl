@@ -318,6 +318,7 @@ def push_model(
     rsync: str = "rsync",
     remote_modelctl: str | None = None,
     jobs: int = 1,
+    job_hosts: list[str] | None = None,
     runner: Callable[..., Any] = subprocess.run,
     progress: Callable[[str], None] | None = None,
 ) -> str:
@@ -327,12 +328,15 @@ def push_model(
     The model must already have a modelctl registration in the local cache
     (for example from ``modelctl sync-local`` or an earlier push); push reads
     that snapshot and transfers only its files through the remote
-    ``receive-cache`` validation and publication path. With ``jobs`` greater
-    than one the transfer is split into that many independent rsync streams
-    into the same staging directory, which helps many-file models saturate a
-    fast fabric. Interrupted transfers remain resumable in remote staging.
+    ``receive-cache`` validation and publication path. ``host`` runs the
+    handshake, preflight, and commit; with ``jobs`` greater than one the
+    transfer is split into that many independent rsync streams into the same
+    staging directory, distributed round-robin over ``host`` plus
+    ``job_hosts`` (useful when a node exposes several fabric interfaces).
+    Interrupted transfers remain resumable in remote staging.
     """
     resolved, metadata, files, commit, overlay = _cache_source(local_cache_dir, name)
+    stream_hosts = [host, *(job_hosts or [])]
     if progress is not None:
         progress(f"push: reading {resolved} from the local Hugging Face cache")
     try:
@@ -368,6 +372,7 @@ def push_model(
                 os.close(descriptor)
                 list_paths.append(Path(list_path))
                 write_transfer_file_list(Path(list_path), chunk)
+                stream_host = stream_hosts[index % len(stream_hosts)]
                 commands.append(
                     [
                         rsync,
@@ -382,13 +387,14 @@ def push_model(
                         "-e",
                         _ssh_transport(ssh, port, identity),
                         f"{overlay}/",
-                        f"{host}:{shlex.quote(str(staging) + '/')}",
+                        f"{stream_host}:{shlex.quote(str(staging) + '/')}",
                     ]
                 )
             if progress is not None:
+                links = ", ".join(stream_hosts)
                 progress(
                     f"push: transferring {len(files)} files "
-                    f"(+{len(names) - len(files)} metadata files) to {host}:{staging} "
+                    f"(+{len(names) - len(files)} metadata files) to {links} "
                     f"with {len(commands)} rsync stream(s)"
                 )
             _run_rsync_streams(commands, runner, host)

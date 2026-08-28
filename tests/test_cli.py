@@ -491,6 +491,28 @@ def test_push_passes_explicit_cache_dir_and_ssh_options(tmp_path, monkeypatch, c
     assert options["jobs"] == 4
 
 
+def test_push_repeated_host_splits_control_and_stream_hosts(
+    tmp_path, monkeypatch, capsys
+):
+    cache = tmp_path / "hub"
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache))
+    calls = []
+
+    def fake_push(local_cache, name, **kwargs):
+        calls.append((local_cache, name, kwargs))
+        return local_cache / "snapshot"
+
+    monkeypatch.setattr("modelctl.cli.push_model", fake_push)
+    assert run([
+        "push", "demo", "--host", "node-b", "--host", "node-c", "--jobs", "6",
+    ]) == 0
+    _, name, options = calls[0]
+    assert name == "demo"
+    assert options["host"] == "node-b"
+    assert options["job_hosts"] == ["node-c"]
+    assert options["jobs"] == 6
+
+
 def test_receive_cache_probe_prints_json(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
     assert run(["receive-cache", "--probe", "demo"]) == 0

@@ -346,7 +346,50 @@ def test_push_jobs_splits_transfer_into_parallel_streams(tmp_path):
         "c.bin",
         "d.bin",
     }
-    assert all(call[-1] == rsync_calls[0][-1] for call in rsync_calls)
+
+
+def test_push_distributes_streams_across_fabric_hosts(tmp_path):
+    cache = _local_cache(
+        tmp_path,
+        files={"a.bin": b"1", "b.bin": b"2", "c.bin": b"3", "d.bin": b"4"},
+    )
+    fake = FakeRunner(cache)
+    push_model(
+        cache,
+        "demo",
+        host="node-b",
+        job_hosts=["node-c"],
+        jobs=2,
+        runner=fake,
+    )
+
+    rsync_calls = [call for call in fake.calls if call[0] == "rsync"]
+    assert len(rsync_calls) == 2
+    destinations = [call[-1].split(":", 1)[0] for call in rsync_calls]
+    assert sorted(destinations) == ["node-b", "node-c"]
+    assert destinations[0] != destinations[1]
+    # probe and commit still go through the control host
+    assert fake.calls[1][1] == "node-b"
+    assert fake.calls[-1][1] == "node-b"
+
+
+def test_push_round_robins_streams_over_three_hosts(tmp_path):
+    cache = _local_cache(
+        tmp_path,
+        files={"a.bin": b"1", "b.bin": b"2", "c.bin": b"3", "d.bin": b"4"},
+    )
+    fake = FakeRunner(cache)
+    push_model(
+        cache,
+        "demo",
+        host="h1",
+        job_hosts=["h2", "h3"],
+        jobs=5,
+        runner=fake,
+    )
+    rsync_calls = [call for call in fake.calls if call[0] == "rsync"]
+    hosts = [call[-1].split(":", 1)[0] for call in rsync_calls]
+    assert hosts == ["h1", "h2", "h3", "h1", "h2"]
 
 def test_push_requires_local_cache_record(tmp_path):
     cache = tmp_path / "hub"

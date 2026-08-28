@@ -565,7 +565,7 @@ work on the destination immediately.
 
 | Option | Meaning |
 | --- | --- |
-| `--host HOST` | ssh destination: hostname, `user@host`, or ssh-config alias (required) |
+| `--host HOST` | ssh destination, repeatable (required): the first runs handshake and commit, transfer streams distribute over all |
 | `--cache-dir PATH` | HF cache directory on this host and the remote default (default: this host's cache path) |
 | `--port PORT` | ssh port |
 | `--identity KEY` | ssh identity file |
@@ -587,6 +587,13 @@ modelctl push qwen3-8b-vllm --host node-b
 modelctl push model-q4 --host node-b \
   --cache-dir /srv/huggingface/hub \
   --remote-modelctl /opt/modelctl/bin/modelctl
+
+# Many-file models: parallel rsync streams over the fabric
+modelctl push glm-5.3-flash-exl3-q4 --host node-b --jobs 4
+
+# Both CX7 links at once
+modelctl push glm-5.3-flash-exl3-q4 \
+  --host 10.100.24.1 --host 10.100.25.1 --jobs 8
 ```
 
 The remote cache directory defaults to the same path this host resolves
@@ -594,8 +601,12 @@ The remote cache directory defaults to the same path this host resolves
 images make the push a single command. Point `--host` at a fabric interface
 (for example the ConnectX-7 IP) when the hostname resolves to a slower path.
 The transfer is a single rsync stream; MTU 9000 and `tcp_bbr` on both fabric
-ends improve throughput, and parallel-stream `--jobs` support is planned for
-saturating 200 Gb/s links.
+ends improve throughput, and `--jobs N` splits the transfer into N parallel
+rsync streams into the same staging directory — the effective fix for
+many-file models over fast fabrics. Repeating `--host` (one per fabric
+interface, for example the two ConnectX-7 links) distributes those streams
+round-robin over all of them, roughly doubling aggregate throughput when a
+node exposes multiple links.
 
 #### receive-cache
 
@@ -895,8 +906,9 @@ in `0.10.0`. `push` gained remote `modelctl` binary auto-discovery in `0.11.0`,
 and remote cache staging preflight plus a narrowed transfer file list in
 `0.11.1`. In `0.12.0` `push` sources from the local Hugging Face cache
 registration (a `sync-local` record) instead of the NAS store, and `list
---local` tolerates stale registrations. Parallel `--jobs` rsync streams for
-`push` were added in `0.13.0`.
+--local` tolerates stale registrations. Parallel `--jobs` rsync streams and
+round-robin distribution over repeated `--host` fabric interfaces were added
+in `0.13.0`.
 
 `src/modelctl/__init__.py` is the single version source. Hatch reads it when
 building the package, and `modelctl --version` imports the same value so package
