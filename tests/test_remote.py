@@ -184,6 +184,11 @@ class FakeRunner:
             return SimpleNamespace(
                 returncode=0, stdout="/usr/local/bin/modelctl\n", stderr=""
             )
+        if any(
+            isinstance(argument, str) and "mkdir -p" in argument
+            for argument in command
+        ):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
         if "receive-cache" in command and "--probe" in command:
             return SimpleNamespace(
                 returncode=0,
@@ -244,14 +249,19 @@ def test_push_orchestrates_probe_rsync_and_commit(tmp_path):
         "--cache-dir",
         str(cache),
     ]
-    rsync = fake.calls[2]
+    prepare = fake.calls[2]
+    assert prepare[:2] == ["ssh", "node-b"]
+    assert prepare[2:4] == ["sh", "-c"]
+    assert "mkdir -p" in prepare[4]
+    assert prepare[5:7] == ["sh", str(cache)]
+    rsync = fake.calls[3]
     assert rsync[0] == "rsync"
     for flag in ("--archive", "--partial", "--delete", "--from0", "-e"):
         assert flag in rsync
     assert rsync[rsync.index("-e") + 1] == "ssh -o Compression=no"
     assert rsync[-2] == f"{object_path}/"
     assert rsync[-1] == f"node-b:{staging}/"
-    assert fake.calls[3] == [
+    assert fake.calls[4] == [
         "ssh",
         "node-b",
         "/usr/local/bin/modelctl",
@@ -296,7 +306,7 @@ def test_push_uses_port_identity_and_fabric_host(tmp_path):
         "--cache-dir",
         str(cache),
     ]
-    assert fake.calls[2][fake.calls[2].index("-e") + 1] == (
+    assert fake.calls[3][fake.calls[3].index("-e") + 1] == (
         "ssh -p 2222 -i /keys/connectx -o Compression=no"
     )
 
@@ -385,6 +395,11 @@ def test_push_reports_resumable_rsync_failure(tmp_path):
             return SimpleNamespace(
                 returncode=0, stdout="/usr/local/bin/modelctl\n", stderr=""
             )
+        if any(
+            isinstance(argument, str) and "mkdir -p" in argument
+            for argument in command
+        ):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
         if "receive-cache" in command:
             return SimpleNamespace(
                 returncode=0,
@@ -395,6 +410,36 @@ def test_push_reports_resumable_rsync_failure(tmp_path):
 
     with pytest.raises(ModelctlError, match="resumable"):
         push_model(nas, tmp_path / "hub", "demo", host="node-b", runner=fail_rsync)
+
+
+def test_push_fails_when_remote_cache_not_writable(tmp_path):
+    nas = _nas_object(tmp_path)
+
+    def deny_cache(command, **kwargs):
+        if any(
+            isinstance(argument, str) and "mkdir -p" in argument
+            for argument in command
+        ):
+            return SimpleNamespace(
+                returncode=1, stdout="", stderr="mkdir: cannot create directory: Permission denied"
+            )
+        if any(
+            isinstance(argument, str) and "cd; for p in " in argument
+            for argument in command
+        ):
+            return SimpleNamespace(
+                returncode=0, stdout="/usr/local/bin/modelctl\n", stderr=""
+            )
+        if "receive-cache" in command and "--probe" in command:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"proto": 1, "cache": str(tmp_path / "hub")}),
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with pytest.raises(ModelctlError, match="not writable on node-b"):
+        push_model(nas, tmp_path / "hub", "demo", host="node-b", runner=deny_cache)
 
 
 def test_push_end_to_end_through_real_receive_cli(tmp_path, monkeypatch):
@@ -449,6 +494,12 @@ def test_push_end_to_end_through_real_receive_cli(tmp_path, monkeypatch):
             remote_args = [
                 argument.strip("'") for argument in command[command.index("node-b") + 1 :]
             ]
+            if remote_args and remote_args[0] == "sh":
+                return subprocess.run(
+                    ["sh", "-c", remote_args[2], "sh", remote_args[4]],
+                    capture_output=True,
+                    text=True,
+                )
             if remote_args and remote_args[0] != "receive-cache":
                 remote_args = remote_args[1:]
             return subprocess.run(

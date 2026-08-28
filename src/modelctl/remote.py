@@ -69,6 +69,44 @@ def _run_ssh(
     return result.stdout
 
 
+def _prepare_remote_cache(
+    ssh: str,
+    host: str,
+    port: int | None,
+    identity: str | None,
+    cache: Path,
+    runner: Callable[..., Any],
+    progress: Callable[[str], None] | None,
+) -> None:
+    """Ensure the remote cache directory exists and is writable before rsync.
+
+    rsync fails with an opaque receiver error when the destination parent is
+    missing or unwritable; a short ``mkdir -p`` plus writability probe turns
+    that into an actionable preflight failure.
+    """
+    if progress is not None:
+        progress(f"push: preparing {cache} on {host}")
+    script = 'mkdir -p "$1" && test -w "$1"'
+    argv = _ssh_argv(
+        ssh, host, port, identity, ["sh", "-c", script, "sh", str(cache)]
+    )
+    try:
+        result = runner(
+            argv, check=False, capture_output=True, text=True, errors="replace"
+        )
+    except BaseException as exc:
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        raise ModelctlError(f"cannot reach {host}: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise ModelctlError(
+            f"cache directory {cache} is not writable on {host}: {detail}; "
+            "create it and make it writable by the ssh user, or use the "
+            "default cache path"
+        )
+
+
 def _remote_payload(stdout: str, host: str, *, command: str) -> dict[str, Any]:
     try:
         payload = json.loads(stdout)
@@ -210,6 +248,7 @@ def push_model(
     if not isinstance(payload.get("cache"), str) or not payload["cache"]:
         raise ModelctlError(f"{host} returned no cache path in its probe payload")
     remote_cache = Path(payload["cache"])
+    _prepare_remote_cache(ssh, host, port, identity, remote_cache, runner, progress)
     staging = staging_path_for(remote_cache, str(metadata["repo"]), commit, files)
 
     names = _push_file_list(object_path, metadata)
