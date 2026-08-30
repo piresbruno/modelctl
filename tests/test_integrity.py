@@ -105,9 +105,11 @@ def test_repair_is_dry_run_by_default_and_apply_quarantines_copy(tmp_path):
     assert {item.name: item.status for item in audit_active_references(tmp_path)}[
         "demo"
     ] == "valid"
-    assert load_catalog(tmp_path)["models"] == [
-        {"name": "demo", "runtime": "vllm", "repository": "org/demo"}
-    ]
+    [record] = load_catalog(tmp_path)["models"]
+    assert record["name"] == "demo"
+    assert record["runtime"] == "vllm"
+    assert record["repository"] == "org/demo"
+    assert isinstance(record["bytes"], int) and record["bytes"] > 0
 
     quarantines = cleanup_quarantine(tmp_path, "demo")
     assert quarantines == [repaired.quarantine]

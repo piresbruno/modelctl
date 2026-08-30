@@ -7,8 +7,9 @@ import pytest
 from modelctl import __version__
 from modelctl.cards import CardResult
 from modelctl.catalog import load_catalog
-from modelctl.cli import DEFAULT_ROOT, _cache_dir, _local_root, _root, build_parser, run
+from modelctl.cli import DEFAULT_ROOT, _cache_dir, _format_size, _local_root, _root, build_parser, run
 from modelctl.errors import ModelctlError
+from modelctl.catalog import catalog_lock, mark_catalog_dirty_locked
 from modelctl.integrity import RepairResult
 from modelctl.hf_cache import state_root
 from modelctl.layout import Layout, atomic_symlink
@@ -116,13 +117,11 @@ def test_list_json_is_machine_readable(tmp_path, capsys):
     _active_model(tmp_path)
     assert run(["list", "--root", str(tmp_path), "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload == [
-        {
-            "name": "demo",
-            "runtime": "vllm",
-            "repository": "org/model",
-        }
-    ]
+    [record] = payload
+    assert {
+        key: value for key, value in record.items() if key != "bytes"
+    } == {"name": "demo", "runtime": "vllm", "repository": "org/model"}
+    assert isinstance(record["bytes"], int) and record["bytes"] > 0
     assert load_catalog(tmp_path)["models"] == payload
 
 
@@ -175,6 +174,72 @@ def test_list_warns_when_malformed_active_references_are_skipped(tmp_path, capsy
     assert "demo" in captured.out
     assert "skipped 1 malformed active reference" in captured.err
     assert "modelctl doctor" in captured.err
+
+
+def test_list_reads_catalog_without_live_scan(tmp_path, monkeypatch, capsys):
+    _active_model(tmp_path)
+    assert run(["list", "--root", str(tmp_path)]) == 0
+    capsys.readouterr()
+
+    def fail_live_scan(root):
+        raise AssertionError("live scan must not run when the catalog is valid")
+
+    monkeypatch.setattr("modelctl.cli.list_active_models", fail_live_scan)
+    monkeypatch.setattr("modelctl.cli.malformed_active_references", fail_live_scan)
+    assert run(["list", "--root", str(tmp_path), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [model["name"] for model in payload] == ["demo"]
+
+
+def test_list_size_column_shows_disk_usage(tmp_path, capsys):
+    _active_model(tmp_path)
+    assert run(["list", "--root", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    [record] = load_catalog(tmp_path)["models"]
+    assert "SIZE" in captured.out
+    assert "REPOSITORY" in captured.out
+    assert _format_size(record["bytes"]) in captured.out
+
+
+def test_list_warns_when_catalog_is_dirty(tmp_path, capsys):
+    _active_model(tmp_path)
+    assert run(["list", "--root", str(tmp_path)]) == 0
+    capsys.readouterr()
+    with catalog_lock(tmp_path):
+        mark_catalog_dirty_locked(tmp_path, "test mutation")
+
+    assert run(["list", "--root", str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    assert "demo" in captured.out
+    assert "catalog may be stale" in captured.err
+    assert "modelctl catalog refresh" in captured.err
+
+
+def test_list_regenerates_missing_catalog(tmp_path, capsys):
+    _active_model(tmp_path)
+    assert run(["list", "--root", str(tmp_path)]) == 0
+    capsys.readouterr()
+    (tmp_path / "catalog.json").unlink()
+
+    assert run(["list", "--root", str(tmp_path), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [model["name"] for model in payload] == ["demo"]
+    assert load_catalog(tmp_path)["schema"] == 2
+
+
+def test_list_treats_schema1_catalog_as_missing(tmp_path, capsys):
+    _active_model(tmp_path)
+    assert run(["list", "--root", str(tmp_path)]) == 0
+    capsys.readouterr()
+    path = tmp_path / "catalog.json"
+    document = json.loads(path.read_text())
+    document["schema"] = 1
+    path.write_text(json.dumps(document))
+
+    assert run(["list", "--root", str(tmp_path), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [model["name"] for model in payload] == ["demo"]
+    assert load_catalog(tmp_path)["schema"] == 2
 
 
 def test_doctor_reports_malformed_references(tmp_path, capsys):
@@ -372,7 +437,7 @@ def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_version_uses_package_version(capsys):
-    assert __version__ == "0.14.0"
+    assert __version__ == "0.15.0"
     with pytest.raises(SystemExit) as exit_info:
         build_parser().parse_args(["--version"])
     assert exit_info.value.code == 0

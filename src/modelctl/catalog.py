@@ -15,7 +15,7 @@ from uuid import uuid4
 from .errors import ModelctlError
 from .layout import Layout
 
-CATALOG_SCHEMA = 1
+CATALOG_SCHEMA = 2
 CATALOG_FILE = "catalog.json"
 
 
@@ -23,6 +23,7 @@ class CatalogModel(Protocol):
     name: str
     runtime: str
     repo: str
+    size_bytes: int
 
 
 ModelT = TypeVar("ModelT", bound=CatalogModel)
@@ -33,7 +34,7 @@ class CatalogRefresh:
     path: Path
     changed: bool
     generation: int
-    models: list[dict[str, str]]
+    models: list[dict[str, Any]]
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -85,7 +86,7 @@ def _canonical_json(value: Any) -> bytes:
     ).encode("utf-8")
 
 
-def _content_hash(models: list[dict[str, str]]) -> str:
+def _content_hash(models: list[dict[str, Any]]) -> str:
     return hashlib.sha256(_canonical_json(models)).hexdigest()
 
 
@@ -142,11 +143,14 @@ def _validate_document(path: Path, document: dict[str, Any]) -> dict[str, Any]:
         raise ModelctlError(f"catalog has an invalid content hash at {path}")
     if not isinstance(models, list):
         raise ModelctlError(f"catalog models must be a list at {path}")
-    expected_keys = {"name", "runtime", "repository"}
+    string_keys = {"name", "runtime", "repository"}
     if any(
         not isinstance(item, dict)
-        or set(item) != expected_keys
-        or any(not isinstance(item[key], str) for key in expected_keys)
+        or set(item) != string_keys | {"bytes"}
+        or any(not isinstance(item[key], str) for key in string_keys)
+        or not isinstance(item["bytes"], int)
+        or isinstance(item["bytes"], bool)
+        or item["bytes"] < 0
         for item in models
     ):
         raise ModelctlError(f"catalog contains an invalid model record at {path}")
@@ -163,12 +167,13 @@ def load_catalog(root: Path) -> dict[str, Any]:
     return _validate_document(path, _read_json_no_follow(path))
 
 
-def project_models(models: Iterable[CatalogModel]) -> list[dict[str, str]]:
+def project_models(models: Iterable[CatalogModel]) -> list[dict[str, Any]]:
     projected = [
         {
             "name": model.name,
             "runtime": model.runtime,
             "repository": model.repo,
+            "bytes": int(model.size_bytes),
         }
         for model in models
     ]
@@ -313,6 +318,11 @@ def refresh_catalog_locked(
 ) -> tuple[list[ModelT], CatalogRefresh]:
     """Refresh while the caller holds :func:`catalog_lock`."""
     return _refresh_catalog_locked(root, loader)
+
+
+def catalog_dirty(root: Path) -> bool:
+    """True when an active-store mutation did not complete catalog refresh."""
+    return _dirty_path(Layout(root)).exists()
 
 
 def catalog_status(root: Path) -> CatalogStatus:

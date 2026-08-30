@@ -58,6 +58,36 @@ class ActiveModel:
     runtime: str
     entrypoint: str
     path: Path
+    size_bytes: int
+
+
+def _disk_usage(directory: Path) -> int:
+    """On-disk usage of a directory tree in bytes (du-style).
+
+    Sums ``st_blocks * 512`` per regular file; ``st_size`` is used when a
+    filesystem reports zero blocks (some network filesystems do)."""
+    total = 0
+    stack = [directory]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        stat = entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        raise ModelctlError(
+                            f"failed to measure disk usage of {directory}: {exc}"
+                        ) from exc
+                    if stat.st_mode & 0o170000 == 0o100000:
+                        total += stat.st_blocks * 512 if stat.st_blocks else stat.st_size
+                    elif stat.st_mode & 0o170000 == 0o040000:
+                        stack.append(Path(entry.path))
+        except OSError as exc:
+            raise ModelctlError(
+                f"failed to measure disk usage of {directory}: {exc}"
+            ) from exc
+    return total
 
 
 @dataclass(frozen=True)
@@ -340,6 +370,7 @@ def list_active_models(root: Path) -> list[ActiveModel]:
                 runtime=profile.kind,
                 entrypoint=entrypoint,
                 path=path.resolve(strict=True),
+                size_bytes=_disk_usage(object_path),
             )
         )
     return models
@@ -699,6 +730,7 @@ def list_cached_models(cache_dir: Path) -> list[ActiveModel]:
                 profile.kind,
                 entrypoint,
                 path.resolve(strict=True),
+                0,
             )
         )
     return models

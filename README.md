@@ -652,9 +652,15 @@ modelctl registration from the selected cache.
 
 Use `modelctl list --root /srv/models` for another store, or `modelctl list
 --json` for machine-readable output. Listings contain only the model name,
-runtime, and Hugging Face repository. NAS listings contain only active validated
-objects; local listings contain only validated modelctl cache registrations.
-Human NAS listings warn when malformed active references were skipped.
+runtime, Hugging Face repository, and (on NAS stores) the on-disk size of the
+published object. NAS listings contain only active validated objects; local
+listings contain only validated modelctl cache registrations. Human NAS
+listings warn when malformed active references were skipped (live scans only).
+
+NAS store listings read `ROOT/catalog.json` directly, so they are fast and do
+not scan the store. If the catalog is missing or invalid, the store is scanned
+live and the catalog is regenerated. A dirty catalog is listed with a warning;
+run `modelctl catalog refresh` to rebuild it.
 
 ### Generated model catalog
 
@@ -664,21 +670,27 @@ the same sorted projection emitted by `modelctl list --json`:
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "generation": 42,
   "generated_at": "2026-08-11T21:00:00+00:00",
   "active_fingerprint": "...",
   "content_sha256": "...",
   "models": [
-    {"name": "demo", "runtime": "vllm", "repository": "org/model"}
+    {"name": "demo", "runtime": "vllm", "repository": "org/model", "bytes": 8732166144}
   ]
 }
 ```
 
+`bytes` is the on-disk usage of the model's published object directory
+(`du`-style; file sizes are summed from block counts, falling back to file
+sizes when a filesystem reports zero blocks).
+
 Successful activation and active-reference repair refresh the complete catalog
-under a global catalog lock. `modelctl list` also performs a live validated scan
-and refreshes the catalog, which repairs stale state caused by changes outside
-modelctl. Active symlinks and validated objects remain authoritative; do not edit
+under a global catalog lock. `modelctl list` reads the catalog directly instead
+of scanning; it detects interrupted refreshes through the dirty marker but does
+not detect out-of-band changes to `active/` on its fast path. Run
+`modelctl catalog refresh` to rebuild the catalog from the store. Active
+symlinks and validated objects remain authoritative; do not edit
 `catalog.json` manually and do not use it for safety-sensitive path resolution.
 Local `list --local` registrations are not included.
 

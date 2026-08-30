@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -15,8 +16,8 @@ from modelctl.errors import ModelctlError
 from modelctl.layout import Layout
 
 
-def _model(name: str, repo: str = "org/model", runtime: str = "vllm"):
-    return SimpleNamespace(name=name, repo=repo, runtime=runtime)
+def _model(name: str, repo: str = "org/model", runtime: str = "vllm", size: int = 1024):
+    return SimpleNamespace(name=name, repo=repo, runtime=runtime, size_bytes=size)
 
 
 def test_refresh_writes_exact_projection_and_skips_unchanged_catalog(tmp_path):
@@ -30,8 +31,8 @@ def test_refresh_writes_exact_projection_and_skips_unchanged_catalog(tmp_path):
     assert first.changed is True
     assert first.generation == 1
     assert document["models"] == [
-        {"name": "alpha", "runtime": "llama.cpp", "repository": "org/model"},
-        {"name": "zeta", "runtime": "vllm", "repository": "org/model"},
+        {"name": "alpha", "runtime": "llama.cpp", "repository": "org/model", "bytes": 1024},
+        {"name": "zeta", "runtime": "vllm", "repository": "org/model", "bytes": 1024},
     ]
 
     _, second = refresh_catalog(tmp_path, lambda root: list(reversed(models)))
@@ -91,4 +92,26 @@ def test_catalog_reader_refuses_symlink(tmp_path):
     (tmp_path / "catalog.json").symlink_to(target)
 
     with pytest.raises(ModelctlError, match="missing or invalid catalog"):
+        load_catalog(tmp_path)
+
+
+def test_load_catalog_rejects_invalid_bytes(tmp_path):
+    refresh_catalog(tmp_path, lambda root: [_model("alpha")])
+    path = tmp_path / "catalog.json"
+    document = json.loads(path.read_text())
+    document["models"][0]["bytes"] = -1
+    path.write_text(json.dumps(document))
+
+    with pytest.raises(ModelctlError, match="invalid model record"):
+        load_catalog(tmp_path)
+
+
+def test_load_catalog_rejects_non_integer_bytes(tmp_path):
+    refresh_catalog(tmp_path, lambda root: [_model("alpha")])
+    path = tmp_path / "catalog.json"
+    document = json.loads(path.read_text())
+    document["models"][0]["bytes"] = "many"
+    path.write_text(json.dumps(document))
+
+    with pytest.raises(ModelctlError, match="invalid model record"):
         load_catalog(tmp_path)

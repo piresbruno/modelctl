@@ -2,6 +2,21 @@
 
 This project follows semantic versioning.
 
+## 0.15.0
+
+### Changed
+
+- Make `modelctl list` on NAS stores read `ROOT/catalog.json` directly instead
+  of performing a live validated scan on every invocation, and add the on-disk
+  size of each model's published object to the listing (SIZE column; `bytes`
+  field in `--json` output). Store listings are now a single JSON parse. When
+  the catalog is missing or invalid, the store is scanned live and the catalog
+  is regenerated; a dirty catalog is listed with a warning pointing to
+  `modelctl catalog refresh`. Catalog model records gain a non-negative
+  `bytes` value and the catalog schema version is now 2; older catalogs are
+  treated as missing and regenerate on the next scan or refresh. `list
+  --local` output is unchanged.
+
 ## 0.14.0
 
 ### Added

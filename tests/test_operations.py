@@ -1,5 +1,7 @@
+import contextlib
 import hashlib
 import json
+import os
 import shlex
 import shutil
 import time
@@ -20,11 +22,13 @@ from modelctl.operations import (
     active_entrypoint,
     delete_local,
     delete_model,
+    list_active_models,
     list_cached_models,
     serve_command,
     sync_local,
     update_model,
 )
+from modelctl.operations import _disk_usage
 from modelctl.state import UpdateState
 from modelctl.validation import ExpectedFile, write_metadata
 
@@ -100,9 +104,11 @@ def test_update_publishes_before_switching_reference_and_reuses_valid_object(tmp
     ]
     assert snapshot.calls[0]["dry_run"] is True
     assert "dry_run" not in snapshot.calls[1]
-    assert load_catalog(tmp_path)["models"] == [
-        {"name": "demo", "runtime": "vllm", "repository": "org/demo"}
-    ]
+    [record] = load_catalog(tmp_path)["models"]
+    assert {
+        key: value for key, value in record.items() if key != "bytes"
+    } == {"name": "demo", "runtime": "vllm", "repository": "org/demo"}
+    assert isinstance(record["bytes"], int) and record["bytes"] > 0
 
     def should_not_download(**kwargs):
         raise AssertionError("valid content-addressed object should be reused")
@@ -844,3 +850,97 @@ def test_delete_catalog_failure_retains_delete_journal_evidence(tmp_path, monkey
     assert object_path.is_dir()
     document = json.loads((tmp_path / "state" / "demo.delete.json").read_text())
     assert document["history"][-1]["state"] == "REFERENCE_REMOVED"
+
+
+class _FakeDirEntry:
+    def __init__(self, path, mode, blocks, size):
+        self.path = path
+        self._stat = os.stat_result(
+            (mode, 1, 0, 1, 0, 0, size, 0, 0, 0),
+            {"st_blksize": 4096, "st_blocks": blocks},
+        )
+
+    def stat(self, follow_symlinks=False):
+        return self._stat
+
+
+def _fake_scandir(entries_by_dir):
+    @contextlib.contextmanager
+    def fake_scandir(path):
+        if str(path) not in entries_by_dir:
+            raise PermissionError(13, "permission denied")
+        yield iter(entries_by_dir[str(path)])
+
+    return fake_scandir
+
+
+def test_disk_usage_sums_blocks_with_size_fallback(tmp_path, monkeypatch):
+    file_mode = 0o100644
+    dir_mode = 0o040755
+    entries_by_dir = {
+        str(tmp_path): [
+            _FakeDirEntry(str(tmp_path / "a.bin"), file_mode, blocks=16, size=100),
+            _FakeDirEntry(str(tmp_path / "sub"), dir_mode, blocks=0, size=0),
+        ],
+        str(tmp_path / "sub"): [
+            _FakeDirEntry(str(tmp_path / "sub" / "b.bin"), file_mode, blocks=0, size=2048),
+        ],
+    }
+    monkeypatch.setattr(
+        "modelctl.operations.os.scandir", _fake_scandir(entries_by_dir)
+    )
+
+    assert _disk_usage(tmp_path) == 16 * 512 + 2048
+
+
+def test_disk_usage_wraps_os_errors(tmp_path, monkeypatch):
+    @contextlib.contextmanager
+    def fail_scandir(path):
+        raise PermissionError(13, f"permission denied: {path}")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr("modelctl.operations.os.scandir", fail_scandir)
+
+    with pytest.raises(ModelctlError, match="failed to measure disk usage"):
+        _disk_usage(tmp_path)
+
+
+def test_list_active_models_reports_object_disk_usage(tmp_path):
+    update_model(
+        tmp_path,
+        _manifest(),
+        api=FakeApi("a" * 40),
+        snapshot=FakeSnapshot({"config.json": b"{}" * 100}),
+    )
+
+    [model] = list_active_models(tmp_path)
+    assert model.size_bytes > 0
+
+
+def test_failed_size_measurement_does_not_roll_back_activated_model(
+    tmp_path, monkeypatch
+):
+    update_model(
+        tmp_path,
+        _manifest("old"),
+        api=FakeApi("a" * 40),
+        snapshot=FakeSnapshot({"config.json": b"old"}),
+    )
+    catalog_path = tmp_path / "catalog.json"
+    previous = catalog_path.read_bytes()
+
+    def fail_measure(directory):
+        raise ModelctlError(f"failed to measure disk usage of {directory}: boom")
+
+    monkeypatch.setattr("modelctl.operations._disk_usage", fail_measure)
+    with pytest.raises(ModelctlError, match="was activated"):
+        update_model(
+            tmp_path,
+            _manifest("new"),
+            api=FakeApi("b" * 40),
+            snapshot=FakeSnapshot({"config.json": b"new"}),
+        )
+
+    assert (tmp_path / "active" / "new").is_symlink()
+    assert catalog_path.read_bytes() == previous
+    assert catalog_status(tmp_path).status == "dirty"

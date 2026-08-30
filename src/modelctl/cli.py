@@ -8,7 +8,7 @@ from pathlib import Path
 
 from . import __version__
 from .cards import sync_model_cards
-from .catalog import catalog_path, catalog_status, refresh_catalog
+from .catalog import catalog_dirty, catalog_path, catalog_status, load_catalog, refresh_catalog
 from .config import load_local_root, load_root, save_local_root, save_root
 from .download_queue import (
     DownloadQueueError,
@@ -134,36 +134,7 @@ def _add_local_root(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _print_models(root: Path, *, json_output: bool, local: bool = False) -> None:
-    if local:
-        models = list_cached_models(root)
-    else:
-        try:
-            models, _ = refresh_catalog(root, list_active_models)
-        except ModelctlError as exc:
-            models = list_active_models(root)
-            print(
-                f"warning: live listing succeeded but catalog refresh failed: {exc}",
-                file=sys.stderr,
-            )
-    if json_output:
-        payload = [
-            {"name": model.name, "runtime": model.runtime, "repository": model.repo}
-            for model in models
-        ]
-        print(json.dumps(payload, indent=2))
-        return
-    malformed = (
-        malformed_cached_records(root) if local else malformed_active_references(root)
-    )
-    warning = _malformed_warning(malformed, local=local)
-    if not models:
-        print(f"No active models in {root}.")
-        if warning:
-            print(warning, file=sys.stderr)
-        return
-    rows = [(model.name, model.runtime, model.repo) for model in models]
-    headers = ("NAME", "RUNTIME", "REPOSITORY")
+def _print_table(rows: list[tuple[str, ...]], headers: tuple[str, ...]) -> None:
     widths = [
         max(len(headers[index]), *(len(row[index]) for row in rows))
         for index in range(len(headers))
@@ -172,7 +143,95 @@ def _print_models(root: Path, *, json_output: bool, local: bool = False) -> None
     print(template.format(*headers))
     for row in rows:
         print(template.format(*row))
-    if warning:
+
+
+def _store_records(root: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    """Active-model records for store listings, preferring the curated catalog.
+
+    Reads ROOT/catalog.json (one JSON parse) instead of scanning active
+    references. Staleness is reported via the dirty marker; a missing or
+    invalid catalog falls back to the live listing, which regenerates it."""
+    try:
+        document = load_catalog(root)
+    except ModelctlError:
+        pass
+    else:
+        warnings: list[str] = []
+        if catalog_dirty(root):
+            warnings.append(
+                "warning: catalog may be stale; run 'modelctl catalog refresh'"
+            )
+        return list(document["models"]), warnings
+    try:
+        models, _ = refresh_catalog(root, list_active_models)
+    except ModelctlError as exc:
+        models = list_active_models(root)
+        warnings = [
+            f"warning: live listing succeeded but catalog refresh failed: {exc}"
+        ]
+    else:
+        warnings = []
+    malformed = malformed_active_references(root)
+    malformed_warning = _malformed_warning(malformed, local=False)
+    if malformed_warning:
+        warnings.append(malformed_warning)
+    records = [
+        {
+            "name": model.name,
+            "runtime": model.runtime,
+            "repository": model.repo,
+            "bytes": model.size_bytes,
+        }
+        for model in models
+    ]
+    return records, warnings
+
+
+def _print_models(root: Path, *, json_output: bool, local: bool = False) -> None:
+    if local:
+        models = list_cached_models(root)
+        if json_output:
+            payload = [
+                {"name": model.name, "runtime": model.runtime, "repository": model.repo}
+                for model in models
+            ]
+            print(json.dumps(payload, indent=2))
+            return
+        warning = _malformed_warning(malformed_cached_records(root), local=True)
+        if not models:
+            print(f"No active models in {root}.")
+            if warning:
+                print(warning, file=sys.stderr)
+            return
+        _print_table(
+            [(model.name, model.runtime, model.repo) for model in models],
+            ("NAME", "RUNTIME", "REPOSITORY"),
+        )
+        if warning:
+            print(warning, file=sys.stderr)
+        return
+    records, warnings = _store_records(root)
+    if json_output:
+        print(json.dumps(records, indent=2))
+        return
+    if not records:
+        print(f"No active models in {root}.")
+        for warning in warnings:
+            print(warning, file=sys.stderr)
+        return
+    _print_table(
+        [
+            (
+                record["name"],
+                record["runtime"],
+                record["repository"],
+                _format_size(record["bytes"]),
+            )
+            for record in records
+        ],
+        ("NAME", "RUNTIME", "REPOSITORY", "SIZE"),
+    )
+    for warning in warnings:
         print(warning, file=sys.stderr)
 
 
@@ -329,7 +388,12 @@ deprecated compatibility fallbacks.""",
   modelctl list --json
 
 Only active, validated models are listed. Published objects that are not active
-and incomplete staging downloads are excluded.""",
+and incomplete staging downloads are excluded.
+
+Store listings read ROOT/catalog.json and include the on-disk size of each
+model. If the catalog is missing or invalid, the store is scanned live and the
+catalog is regenerated. A stale catalog is listed with a warning; run
+'modelctl catalog refresh' to rebuild it.""",
     )
     list_location = list_models.add_mutually_exclusive_group()
     list_location.add_argument(
