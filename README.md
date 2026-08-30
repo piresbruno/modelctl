@@ -763,6 +763,35 @@ It does not delete snapshots, refs, or blobs because the Hugging Face cache may
 also be used by Transformers, vLLM, `hf`, or other processes. Reclaim data
 explicitly with `hf cache rm` or `hf cache prune` after reviewing what is shared.
 
+### Deleting a model from the NAS store
+
+`delete-local` never touches the managed model store. To permanently remove a
+model from the NAS store itself, inspect the plan in dry-run mode first and
+then delete it with `--apply`:
+
+```bash
+modelctl delete MODEL_NAME --root /mnt/nas/llm-models
+modelctl delete MODEL_NAME --root /mnt/nas/llm-models --apply
+```
+
+With `--apply`, modelctl states that the deletion targets the MANAGED ROOT
+STORE on the NAS (not the local Hugging Face cache) and requires typing `yes`.
+Scripts and other non-interactive runs must pass `--yes` explicitly.
+
+Deletion removes the `active/NAME` reference first, refreshes the catalog,
+then removes the model's journals, eligible staging data under the model's
+repository, and now-unreferenced published objects of that repository.
+Objects still referenced by another active model and invalid objects are
+retained; live staging data (resumable or journal-referenced) is reported and
+left for `cleanup-staging`. Empty `models/OWNER/REPO` directories are pruned.
+The command is dry-run by default and reports exactly what it would remove.
+
+A failure during deletion cannot reactivate the model, but it never leaves a
+dangling active reference: once the reference is removed, every remaining
+artifact stays recoverable with `objects-audit` and `gc-objects`, and the
+delete journal at `state/NAME.delete.json` is retained as evidence until the
+deletion completes.
+
 ## Moving existing models to the NAS
 
 ### Existing modelctl store
@@ -870,6 +899,7 @@ modelctl --help
 modelctl config --help
 modelctl list --help
 modelctl delete-local --help
+modelctl delete --help
 modelctl download --help
 modelctl queue --help
 modelctl sync-cards --help

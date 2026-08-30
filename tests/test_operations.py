@@ -19,6 +19,7 @@ from modelctl.manifest import parse_manifest
 from modelctl.operations import (
     active_entrypoint,
     delete_local,
+    delete_model,
     list_cached_models,
     serve_command,
     sync_local,
@@ -641,3 +642,205 @@ def test_sync_accepts_sha256_lfs_etag(tmp_path):
 
     snapshot = sync_local(nas, cache, "demo", runner=copy)
     assert (snapshot / "model.safetensors").read_bytes() == content
+
+
+def _store_snapshot(root: Path) -> list[tuple[str, bytes | None]]:
+    items: list[tuple[str, bytes | None]] = []
+    for sub in ("active", "models", "state", ".staging", "catalog.json"):
+        path = root / sub
+        if path.is_file():
+            items.append((sub, path.read_bytes()))
+        elif path.is_dir():
+            for item in sorted(path.rglob("*")):
+                relative = str(item.relative_to(root))
+                items.append((relative, item.read_bytes() if item.is_file() else None))
+    return items
+
+
+def test_delete_dry_run_leaves_store_unchanged(tmp_path):
+    update_model(
+        tmp_path, _manifest(), api=FakeApi("a" * 40), snapshot=FakeSnapshot({"config.json": b"{}"})
+    )
+    before = _store_snapshot(tmp_path)
+    result = delete_model(tmp_path, "demo")
+
+    assert result.applied is False
+    assert [item.name for item in result.removed_objects] == ["demo"]
+    assert result.removed_objects[0].status == "unreferenced"
+    assert result.journals == (
+        tmp_path / "state" / "demo.json",
+        tmp_path / "state" / "demo.delete.json",
+    )
+    assert _store_snapshot(tmp_path) == before
+    assert (tmp_path / "active" / "demo").is_symlink()
+
+
+def test_delete_apply_removes_reference_journal_objects_and_empty_dirs(tmp_path):
+    update_model(
+        tmp_path, _manifest(), api=FakeApi("a" * 40), snapshot=FakeSnapshot({"config.json": b"{}"})
+    )
+    result = delete_model(tmp_path, "demo", apply=True)
+
+    assert result.applied is True
+    assert not (tmp_path / "active" / "demo").exists()
+    assert not (tmp_path / "state" / "demo.json").exists()
+    assert not (tmp_path / "state" / "demo.delete.json").exists()
+    for item in result.removed_objects:
+        assert not item.path.exists()
+    assert not (tmp_path / "models" / "org" / "demo").exists()
+    assert not (tmp_path / "models" / "org").exists()
+    assert load_catalog(tmp_path)["models"] == []
+
+
+def test_delete_keeps_objects_referenced_by_other_active_models(tmp_path):
+    update_model(
+        tmp_path,
+        _manifest("demo"),
+        api=FakeApi("a" * 40),
+        snapshot=FakeSnapshot({"config.json": b"demo"}),
+    )
+    update_model(
+        tmp_path,
+        _manifest("beta"),
+        api=FakeApi("b" * 40),
+        snapshot=FakeSnapshot({"config.json": b"beta"}),
+    )
+    result = delete_model(tmp_path, "demo", apply=True)
+
+    assert not (tmp_path / "active" / "demo").exists()
+    assert (tmp_path / "active" / "beta").is_symlink()
+    assert (tmp_path / "active" / "beta").resolve().is_dir()
+    assert [item.name for item in result.removed_objects] == ["demo"]
+    assert [item.name for item in result.retained_objects] == ["beta"]
+    assert (tmp_path / "models" / "org" / "demo").exists()
+    assert [item["name"] for item in load_catalog(tmp_path)["models"]] == ["beta"]
+
+
+def test_delete_removes_eligible_staging_and_retains_live_data(tmp_path):
+    update_model(
+        tmp_path, _manifest(), api=FakeApi("a" * 40), snapshot=FakeSnapshot({"config.json": b"{}"})
+    )
+    layout = Layout(tmp_path)
+    failed = layout.staging / "org" / "demo" / "commit--failed"
+    failed.mkdir(parents=True)
+    (failed / "data").write_bytes(b"x")
+    (tmp_path / "state" / "stale.json").write_text(
+        json.dumps(
+            {
+                "operation": "update",
+                "state": "FAILED_UNPUBLISHED",
+                "history": [{"state": "FAILED_UNPUBLISHED", "staging": str(failed)}],
+            }
+        )
+    )
+    resumable = layout.staging / "org" / "demo" / "commit--partial"
+    resumable.mkdir(parents=True)
+    (resumable / "data").write_bytes(b"x")
+    (tmp_path / "state" / "other.json").write_text(
+        json.dumps(
+            {
+                "operation": "update",
+                "state": "PARTIAL_RESUMABLE",
+                "history": [{"state": "PARTIAL_RESUMABLE", "staging": str(resumable)}],
+            }
+        )
+    )
+
+    plan = delete_model(tmp_path, "demo")
+    result = delete_model(tmp_path, "demo", apply=True)
+
+    assert [item.path for item in plan.removed_staging] == [
+        item.path for item in result.removed_staging
+    ]
+    assert [item.path for item in result.removed_staging] == [failed]
+    assert not failed.exists()
+    assert resumable.exists()
+    assert [item.status for item in result.retained_staging] == ["resumable"]
+
+
+def test_delete_retains_invalid_objects(tmp_path):
+    update_model(
+        tmp_path, _manifest(), api=FakeApi("a" * 40), snapshot=FakeSnapshot({"config.json": b"{}"})
+    )
+    junk = tmp_path / "models" / "org" / "demo" / "junk"
+    junk.mkdir(parents=True)
+    (junk / "config.json").write_bytes(b"x")
+
+    result = delete_model(tmp_path, "demo", apply=True)
+
+    assert junk.exists()
+    assert [item.status for item in result.retained_objects] == ["invalid_object"]
+    assert not (tmp_path / "models" / "org" / "demo").exists() is False
+    assert (tmp_path / "models" / "org" / "demo").exists()
+
+
+def test_delete_refuses_unsafe_references(tmp_path):
+    layout = Layout(tmp_path)
+    layout.prepare()
+    with pytest.raises(ModelctlError, match="no active reference"):
+        delete_model(tmp_path, "demo")
+
+    reference = layout.active_path("demo")
+    reference.mkdir()
+    with pytest.raises(ModelctlError, match="repair-active"):
+        delete_model(tmp_path, "demo")
+    reference.rmdir()
+
+    reference.symlink_to(tmp_path / "missing-target")
+    with pytest.raises(ModelctlError, match="doctor"):
+        delete_model(tmp_path, "demo")
+    reference.unlink()
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    reference.symlink_to(outside)
+    with pytest.raises(ModelctlError, match="doctor"):
+        delete_model(tmp_path, "demo")
+
+
+def test_delete_failure_keeps_objects_and_delete_journal(tmp_path, monkeypatch):
+    update_model(
+        tmp_path, _manifest(), api=FakeApi("a" * 40), snapshot=FakeSnapshot({"config.json": b"{}"})
+    )
+    object_path = (tmp_path / "active" / "demo").resolve()
+
+    import modelctl.operations as operations_module
+
+    def fail_rmtree(path, *args, **kwargs):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(operations_module.shutil, "rmtree", fail_rmtree)
+    with pytest.raises(ModelctlError, match="disk unavailable"):
+        delete_model(tmp_path, "demo", apply=True)
+
+    assert not (tmp_path / "active" / "demo").exists()
+    assert object_path.is_dir()
+    assert not (tmp_path / "state" / "demo.json").exists()
+    document = json.loads((tmp_path / "state" / "demo.delete.json").read_text())
+    assert document["history"][-1]["state"] == "FAILED"
+    assert "disk unavailable" in document["history"][-1]["error"]
+
+    monkeypatch.undo()
+    with pytest.raises(ModelctlError, match="no active reference"):
+        delete_model(tmp_path, "demo", apply=True)
+
+
+def test_delete_catalog_failure_retains_delete_journal_evidence(tmp_path, monkeypatch):
+    update_model(
+        tmp_path, _manifest(), api=FakeApi("a" * 40), snapshot=FakeSnapshot({"config.json": b"{}"})
+    )
+    object_path = (tmp_path / "active" / "demo").resolve()
+
+    import modelctl.operations as operations_module
+
+    def fail_refresh(root, listing):
+        raise ModelctlError("catalog boom")
+
+    monkeypatch.setattr(operations_module, "refresh_catalog_locked", fail_refresh)
+    with pytest.raises(ModelctlError, match="was deactivated.*catalog boom"):
+        delete_model(tmp_path, "demo", apply=True)
+
+    assert not (tmp_path / "active" / "demo").exists()
+    assert object_path.is_dir()
+    document = json.loads((tmp_path / "state" / "demo.delete.json").read_text())
+    assert document["history"][-1]["state"] == "REFERENCE_REMOVED"

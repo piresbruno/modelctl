@@ -39,8 +39,10 @@ from .maintenance import (
 )
 from .manifest import load_manifest, validate_name
 from .operations import (
+    DeleteResult,
     active_entrypoint,
     delete_cached,
+    delete_model,
     list_active_models,
     list_cached_models,
     local_active_entrypoint,
@@ -189,6 +191,71 @@ def _malformed_warning(malformed: list[str], *, local: bool) -> str | None:
     return (
         f"warning: skipped {len(malformed)} malformed active reference(s); "
         "run 'modelctl doctor' for details"
+    )
+
+
+def _confirm_root_delete(root: Path, plan: DeleteResult, *, yes: bool) -> None:
+    """Require an explicit typed confirmation that the NAS root store (not the
+    local Hugging Face cache) is about to be deleted from."""
+    if yes:
+        return
+    if not sys.stdin.isatty():
+        raise ModelctlError(
+            "deleting from the managed root store requires --yes when stdin is "
+            "not interactive"
+        )
+    print(
+        f"This permanently deletes model '{plan.name}' from the MANAGED ROOT "
+        f"STORE ({root}) on the NAS: its active reference, journals, staging "
+        "data, and published model objects on disk."
+    )
+    print(
+        "This does NOT touch your local Hugging Face cache (use 'modelctl "
+        "delete-local' for that). The deleted data cannot be recovered except "
+        "by re-downloading."
+    )
+    answer = input("Type 'yes' to confirm: ")
+    if answer.strip().lower() != "yes":
+        raise ModelctlError("deletion aborted; the model store was not modified")
+
+
+def _print_delete_result(root: Path, result: DeleteResult, *, apply: bool) -> None:
+    action = "removed" if apply else "would remove"
+    mode = "apply" if apply else "dry-run"
+    print(f"delete ({mode}): {result.name} ({result.repo})")
+    print(f"  reference: {result.reference} [{action}]")
+    for path in result.journals:
+        print(f"  journal: {path} [{action}]")
+    staging_base = root / ".staging"
+    models_base = root / "models"
+    for item in result.removed_staging:
+        print(
+            f"  [{action}] staging {item.path.relative_to(staging_base)} "
+            f"({_format_size(item.bytes)})"
+        )
+    for item in result.retained_staging:
+        print(
+            f"  [retained] staging {item.path.relative_to(staging_base)} "
+            f"({item.status}; {item.detail})"
+        )
+    for item in result.removed_objects:
+        print(
+            f"  [{action}] object {item.path.relative_to(models_base)} "
+            f"({_format_size(item.bytes)})"
+        )
+    for item in result.retained_objects:
+        print(
+            f"  [retained] object {item.path.relative_to(models_base)} "
+            f"({item.status}; {item.detail})"
+        )
+    for path in result.pruned_dirs:
+        print(f"  [{action}] empty directory {path.relative_to(root)}")
+    total = sum(item.bytes for item in result.removed_staging) + sum(
+        item.bytes for item in result.removed_objects
+    )
+    print(
+        f"delete: {len(result.removed_staging)} staging path(s), "
+        f"{len(result.removed_objects)} object(s), {_format_size(total)} {action}"
     )
 
 
@@ -428,6 +495,39 @@ explicitly when shared cache data should be removed.""",
     )
     delete.add_argument("name")
     _add_local_root(delete)
+
+    store_delete = commands.add_parser(
+        "delete",
+        help="delete a model from the managed root store (NAS)",
+        description=(
+            "Permanently remove a model from the managed model store: its "
+            "active reference, journals, eligible staging data, and "
+            "now-unreferenced published objects. Dry-run is the default. "
+            "This never touches the local Hugging Face cache; use delete-local "
+            "to unregister a local cache model instead."
+        ),
+        formatter_class=HELP_FORMATTER,
+        epilog="""examples:
+  modelctl delete qwen3-8b-vllm --root /mnt/nas/llm-models
+  modelctl delete qwen3-8b-vllm --apply
+  modelctl delete qwen3-8b-vllm --apply --yes
+
+With --apply, modelctl prints what will be deleted from the MANAGED ROOT
+STORE on the NAS and requires typing 'yes' unless --yes is supplied (use
+--yes for scripts and other non-interactive runs). Objects still referenced
+by another active model and live staging data are retained.""",
+    )
+    store_delete.add_argument("name", metavar="NAME")
+    store_delete.add_argument(
+        "--apply", action="store_true", help="delete the model (default: dry-run)"
+    )
+    store_delete.add_argument(
+        "--yes",
+        action="store_true",
+        help="skip the typed confirmation (required when stdin is not interactive)",
+    )
+    store_delete.add_argument("--json", action="store_true", help="emit JSON")
+    _add_root(store_delete)
 
     manifest = commands.add_parser(
         "manifest",
@@ -1044,6 +1144,19 @@ def run(argv: list[str] | None = None) -> int:
                 f"cleanup: {len(results)} path(s), "
                 f"{_format_size(sum(item.bytes for item in results))}"
             )
+        return 0
+
+    if args.command == "delete":
+        plan = delete_model(root, args.name, apply=False)
+        if args.apply:
+            _confirm_root_delete(root, plan, yes=args.yes)
+            result = delete_model(root, args.name, apply=True)
+        else:
+            result = plan
+        if args.json:
+            print(json.dumps(result.to_dict(), indent=2))
+        else:
+            _print_delete_result(root, result, apply=args.apply)
         return 0
 
     if args.command == "download":

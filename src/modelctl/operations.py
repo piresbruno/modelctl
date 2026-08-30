@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 from .catalog import (
@@ -29,8 +30,14 @@ from .layout import (
     model_lock,
     verify_symlink,
 )
+from .maintenance import (
+    StoreEntryAudit,
+    audit_objects,
+    audit_staging,
+    cleanup_staging,
+)
 from .manifest import ModelManifest, validate_name
-from .state import StateJournal, UpdateState
+from .state import DeleteState, StateJournal, UpdateState
 from .validation import (
     resolve_entrypoint,
     runtime_from_metadata,
@@ -51,6 +58,38 @@ class ActiveModel:
     runtime: str
     entrypoint: str
     path: Path
+
+
+@dataclass(frozen=True)
+class DeleteResult:
+    """Plan (dry-run) or outcome (--apply) of deleting a model from the store."""
+
+    name: str
+    repo: str
+    reference: Path
+    object: Path
+    journals: tuple[Path, ...] = ()
+    removed_staging: tuple[StoreEntryAudit, ...] = ()
+    retained_staging: tuple[StoreEntryAudit, ...] = ()
+    removed_objects: tuple[StoreEntryAudit, ...] = ()
+    retained_objects: tuple[StoreEntryAudit, ...] = ()
+    pruned_dirs: tuple[Path, ...] = ()
+    applied: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "applied": self.applied,
+            "name": self.name,
+            "repo": self.repo,
+            "reference": str(self.reference),
+            "object": str(self.object),
+            "journals": [str(path) for path in self.journals],
+            "removed_staging": [item.to_dict() for item in self.removed_staging],
+            "retained_staging": [item.to_dict() for item in self.retained_staging],
+            "removed_objects": [item.to_dict() for item in self.removed_objects],
+            "retained_objects": [item.to_dict() for item in self.retained_objects],
+            "pruned_dirs": [str(path) for path in self.pruned_dirs],
+        }
 
 
 def _fsync_directory(path: Path) -> None:
@@ -308,6 +347,243 @@ def list_active_models(root: Path) -> list[ActiveModel]:
 
 def delete_local(root: Path, name: str) -> Path:
     return delete_record(root, name)
+
+
+def _validate_delete_target(
+    layout: Layout, name: str
+) -> tuple[Path, Path, Path, dict[str, Any], PurePosixPath]:
+    """Validate the active reference and return (reference, object, repo_dir,
+    metadata, repo_parts)."""
+    reference = layout.active_path(name)
+    if not os.path.lexists(reference):
+        raise ModelctlError(
+            f"model {name!r} has no active reference at {reference}; "
+            "run 'modelctl list' to see active models"
+        )
+    if not reference.is_symlink():
+        raise ModelctlError(
+            f"active reference path is a {_reference_kind(reference)}: {reference}; "
+            "run 'modelctl doctor' and 'modelctl repair-active'"
+        )
+    try:
+        object_path = reference.resolve(strict=True)
+        object_path.relative_to(layout.models.resolve(strict=True))
+    except (OSError, ValueError) as exc:
+        raise ModelctlError(
+            f"active reference for {name!r} does not resolve inside "
+            f"{layout.models}; run 'modelctl doctor'"
+        ) from exc
+    if not object_path.is_dir():
+        raise ModelctlError(
+            f"active object for {name!r} is not a directory; "
+            "run 'modelctl doctor'"
+        )
+    metadata = validate_object(object_path, expected_name=name)
+    repo = str(metadata.get("repo", ""))
+    repo_parts = PurePosixPath(repo).parts
+    if (
+        not repo
+        or len(repo_parts) != 2
+        or any(part in {"", ".", ".."} for part in repo_parts)
+    ):
+        raise ModelctlError(
+            f"active object metadata for {name!r} has an unusable repository "
+            f"{repo!r}; run 'modelctl doctor'"
+        )
+    repo_dir = layout.models.joinpath(*repo_parts)
+    return reference, object_path, repo_dir, metadata, repo_parts
+
+
+def _plan_store_removal(
+    layout: Layout,
+    name: str,
+    repo_parts: PurePosixPath,
+    *,
+    ignore_object_target: Path | None = None,
+) -> tuple[
+    tuple[StoreEntryAudit, ...],
+    tuple[StoreEntryAudit, ...],
+    tuple[StoreEntryAudit, ...],
+    tuple[StoreEntryAudit, ...],
+]:
+    """Classify staging data and objects under the model's repository subtree.
+
+    Staging references from *name*'s own update journal and the object target
+    of the model's own active reference are ignored because both are removed
+    before cleanup, keeping the dry-run plan and the applied outcome
+    consistent.
+    """
+    removable_staging = {"failed_unpublished", "published_duplicate", "orphaned"}
+    ignore = {ignore_object_target} if ignore_object_target is not None else set()
+    staging: list[StoreEntryAudit] = []
+    retained_staging: list[StoreEntryAudit] = []
+    for item in audit_staging(layout.root, exclude_names={name}):
+        if item.path.relative_to(layout.staging).parts[:2] != repo_parts:
+            continue
+        if item.status in removable_staging:
+            staging.append(item)
+        else:
+            retained_staging.append(item)
+    objects: list[StoreEntryAudit] = []
+    retained_objects: list[StoreEntryAudit] = []
+    for item in audit_objects(layout.root, ignore_active_targets=ignore):
+        if item.path.relative_to(layout.models).parts[:2] != repo_parts:
+            continue
+        if item.status == "unreferenced" and item.name is not None:
+            objects.append(item)
+        else:
+            retained_objects.append(item)
+    return (
+        tuple(staging),
+        tuple(retained_staging),
+        tuple(objects),
+        tuple(retained_objects),
+    )
+
+
+def delete_model(root: Path, name: str, *, apply: bool = False) -> DeleteResult:
+    """Plan or perform deletion of *name* from the managed model store.
+
+    Dry-run (default) classifies everything that would be removed without
+    touching the store. With ``apply`` the active reference is removed first
+    (the inverse of the update flow's active-last rule), then the catalog is
+    refreshed, then staging data and now-unreferenced objects of the model's
+    repository are removed. A failure after deactivation leaves the store
+    consistent and the data recoverable with the existing audit/gc commands;
+    the delete journal at ``state/NAME.delete.json`` is retained as evidence.
+    """
+    validate_name(name)
+    layout = Layout(root)
+    layout.prepare()
+    with model_lock(layout, name):
+        reference, object_path, repo_dir, metadata, repo_parts = (
+            _validate_delete_target(layout, name)
+        )
+        repo = str(metadata.get("repo", ""))
+        journals = (
+            layout.state_path(name),
+            layout.state / f"{name}.delete.json",
+        )
+        plan = _plan_store_removal(
+            layout,
+            name,
+            repo_parts,
+            ignore_object_target=object_path.resolve(strict=True),
+        )
+        if not apply:
+            return DeleteResult(
+                name=name,
+                repo=repo,
+                reference=reference,
+                object=object_path,
+                journals=journals,
+                removed_staging=plan[0],
+                retained_staging=plan[1],
+                removed_objects=plan[2],
+                retained_objects=plan[3],
+                applied=False,
+            )
+
+        journal = StateJournal(journals[1], "delete")
+        journal.transition(
+            DeleteState.PLANNED,
+            reference=str(reference),
+            object=str(object_path),
+            repo=repo,
+            staging=len(plan[0]),
+            objects=len(plan[2]),
+        )
+
+        reference.unlink()
+        _fsync_directory(layout.active)
+        journal.transition(
+            DeleteState.REFERENCE_REMOVED,
+            reference=str(reference),
+            object=str(object_path),
+        )
+
+        with catalog_lock(root):
+            mark_catalog_dirty_locked(root, f"deleting {name}")
+            try:
+                refresh_catalog_locked(root, list_active_models)
+            except ModelctlError as exc:
+                raise ModelctlError(
+                    f"model {name!r} was deactivated, but {exc}"
+                ) from exc
+        journal.transition(DeleteState.CATALOG_REFRESHED)
+
+        journals[0].unlink(missing_ok=True)
+
+        staging, retained_staging, objects, retained_objects = _plan_store_removal(
+            layout, name, repo_parts
+        )
+        removed_staging: list[StoreEntryAudit] = []
+        if staging:
+            selections = [
+                str(item.path.relative_to(layout.staging)) for item in staging
+            ]
+            removed_staging = list(cleanup_staging(root, selections, apply=True))
+        journal.transition(
+            DeleteState.STAGING_REMOVED,
+            removed=len(removed_staging),
+            retained=len(retained_staging),
+        )
+
+        removed_objects: list[StoreEntryAudit] = []
+        for candidate in objects:
+            current = {
+                item.path.resolve(strict=True): item for item in audit_objects(root)
+            }.get(candidate.path.resolve(strict=True))
+            if current is None or current.status != "unreferenced":
+                raise ModelctlError(
+                    f"object status changed while deleting: {candidate.path}"
+                )
+            validate_object(candidate.path, expected_name=candidate.name)
+            try:
+                shutil.rmtree(candidate.path)
+            except OSError as exc:
+                journal.transition(
+                    DeleteState.FAILED,
+                    object=str(candidate.path),
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                raise ModelctlError(
+                    f"failed to remove object {candidate.path}: {exc}; the model "
+                    "is deactivated and its data remains recoverable with "
+                    "'modelctl objects-audit' and 'modelctl gc-objects'"
+                ) from exc
+            removed_objects.append(candidate)
+        journal.transition(
+            DeleteState.OBJECTS_REMOVED,
+            removed=len(removed_objects),
+            retained=len(retained_objects),
+        )
+
+        pruned_dirs: list[Path] = []
+        for directory in (repo_dir, repo_dir.parent):
+            if directory == layout.models or not directory.is_dir():
+                continue
+            try:
+                directory.rmdir()
+            except OSError:
+                continue
+            pruned_dirs.append(directory)
+
+        journal.transition(DeleteState.COMPLETE)
+        journals[1].unlink(missing_ok=True)
+        return DeleteResult(
+            name=name,
+            repo=repo,
+            reference=reference,
+            object=object_path,
+            journals=journals,
+            removed_staging=tuple(removed_staging),
+            retained_staging=retained_staging,
+            removed_objects=tuple(removed_objects),
+            retained_objects=retained_objects,
+            pruned_dirs=tuple(pruned_dirs),
+            applied=True,
+        )
 
 
 def serve_argv(root: Path, name: str) -> list[str]:

@@ -93,9 +93,17 @@ def _current_staging_references(layout: Layout) -> dict[Path, tuple[str, str]]:
     return references
 
 
-def audit_staging(root: Path) -> list[StoreEntryAudit]:
+def audit_staging(
+    root: Path, *, exclude_names: set[str] | None = None
+) -> list[StoreEntryAudit]:
     layout = Layout(root)
     references = _current_staging_references(layout)
+    if exclude_names:
+        references = {
+            path: value
+            for path, value in references.items()
+            if value[0] not in exclude_names
+        }
     results: list[StoreEntryAudit] = []
     for path in _object_directories(layout.staging):
         resolved = path.resolve(strict=True)
@@ -200,9 +208,14 @@ def _active_object_paths(layout: Layout) -> set[Path]:
     return targets
 
 
-def audit_objects(root: Path) -> list[StoreEntryAudit]:
+def audit_objects(
+    root: Path, *, ignore_active_targets: set[Path] | None = None
+) -> list[StoreEntryAudit]:
     layout = Layout(root)
     active = _active_object_paths(layout)
+    ignored = {
+        path.resolve(strict=True) for path in (ignore_active_targets or set())
+    }
     results: list[StoreEntryAudit] = []
     for path in _object_directories(layout.models):
         resolved = path.resolve(strict=True)
@@ -221,8 +234,12 @@ def audit_objects(root: Path) -> list[StoreEntryAudit]:
                 )
             )
             continue
-        status = "active" if resolved in active else "unreferenced"
-        detail = "active reference target" if status == "active" else "no active reference"
+        if resolved in active and resolved not in ignored:
+            status = "active"
+            detail = "active reference target"
+        else:
+            status = "unreferenced"
+            detail = "no active reference"
         results.append(StoreEntryAudit(path, status, _tree_bytes(path), name, detail))
     return results
 

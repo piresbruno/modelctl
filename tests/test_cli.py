@@ -1,3 +1,4 @@
+import io
 import json
 from pathlib import Path
 
@@ -371,7 +372,7 @@ def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_version_uses_package_version(capsys):
-    assert __version__ == "0.13.0"
+    assert __version__ == "0.14.0"
     with pytest.raises(SystemExit) as exit_info:
         build_parser().parse_args(["--version"])
     assert exit_info.value.code == 0
@@ -583,3 +584,73 @@ def test_path_local_uses_cache_record_resolver(tmp_path, monkeypatch, capsys):
     assert run(["path", "demo", "--local", "--cache-dir", str(cache)]) == 0
     assert calls == [(cache, "demo")]
     assert capsys.readouterr().out == f"{result}\n"
+
+
+class _FakeTty(io.StringIO):
+    def isatty(self):
+        return True
+
+
+def test_delete_dry_run_is_default_and_mutates_nothing(tmp_path, capsys):
+    _active_model(tmp_path)
+    assert run(["delete", "demo", "--root", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "delete (dry-run): demo (org/model)" in out
+    assert "would remove" in out
+    assert "MANAGED ROOT STORE" not in out
+    assert (tmp_path / "active" / "demo").is_symlink()
+    assert (tmp_path / "models" / "org" / "model").exists()
+
+
+def test_delete_apply_requires_typed_confirmation(tmp_path, monkeypatch, capsys):
+    _active_model(tmp_path)
+    object_path = (tmp_path / "active" / "demo").resolve()
+
+    # Non-interactive stdin without --yes refuses before mutating anything.
+    with pytest.raises(ModelctlError, match="--yes"):
+        run(["delete", "demo", "--root", str(tmp_path), "--apply"])
+    capsys.readouterr()
+    assert (tmp_path / "active" / "demo").is_symlink()
+
+    # Any answer other than a line reading 'yes' aborts without mutating.
+    monkeypatch.setattr("sys.stdin", _FakeTty("n\n"))
+    with pytest.raises(ModelctlError, match="aborted"):
+        run(["delete", "demo", "--root", str(tmp_path), "--apply"])
+    capsys.readouterr()
+    assert (tmp_path / "active" / "demo").is_symlink()
+
+    # Typing 'yes' confirms the NAS root-store deletion.
+    monkeypatch.setattr("sys.stdin", _FakeTty("YES\n"))
+    assert run(["delete", "demo", "--root", str(tmp_path), "--apply"]) == 0
+    out = capsys.readouterr().out
+    assert "MANAGED ROOT STORE" in out
+    assert "delete-local" in out
+    assert "removed" in out
+    assert not (tmp_path / "active" / "demo").exists()
+    assert not object_path.exists()
+    assert not (tmp_path / "state" / "demo.json").exists()
+    assert load_catalog(tmp_path)["models"] == []
+
+
+def test_delete_apply_yes_skips_confirmation(tmp_path, capsys):
+    _active_model(tmp_path)
+    assert run(["delete", "demo", "--root", str(tmp_path), "--apply", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "MANAGED ROOT STORE" not in out
+    assert "delete (apply): demo (org/model)" in out
+    assert not (tmp_path / "active" / "demo").exists()
+
+
+def test_delete_json_is_machine_readable(tmp_path, capsys):
+    _active_model(tmp_path)
+    assert (
+        run(["delete", "demo", "--root", str(tmp_path), "--apply", "--yes", "--json"])
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["applied"] is True
+    assert payload["name"] == "demo"
+    assert payload["repo"] == "org/model"
+    assert [item["name"] for item in payload["removed_objects"]] == ["demo"]
+    assert payload["removed_objects"][0]["status"] == "unreferenced"
+    assert str(tmp_path / "state" / "demo.json") in payload["journals"]

@@ -2,6 +2,22 @@
 
 This project follows semantic versioning.
 
+## 0.14.0
+
+### Added
+
+- Add `modelctl delete NAME`: permanently remove a model from the managed root
+  store (NAS). The command removes the active reference first, refreshes the
+  catalog, then removes the model's journals, eligible staging data, and
+  now-unreferenced published objects of its repository, pruning empty
+  directories. Objects still referenced by other active models and live
+  staging data are retained. Dry-run is the default; `--apply` requires a
+  typed `yes` confirmation (or `--yes` for non-interactive runs) that states
+  the target is the MANAGED ROOT STORE and not the local Hugging Face cache.
+  A failed deletion never leaves a dangling active reference; remaining data
+  stays recoverable with `objects-audit` and `gc-objects`, and the delete
+  journal is retained as evidence.
+
 ## 0.13.0
 
 ### Added
