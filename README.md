@@ -475,6 +475,27 @@ A repository id is resolved from active NAS object metadata and must match
 exactly one active model. If multiple active names select different variants of
 the same repository, pass the desired active model name instead.
 
+Synchronize several models in one invocation with a queue file — a YAML list of
+model names or repository ids:
+
+```yaml
+# models.txt
+- qwen3-8b-vllm
+- unsloth/DeepSeek-V4-Flash-0731
+```
+
+```bash
+modelctl sync-local --queue models.txt --source-root /mnt/nas/llm-models
+modelctl sync-local --queue models.txt --jobs 2 --source-root /mnt/nas/llm-models
+```
+
+Before any transfer, preflight resolves every entry against the source root and
+fails before touching the cache if any entry is unknown, ambiguous, or
+duplicated. The queue continues after individual failures, prints a per-entry
+summary, and exits nonzero if any entry failed. `--jobs N` (default 1) bounds
+concurrency; with two or more jobs, per-transfer progress is replaced by
+completion lines to keep the output readable.
+
 The default destination follows Hugging Face cache resolution: `HF_HUB_CACHE`,
 then `HF_HOME/hub`, then the platform default (normally
 `~/.cache/huggingface/hub`). Override it explicitly when required:

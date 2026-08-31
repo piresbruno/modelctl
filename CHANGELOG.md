@@ -2,6 +2,25 @@
 
 This project follows semantic versioning.
 
+## 0.17.0
+
+### Added
+
+- Add `modelctl sync-local --queue FILE`: synchronize several active NAS
+  models into the local Hugging Face cache from a YAML list of model names or
+  unique repository ids. Every entry is resolved against the source root
+  before any transfer starts; the queue continues after individual failures,
+  prints a summary, and exits nonzero if any entry failed. Add `--jobs N`
+  (default 1) to bound concurrency; with two or more jobs, per-transfer
+  progress is replaced by completion lines.
+
+### Changed
+
+- `modelctl doctor` now prints an actionable hint under each
+  `repairable_directory` entry: run `modelctl repair-active --apply`, and a
+  note that a process outside modelctl replaced the active symlink with a
+  copy.
+
 ## 0.16.1
 
 ### Fixed

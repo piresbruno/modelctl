@@ -52,6 +52,11 @@ from .operations import (
     update_model,
 )
 from .remote import push_model
+from .sync_queue import (
+    execute_sync_queue,
+    load_sync_queue,
+    prepare_sync_queue,
+)
 
 DEFAULT_ROOT = "/var/lib/llm-models"
 HELP_FORMATTER = argparse.RawDescriptionHelpFormatter
@@ -846,7 +851,8 @@ Review a generated command before evaluating or executing it.""",
         description=(
             "Validate the active NAS object, rsync selected files into staging, "
             "show aggregate transfer progress and speed, publish HF blobs and "
-            "a commit snapshot, then register it locally."
+            "a commit snapshot, then register it locally. Accepts one model, "
+            "or a queue file of model names synced with --queue."
         ),
         formatter_class=HELP_FORMATTER,
         epilog="""examples:
@@ -854,17 +860,43 @@ Review a generated command before evaluating or executing it.""",
     --source-root /mnt/nas/llm-models --cache-dir ~/.cache/huggingface/hub
   modelctl sync-local qwen3-8b-vllm
   modelctl sync model-q4 --from-root /mnt/nas/llm-models --cache-dir /srv/huggingface/hub
+  modelctl sync-local --queue models.txt --jobs 2
+
+Queue file (models.txt) — one model name per YAML list entry:
+  - qwen3-8b-vllm
+  - deepseek-v4-flash
 
 Pass an active model name or its Hugging Face repository id. A repository id
 must identify exactly one active model. Selected repository files are published
 as HF blobs and snapshot symlinks. Partial selections remain partial snapshots.
 Transfer status includes bytes, completion, speed, and ETA; post-transfer ETag
 validation and publication phases are also reported. The inference service is
-not restarted.""",
+not restarted.
+
+With --queue, every entry is resolved against the source root before any
+transfer starts; the queue continues after failures, prints a summary, and
+exits nonzero if any entry failed. With --jobs 2 or more, per-transfer
+progress is replaced by completion lines to keep output readable.""",
     )
     sync.add_argument(
-        "name", metavar="MODEL_OR_REPO",
+        "name", metavar="MODEL_OR_REPO", nargs="?",
         help="active model name or unique Hugging Face repository id",
+    )
+    sync.add_argument(
+        "--queue",
+        type=Path,
+        metavar="FILE",
+        help=(
+            "YAML file with a list of model names to sync "
+            "(conflicts with MODEL_OR_REPO)"
+        ),
+    )
+    sync.add_argument(
+        "--jobs",
+        type=_positive_int,
+        default=1,
+        metavar="N",
+        help="maximum concurrent syncs with --queue (default: 1)",
     )
     sync.add_argument(
         "--source-root", "--from-root", metavar="PATH", dest="source_root",
@@ -1054,9 +1086,63 @@ def run(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command in {"sync-local", "sync"}:
+        cache = _selected_cache(args)
+        source_root = _root(args.source_root)
+        if args.queue is not None:
+            if args.name:
+                raise ModelctlError(
+                    "pass either MODEL_OR_REPO or --queue, not both"
+                )
+            entries = load_sync_queue(args.queue)
+            print(
+                f"preflight: validating source store and {len(entries)} "
+                "queue entries"
+            )
+            prepared = prepare_sync_queue(source_root, entries)
+            for index, item in enumerate(prepared, start=1):
+                print(
+                    f"[{index}/{len(prepared)}] ready: {item.name} "
+                    f"<- {item.entry.identifier}"
+                )
+            concurrency = min(args.jobs, len(prepared))
+            print(
+                f"preflight complete: starting {len(prepared)} sync(s), "
+                f"up to {concurrency} concurrent"
+            )
+            results = execute_sync_queue(
+                source_root,
+                cache,
+                prepared,
+                jobs=args.jobs,
+                rsync=args.rsync,
+            )
+            failures = 0
+            for index, result in enumerate(results, start=1):
+                label = prepared[index - 1].name
+                if result.succeeded:
+                    print(
+                        f"[{index}/{len(results)}] complete: "
+                        f"{label} -> {result.snapshot}"
+                    )
+                else:
+                    failures += 1
+                    error = result.error
+                    print(
+                        f"[{index}/{len(results)}] failed: {label}: "
+                        f"{type(error).__name__}: {error}"
+                    )
+            print(
+                f"summary: {len(results) - failures} complete, "
+                f"{failures} failed"
+            )
+            return 1 if failures else 0
+        if not args.name:
+            raise ModelctlError("provide MODEL_OR_REPO or --queue FILE")
+        if args.jobs != 1:
+            raise ModelctlError("--jobs requires --queue")
         result = sync_local(
-            _root(args.source_root),
-            _selected_cache(args),
+            source_root,
+            cache,
             args.name,
             rsync=args.rsync,
             progress=lambda message: print(message, flush=True),
@@ -1129,6 +1215,12 @@ def run(argv: list[str] | None = None) -> int:
                 target = f" -> {item.object}" if item.object is not None else ""
                 detail = f" ({item.detail})" if item.detail else ""
                 print(f"[{item.status}] {item.name}{target}{detail}")
+                if item.status == "repairable_directory":
+                    print(
+                        f"    run 'modelctl repair-active --apply' to replace "
+                        "it with an active symlink; a process outside "
+                        "modelctl replaced the active symlink with a copy"
+                    )
             warnings = [item for item in results if item.status == "missing_journal"]
             malformed = [
                 item

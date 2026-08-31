@@ -10,7 +10,8 @@ from modelctl.catalog import load_catalog
 from modelctl.cli import DEFAULT_ROOT, _cache_dir, _format_size, _local_root, _root, build_parser, run
 from modelctl.errors import ModelctlError
 from modelctl.catalog import catalog_lock, mark_catalog_dirty_locked
-from modelctl.integrity import RepairResult
+from modelctl.integrity import ActiveReferenceAudit, RepairResult
+from modelctl.sync_queue import PreparedSync, SyncQueueEntry, SyncQueueResult
 from modelctl.hf_cache import LocalDeleteResult, state_root
 from modelctl.layout import Layout, atomic_symlink
 from modelctl.maintenance import StoreEntryAudit
@@ -252,6 +253,28 @@ def test_doctor_reports_malformed_references(tmp_path, capsys):
     assert "doctor: 1 healthy/ignored, 0 warning(s), 1 malformed" in captured.out
 
 
+def test_doctor_hints_repair_for_repairable_directory(tmp_path, monkeypatch, capsys):
+    reference = tmp_path / "active" / "demo"
+    monkeypatch.setattr(
+        "modelctl.cli.audit_active_references",
+        lambda root: [
+            ActiveReferenceAudit(
+                "demo",
+                "repairable_directory",
+                reference,
+                tmp_path / "models" / "demo",
+                "validated duplicate of canonical object",
+            )
+        ],
+    )
+
+    assert run(["doctor", "--root", str(tmp_path)]) == 1
+    out = capsys.readouterr().out
+    assert "[repairable_directory] demo" in out
+    assert "modelctl repair-active --apply" in out
+    assert "outside modelctl" in out
+
+
 def test_repair_active_is_dry_run_by_default(tmp_path, monkeypatch, capsys):
     calls = []
 
@@ -402,6 +425,79 @@ def test_sync_local_accepts_hugging_face_repository(
     assert capsys.readouterr().out == f"{cache / 'snapshot'}\n"
 
 
+def test_sync_local_queue_preflights_and_reports_results(
+    tmp_path, monkeypatch, capsys
+):
+    queue_file = tmp_path / "models.txt"
+    queue_file.write_text("- alpha\n- beta\n", encoding="utf-8")
+    nas = tmp_path / "nas"
+    cache = tmp_path / "hub"
+    calls = []
+
+    def fake_prepare(source_root, entries):
+        calls.append(("prepare", source_root, [e.identifier for e in entries]))
+        return [
+            PreparedSync(entry, entry.identifier)
+            for entry in entries
+        ]
+
+    def fake_execute(source_root, cache_dir, prepared, *, jobs, rsync):
+        calls.append(("execute", source_root, cache_dir, len(prepared), jobs))
+        return [
+            SyncQueueResult(
+                prepared[0].entry,
+                "alpha",
+                snapshot=cache / "snapshots" / "alpha",
+            ),
+            SyncQueueResult(
+                prepared[1].entry,
+                "beta",
+                error=ModelctlError("rsync failed; staging is resumable"),
+            ),
+        ]
+
+    monkeypatch.setattr("modelctl.cli.prepare_sync_queue", fake_prepare)
+    monkeypatch.setattr("modelctl.cli.execute_sync_queue", fake_execute)
+    assert run([
+        "sync-local",
+        "--queue",
+        str(queue_file),
+        "--source-root",
+        str(nas),
+        "--cache-dir",
+        str(cache),
+    ]) == 1
+    assert calls == [
+        ("prepare", nas, ["alpha", "beta"]),
+        ("execute", nas, cache, 2, 1),
+    ]
+    out = capsys.readouterr().out
+    assert "preflight: validating source store and 2 queue entries" in out
+    assert "[1/2] ready: alpha <- alpha" in out
+    assert "[2/2] ready: beta <- beta" in out
+    assert "preflight complete: starting 2 sync(s), up to 1 concurrent" in out
+    assert "[1/2] complete: alpha" in out
+    assert "[2/2] failed: beta: ModelctlError: rsync failed" in out
+    assert "summary: 1 complete, 1 failed" in out
+
+
+def test_sync_local_queue_rejects_name_and_queue_together(tmp_path):
+    queue_file = tmp_path / "models.txt"
+    queue_file.write_text("- alpha\n", encoding="utf-8")
+    with pytest.raises(ModelctlError, match="not both"):
+        run(["sync-local", "alpha", "--queue", str(queue_file)])
+
+
+def test_sync_local_jobs_requires_queue(tmp_path):
+    with pytest.raises(ModelctlError, match="--jobs requires --queue"):
+        run(["sync-local", "alpha", "--jobs", "2"])
+
+
+def test_sync_local_requires_name_or_queue(tmp_path):
+    with pytest.raises(ModelctlError, match="provide MODEL_OR_REPO or --queue"):
+        run(["sync-local"])
+
+
 def test_delete_local_deletes_cache_data_by_default(tmp_path, monkeypatch, capsys):
     cache = tmp_path / "hub"
     record = cache / "state" / "active" / "demo.json"
@@ -472,7 +568,7 @@ def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_version_uses_package_version(capsys):
-    assert __version__ == "0.16.1"
+    assert __version__ == "0.17.0"
     with pytest.raises(SystemExit) as exit_info:
         build_parser().parse_args(["--version"])
     assert exit_info.value.code == 0
