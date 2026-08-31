@@ -2,6 +2,19 @@
 
 This project follows semantic versioning.
 
+## 0.16.0
+
+### Changed
+
+- Make `modelctl delete-local` delete the model's local Hugging Face cache
+  data (snapshot, refs, blobs, and modelctl staging) in addition to removing
+  modelctl's registration. Unshared repositories are removed whole; data
+  shared with another local registration is pruned to what the deleted
+  registration alone pins, and anything still referenced — including
+  resumable staging data and stale registrations whose data cannot be
+  identified safely — is retained and reported on stdout. Add `--keep-data`
+  to restore the previous unregister-only behavior.
+
 ## 0.15.0
 
 ### Changed

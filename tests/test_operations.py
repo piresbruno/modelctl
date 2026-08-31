@@ -443,7 +443,7 @@ def test_local_sync_publishes_hf_cache_and_updates_record_last(
     ]
 
 
-def test_delete_local_unregisters_model_and_preserves_cache_and_nas(tmp_path):
+def test_delete_local_deletes_cache_data_and_preserves_nas(tmp_path):
     nas = tmp_path / "nas"
     cache = tmp_path / "hub"
     update_model(
@@ -461,11 +461,82 @@ def test_delete_local_unregisters_model_and_preserves_cache_and_nas(tmp_path):
 
     snapshot = sync_local(nas, cache, "demo", runner=copy)
     nas_object = (nas / "active" / "demo").resolve()
-    assert delete_local(cache, "demo") == snapshot
-    assert snapshot.exists()
+    repository = cache / "models--org--demo"
+    result = delete_local(cache, "demo")
+    assert result.snapshot == snapshot.resolve()
+    assert result.removed == (repository,)
+    assert result.retained == ()
+    assert not repository.exists()
     assert not (state_root(cache) / "active" / "demo.json").exists()
+    refs = json.loads((state_root(cache) / "refs.json").read_text())
+    assert refs == {"schema": 1, "refs": {}}
     assert (nas / "active" / "demo").resolve() == nas_object
     assert nas_object.exists()
+
+
+def test_delete_local_keep_data_preserves_cache(tmp_path):
+    nas = tmp_path / "nas"
+    cache = tmp_path / "hub"
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot({"config.json": b"data"}),
+    )
+
+    def copy(command, check):
+        source = Path(command[-2].removesuffix("/"))
+        destination = Path(command[-1].removesuffix("/"))
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source / "config.json", destination / "config.json")
+
+    snapshot = sync_local(nas, cache, "demo", runner=copy)
+    repository = cache / "models--org--demo"
+    result = delete_local(cache, "demo", keep_data=True)
+    assert result.snapshot == snapshot.resolve()
+    assert result.removed == ()
+    assert result.retained == (
+        "--keep-data was set; snapshots, refs, and blobs were retained",
+    )
+    assert snapshot.exists()
+    assert repository.exists()
+    assert not (state_root(cache) / "active" / "demo.json").exists()
+
+
+def test_delete_local_reports_data_shared_with_other_registration(tmp_path):
+    nas = tmp_path / "nas"
+    cache = tmp_path / "hub"
+
+    def copy(command, check):
+        source = Path(command[-2].removesuffix("/"))
+        destination = Path(command[-1].removesuffix("/"))
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source / "config.json", destination / "config.json")
+
+    for name in ("demo", "demo2"):
+        update_model(
+            nas,
+            _manifest(name=name),
+            api=FakeApi("d" * 40),
+            snapshot=FakeSnapshot({"config.json": b"data"}),
+        )
+        sync_local(nas, cache, name, runner=copy)
+
+    repository = cache / "models--org--demo"
+    result = delete_local(cache, "demo")
+    assert result.removed == ()
+    assert len(result.retained) == 2
+    assert all(
+        note.startswith(("snapshot ", "blob " )) for note in result.retained
+    )
+    assert all("demo2" in note for note in result.retained)
+    assert repository.exists()
+    assert load_record(cache, "demo2").snapshot.is_dir()
+
+    result = delete_local(cache, "demo2")
+    assert result.removed == (repository,)
+    assert result.retained == ()
+    assert not repository.exists()
 
 
 def test_delete_local_only_removes_one_shared_record(tmp_path):
@@ -524,8 +595,12 @@ def test_local_listing_skips_broken_registration(tmp_path):
 def test_delete_local_removes_broken_registration(tmp_path):
     cache = tmp_path / "hub"
     _broken_record(cache)
-    removed = delete_local(cache, "broken")
-    assert removed.name == "broken.json"
+    result = delete_local(cache, "broken")
+    assert result.snapshot is None
+    assert result.removed == ()
+    assert result.retained == (
+        "registration was stale or malformed; cache data was left untouched",
+    )
     assert not (state_root(cache) / "active" / "broken.json").exists()
     with pytest.raises(ModelctlError, match="no local cache record"):
         delete_local(cache, "broken")

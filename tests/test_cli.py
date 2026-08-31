@@ -11,7 +11,7 @@ from modelctl.cli import DEFAULT_ROOT, _cache_dir, _format_size, _local_root, _r
 from modelctl.errors import ModelctlError
 from modelctl.catalog import catalog_lock, mark_catalog_dirty_locked
 from modelctl.integrity import RepairResult
-from modelctl.hf_cache import state_root
+from modelctl.hf_cache import LocalDeleteResult, state_root
 from modelctl.layout import Layout, atomic_symlink
 from modelctl.maintenance import StoreEntryAudit
 from modelctl.manifest import parse_manifest
@@ -402,19 +402,54 @@ def test_sync_local_accepts_hugging_face_repository(
     assert capsys.readouterr().out == f"{cache / 'snapshot'}\n"
 
 
-def test_delete_local_uses_hf_cache_and_retains_data(tmp_path, monkeypatch, capsys):
+def test_delete_local_deletes_cache_data_by_default(tmp_path, monkeypatch, capsys):
     cache = tmp_path / "hub"
-    snapshot = cache / "models--org--demo" / "snapshots" / ("e" * 40)
+    record = cache / "state" / "active" / "demo.json"
+    repository = cache / "models--org--demo"
     calls = []
 
-    def fake_delete(selected, name):
-        calls.append((selected, name))
-        return snapshot
+    def fake_delete(selected, name, *, keep_data=False):
+        calls.append((selected, name, keep_data))
+        return LocalDeleteResult(
+            name=name,
+            record=record,
+            snapshot=repository,
+            removed=(repository,),
+            retained=(),
+        )
 
     monkeypatch.setattr("modelctl.cli.delete_cached", fake_delete)
     assert run(["delete-local", "demo", "--cache-dir", str(cache)]) == 0
-    assert calls == [(cache, "demo")]
-    assert capsys.readouterr().out == f"unregistered: {snapshot} (cache data retained)\n"
+    assert calls == [(cache, "demo", False)]
+    assert capsys.readouterr().out == (
+        f"deleted: {repository}\nunregistered: {record}\n"
+    )
+
+
+def test_delete_local_keep_data_flag_retains_cache(tmp_path, monkeypatch, capsys):
+    cache = tmp_path / "hub"
+    record = cache / "state" / "active" / "demo.json"
+    calls = []
+
+    def fake_delete(selected, name, *, keep_data=False):
+        calls.append((selected, name, keep_data))
+        return LocalDeleteResult(
+            name=name,
+            record=record,
+            snapshot=None,
+            removed=(),
+            retained=("--keep-data was set; snapshots, refs, and blobs were retained",),
+        )
+
+    monkeypatch.setattr("modelctl.cli.delete_cached", fake_delete)
+    assert run(
+        ["delete-local", "demo", "--cache-dir", str(cache), "--keep-data"]
+    ) == 0
+    assert calls == [(cache, "demo", True)]
+    assert capsys.readouterr().out == (
+        "retained: --keep-data was set; snapshots, refs, and blobs were retained\n"
+        f"unregistered: {record} (cache data retained)\n"
+    )
 
 
 def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
@@ -437,7 +472,7 @@ def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_version_uses_package_version(capsys):
-    assert __version__ == "0.15.0"
+    assert __version__ == "0.16.0"
     with pytest.raises(SystemExit) as exit_info:
         build_parser().parse_args(["--version"])
     assert exit_info.value.code == 0

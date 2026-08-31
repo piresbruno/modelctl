@@ -16,6 +16,7 @@ from .catalog import (
 from .errors import ModelctlError, ValidationError
 from .generation import parse_hf_source
 from .hf_cache import (
+    LocalDeleteResult,
     cached_entrypoint,
     delete_record,
     list_records,
@@ -376,8 +377,10 @@ def list_active_models(root: Path) -> list[ActiveModel]:
     return models
 
 
-def delete_local(root: Path, name: str) -> Path:
-    return delete_record(root, name)
+def delete_local(
+    root: Path, name: str, *, keep_data: bool = False
+) -> LocalDeleteResult:
+    return delete_record(root, name, keep_data=keep_data)
 
 
 def _validate_delete_target(
@@ -740,8 +743,10 @@ def local_active_entrypoint(cache_dir: Path, name: str) -> Path:
     return cached_entrypoint(cache_dir, name)
 
 
-def delete_cached(cache_dir: Path, name: str) -> Path:
-    return delete_record(cache_dir, name)
+def delete_cached(
+    cache_dir: Path, name: str, *, keep_data: bool = False
+) -> LocalDeleteResult:
+    return delete_record(cache_dir, name, keep_data=keep_data)
 
 
 def serve_cached_command(cache_dir: Path, name: str) -> str:

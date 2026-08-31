@@ -38,6 +38,22 @@ class CacheRecord:
     snapshot: Path
 
 
+@dataclass(frozen=True)
+class LocalDeleteResult:
+    """Outcome of ``modelctl delete-local``.
+
+    ``removed`` lists the cache paths deleted during this run and ``retained``
+    explains, in human-readable form, anything deliberately kept (data shared
+    with another registration, resumable staging, or stale registrations
+    whose data cannot be identified safely)."""
+
+    name: str
+    record: Path
+    snapshot: Path | None
+    removed: tuple[Path, ...]
+    retained: tuple[str, ...]
+
+
 def canonical_cache(cache_dir: Path) -> Path:
     return cache_dir.expanduser().absolute().resolve(strict=False)
 
@@ -780,23 +796,210 @@ def list_records(cache_dir: Path) -> list[CacheRecord]:
     return records
 
 
-def delete_record(cache_dir: Path, name: str) -> Path:
-    with _lock(_name_lock(cache_dir, name)):
-        path = _record_path(cache_dir, name)
+def _raw_records(cache: Path) -> dict[str, dict[str, Any]]:
+    """Best-effort raw read of the remaining local registrations.
+
+    Broken records are included so their pinned files and repositories can
+    still be treated as shared instead of being deleted underneath them."""
+    active = state_root(cache) / "active"
+    records: dict[str, dict[str, Any]] = {}
+    if not active.is_dir():
+        return records
+    for path in sorted(active.glob("*.json")):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(raw, dict):
+            records[path.stem] = raw
+    return records
+
+
+def _shared_names(others: dict[str, dict[str, Any]], repo: str) -> list[str]:
+    return sorted(
+        other_name
+        for other_name, raw in others.items()
+        if isinstance(raw.get("repo"), str) and raw["repo"] == repo
+    )
+
+
+def _delete_repository(
+    cache: Path, repo: str, repository: Path
+) -> tuple[tuple[Path, ...], tuple[str, ...]]:
+    """Remove an unshared repository: its snapshots, refs, blobs, and modelctl
+    staging data, plus this repository's modelctl ref-ownership entries."""
+    retained: list[str] = []
+    state_dir = state_root(cache) / "state"
+    if state_dir.is_dir():
+        for journal in sorted(state_dir.glob("*.json")):
+            try:
+                text = journal.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if str(repository) in text:
+                retained.append(
+                    f"{repository} is referenced by a live or resumable "
+                    f"transfer journal ({journal.name})"
+                )
+                break
+    staging = repository / ".modelctl-staging"
+    if staging.is_dir() and any(staging.iterdir()):
+        retained.append(f"resumable staging data present under {staging}")
+    if retained:
+        return (), tuple(retained)
+    shutil.rmtree(repository)
+    _fsync_directory(repository.parent)
+    ownership_path = _refs_path(cache)
+    if ownership_path.exists():
+        try:
+            ownership = _load_ref_ownership(cache)
+        except ModelctlError:
+            retained.append(
+                f"modelctl ref ownership at {ownership_path} could not be "
+                "read; it may still list refs for the deleted repository"
+            )
+        else:
+            remaining = {
+                key: value
+                for key, value in ownership.items()
+                if not key.startswith(f"{repo}@")
+            }
+            if remaining != ownership:
+                _atomic_json(
+                    ownership_path, {"schema": _REFS_SCHEMA, "refs": remaining}
+                )
+    return (repository,), tuple(retained)
+
+
+def _delete_pinned_data(
+    cache: Path, record: CacheRecord, others: dict[str, dict[str, Any]]
+) -> tuple[tuple[Path, ...], tuple[str, ...]]:
+    """Remove only the data this registration pins from a repository that
+    other local registrations still reference."""
+    repository = repo_path(cache, record.repo)
+    removed: list[Path] = []
+    retained: list[str] = []
+
+    sharers = _shared_names(others, record.repo)
+    commit_sharers = sorted(
+        other_name
+        for other_name in sharers
+        if others[other_name].get("commit") == record.commit
+    )
+    snapshot = record.snapshot
+    if not commit_sharers and snapshot.is_dir():
+        shutil.rmtree(snapshot)
+        _fsync_directory(snapshot.parent)
+        removed.append(snapshot)
+    elif commit_sharers:
+        retained.append(
+            f"snapshot {snapshot} is still referenced by local "
+            f"registration(s): {', '.join(commit_sharers)}"
+        )
+
+    if not _COMMIT_RE.fullmatch(record.revision) and not commit_sharers:
+        relative = _safe_relative(record.revision, "Hugging Face revision")
+        ref = repository / "refs" / Path(*relative.parts)
+        try:
+            points_here = (
+                ref.is_file() and ref.read_text(encoding="utf-8") == record.commit
+            )
+        except OSError:
+            points_here = False
+        if points_here:
+            ref.unlink()
+            _fsync_directory(ref.parent)
+            removed.append(ref)
+
+    referenced_blobs: dict[str, list[str]] = {}
+    for other_name in sharers:
+        files = others[other_name].get("files")
+        if not isinstance(files, dict):
+            continue
+        for etag in files.values():
+            if isinstance(etag, str):
+                referenced_blobs.setdefault(etag, []).append(other_name)
+    for etag in dict.fromkeys(record.files.values()):
+        blob = repository / "blobs" / etag
+        if not blob.exists():
+            continue
+        if etag in referenced_blobs:
+            retained.append(
+                f"blob {blob} is still referenced by local registration(s): "
+                f"{', '.join(referenced_blobs[etag])}"
+            )
+            continue
+        blob.unlink()
+        _fsync_directory(blob.parent)
+        removed.append(blob)
+
+    for directory in (
+        repository / "blobs",
+        repository / "refs",
+        repository / "snapshots",
+    ):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    return tuple(removed), tuple(retained)
+
+
+def delete_record(
+    cache_dir: Path, name: str, *, keep_data: bool = False
+) -> LocalDeleteResult:
+    """Remove a local cache registration and, by default, its cache data.
+
+    Unshared repositories are removed whole (snapshots, refs, blobs, and
+    modelctl staging). Data shared with another local registration is pruned
+    to what this registration alone pins, and anything still referenced —
+    including resumable staging and stale registrations whose data cannot be
+    identified safely — is retained and reported."""
+    cache = canonical_cache(cache_dir)
+    with _lock(_name_lock(cache, name)):
+        path = _record_path(cache, name)
         if not path.exists():
             raise ModelctlError(
                 f"model {name!r} has no local cache record at {path}"
             )
         try:
-            record = load_record(cache_dir, name)
+            record = load_record(cache, name)
         except ModelctlError:
             # A stale registration must still be removable so it stops
-            # blocking listings; cache data is never touched.
+            # blocking listings; its data cannot be identified safely, so
+            # cache data is never touched.
             record = None
         path.unlink()
         _fsync_directory(path.parent)
-        journal = _journal_path(cache_dir, name)
+        journal = _journal_path(cache, name)
         journal.unlink(missing_ok=True)
         if journal.parent.exists():
             _fsync_directory(journal.parent)
-        return record.snapshot if record is not None else path
+        removed: tuple[Path, ...] = ()
+        retained: tuple[str, ...] = ()
+        if record is None:
+            retained = (
+                "registration was stale or malformed; "
+                "cache data was left untouched",
+            )
+        elif keep_data:
+            retained = (
+                "--keep-data was set; snapshots, refs, and blobs were retained",
+            )
+        else:
+            repository = repo_path(cache, record.repo)
+            with _lock(_repo_lock(cache, record.repo)):
+                others = _raw_records(cache)
+                if _shared_names(others, record.repo):
+                    removed, retained = _delete_pinned_data(cache, record, others)
+                else:
+                    removed, retained = _delete_repository(
+                        cache, record.repo, repository
+                    )
+    return LocalDeleteResult(
+        name=name,
+        record=path,
+        snapshot=record.snapshot if record is not None else None,
+        removed=removed,
+        retained=retained,
+    )

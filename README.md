@@ -763,17 +763,22 @@ invalid objects. Stop modelctl writers and take a store snapshot before applying
 either cleanup, especially before removing unreferenced immutable revisions that
 might otherwise serve as manual rollback points.
 
-Unregister a synchronized model while preserving both its NAS source and shared
-Hugging Face cache data:
+Delete a synchronized model from the local Hugging Face cache while preserving
+its NAS source:
 
 ```bash
 modelctl delete-local MODEL_NAME
 ```
 
-The command atomically removes only modelctl's local registration and journal.
-It does not delete snapshots, refs, or blobs because the Hugging Face cache may
-also be used by Transformers, vLLM, `hf`, or other processes. Reclaim data
-explicitly with `hf cache rm` or `hf cache prune` after reviewing what is shared.
+By default the command removes modelctl's registration and journal, then
+deletes the repository's snapshots, refs, and blobs from the local cache.
+Data that another local registration still references, and resumable staging
+data from interrupted transfers, are retained and reported instead of deleted.
+The managed model store on the NAS is never touched. Use `--keep-data` to only
+remove modelctl's registration while leaving all cache files in place, for
+example when Transformers, vLLM, `hf`, or other processes still share the
+cache and you prefer to reclaim space with `hf cache rm` or `hf cache prune`
+yourself.
 
 ### Deleting a model from the NAS store
 

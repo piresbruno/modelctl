@@ -544,20 +544,32 @@ Quarantined directories are retained until cleanup-quarantine is explicitly run.
 
     delete = commands.add_parser(
         "delete-local",
-        help="unregister a model from the local Hugging Face cache",
+        help="delete a model from the local Hugging Face cache",
         description=(
-            "Remove modelctl local registration state without deleting shared "
-            "Hugging Face cache data or modifying the NAS model."
+            "Permanently remove a model's local Hugging Face cache data "
+            "(snapshot, refs, and blobs) along with modelctl's registration. "
+            "Data still referenced by another local registration is retained "
+            "and reported. The managed model store on the NAS is never "
+            "touched; use 'delete' for that."
         ),
         formatter_class=HELP_FORMATTER,
         epilog="""examples:
   modelctl delete-local qwen3-8b-vllm
   modelctl delete-local model-q4 --cache-dir /srv/huggingface/hub
+  modelctl delete-local qwen3-8b-vllm --keep-data
 
-Cache snapshots, refs, and blobs are retained. Use hf cache rm or hf cache prune
-explicitly when shared cache data should be removed.""",
+Without --keep-data this permanently deletes cache files that Transformers,
+vLLM, hf, or other processes may still be using.""",
     )
     delete.add_argument("name")
+    delete.add_argument(
+        "--keep-data",
+        action="store_true",
+        help=(
+            "only remove modelctl's registration; retain snapshots, refs, "
+            "and blobs"
+        ),
+    )
     _add_local_root(delete)
 
     store_delete = commands.add_parser(
@@ -1030,8 +1042,15 @@ def run(argv: list[str] | None = None) -> int:
 
     if args.command == "delete-local":
         validate_name(args.name)
-        removed = delete_cached(_selected_cache(args), args.name)
-        print(f"unregistered: {removed} (cache data retained)")
+        result = delete_cached(
+            _selected_cache(args), args.name, keep_data=args.keep_data
+        )
+        for removed in result.removed:
+            print(f"deleted: {removed}")
+        for note in result.retained:
+            print(f"retained: {note}")
+        suffix = "" if result.removed else " (cache data retained)"
+        print(f"unregistered: {result.record}{suffix}")
         return 0
 
     if args.command in {"sync-local", "sync"}:
