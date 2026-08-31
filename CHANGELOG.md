@@ -2,6 +2,17 @@
 
 This project follows semantic versioning.
 
+## 0.16.1
+
+### Fixed
+
+- Make `modelctl delete-local` fail with a `ModelctlError` (instead of a raw
+  traceback) when cache data cannot be deleted, for example because another
+  user such as a root-owned container owns cache paths. The registration and
+  journal are now removed only after the data deletion succeeds, so a failed
+  deletion keeps the registration in place and the command can be retried
+  after fixing ownership or removing the leftovers manually.
+
 ## 0.16.0
 
 ### Changed

@@ -503,6 +503,47 @@ def test_delete_local_keep_data_preserves_cache(tmp_path):
     assert not (state_root(cache) / "active" / "demo.json").exists()
 
 
+def test_delete_local_keeps_registration_when_data_deletion_fails(
+    tmp_path, monkeypatch
+):
+    nas = tmp_path / "nas"
+    cache = tmp_path / "hub"
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot({"config.json": b"data"}),
+    )
+
+    def copy(command, check):
+        source = Path(command[-2].removesuffix("/"))
+        destination = Path(command[-1].removesuffix("/"))
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source / "config.json", destination / "config.json")
+
+    sync_local(nas, cache, "demo", runner=copy)
+    repository = cache / "models--org--demo"
+    record_path = state_root(cache) / "active" / "demo.json"
+
+    real_rmtree = shutil.rmtree
+
+    def denied(path, *args, **kwargs):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr("modelctl.hf_cache.shutil.rmtree", denied)
+    with pytest.raises(ModelctlError, match="could not delete local cache data"):
+        delete_local(cache, "demo")
+    assert record_path.exists()
+    assert repository.exists()
+    assert load_record(cache, "demo").snapshot.is_dir()
+
+    monkeypatch.setattr("modelctl.hf_cache.shutil.rmtree", real_rmtree)
+    result = delete_local(cache, "demo")
+    assert result.removed == (repository,)
+    assert not repository.exists()
+    assert not record_path.exists()
+
+
 def test_delete_local_reports_data_shared_with_other_registration(tmp_path):
     nas = tmp_path / "nas"
     cache = tmp_path / "hub"

@@ -824,7 +824,7 @@ def _shared_names(others: dict[str, dict[str, Any]], repo: str) -> list[str]:
 
 
 def _delete_repository(
-    cache: Path, repo: str, repository: Path
+    cache: Path, name: str, repo: str, repository: Path
 ) -> tuple[tuple[Path, ...], tuple[str, ...]]:
     """Remove an unshared repository: its snapshots, refs, blobs, and modelctl
     staging data, plus this repository's modelctl ref-ownership entries."""
@@ -832,6 +832,10 @@ def _delete_repository(
     state_dir = state_root(cache) / "state"
     if state_dir.is_dir():
         for journal in sorted(state_dir.glob("*.json")):
+            if journal.stem == name:
+                # The caller's own journal is removed after a successful
+                # deletion; it does not block removing the data it describes.
+                continue
             try:
                 text = journal.read_text(encoding="utf-8")
             except OSError:
@@ -945,6 +949,17 @@ def _delete_pinned_data(
     return tuple(removed), tuple(retained)
 
 
+def _delete_error(name: str, exc: OSError) -> ModelctlError:
+    return ModelctlError(
+        f"could not delete local cache data for {name!r}: {exc}; the "
+        "registration was kept so the command can be retried. Cache paths "
+        "owned by another user (for example a container or service running "
+        "as root against this cache) cannot be removed by the current user; "
+        "fix ownership with 'sudo chown -R' or remove the leftovers with "
+        "'sudo rm -rf', then re-run 'modelctl delete-local'",
+    )
+
+
 def delete_record(
     cache_dir: Path, name: str, *, keep_data: bool = False
 ) -> LocalDeleteResult:
@@ -954,7 +969,9 @@ def delete_record(
     modelctl staging). Data shared with another local registration is pruned
     to what this registration alone pins, and anything still referenced —
     including resumable staging and stale registrations whose data cannot be
-    identified safely — is retained and reported."""
+    identified safely — is retained and reported. The registration and
+    journal are removed last, so a failed data deletion leaves them in place
+    for a retry."""
     cache = canonical_cache(cache_dir)
     with _lock(_name_lock(cache, name)):
         path = _record_path(cache, name)
@@ -969,12 +986,6 @@ def delete_record(
             # blocking listings; its data cannot be identified safely, so
             # cache data is never touched.
             record = None
-        path.unlink()
-        _fsync_directory(path.parent)
-        journal = _journal_path(cache, name)
-        journal.unlink(missing_ok=True)
-        if journal.parent.exists():
-            _fsync_directory(journal.parent)
         removed: tuple[Path, ...] = ()
         retained: tuple[str, ...] = ()
         if record is None:
@@ -989,13 +1000,28 @@ def delete_record(
         else:
             repository = repo_path(cache, record.repo)
             with _lock(_repo_lock(cache, record.repo)):
+                # The record being deleted is unlinked only after a
+                # successful data deletion, so exclude it from the share
+                # analysis or it would count as its own sharer.
                 others = _raw_records(cache)
-                if _shared_names(others, record.repo):
-                    removed, retained = _delete_pinned_data(cache, record, others)
-                else:
-                    removed, retained = _delete_repository(
-                        cache, record.repo, repository
-                    )
+                others.pop(name, None)
+                try:
+                    if _shared_names(others, record.repo):
+                        removed, retained = _delete_pinned_data(
+                            cache, record, others
+                        )
+                    else:
+                        removed, retained = _delete_repository(
+                            cache, name, record.repo, repository
+                        )
+                except OSError as exc:
+                    raise _delete_error(name, exc) from exc
+        path.unlink()
+        _fsync_directory(path.parent)
+        journal = _journal_path(cache, name)
+        journal.unlink(missing_ok=True)
+        if journal.parent.exists():
+            _fsync_directory(journal.parent)
     return LocalDeleteResult(
         name=name,
         record=path,
