@@ -41,6 +41,7 @@ from .manifest import load_manifest, validate_name
 from .operations import (
     DeleteResult,
     active_entrypoint,
+    catalog_models,
     delete_cached,
     delete_model,
     list_active_models,
@@ -168,7 +169,7 @@ def _store_records(root: Path) -> tuple[list[dict[str, Any]], list[str]]:
             )
         return list(document["models"]), warnings
     try:
-        models, _ = refresh_catalog(root, list_active_models)
+        models, _ = refresh_catalog(root, catalog_models)
     except ModelctlError as exc:
         models = list_active_models(root)
         warnings = [
@@ -1195,7 +1196,7 @@ def run(argv: list[str] | None = None) -> int:
                         f"generation: {status.generation}; models: {status.models}"
                     )
             return 0 if status.status == "ready" else 1
-        _, result = refresh_catalog(root, list_active_models)
+        _, result = refresh_catalog(root, catalog_models)
         if args.json:
             print(json.dumps(result.to_dict(), indent=2))
         else:

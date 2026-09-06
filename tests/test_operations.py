@@ -119,6 +119,80 @@ def test_update_publishes_before_switching_reference_and_reuses_valid_object(tmp
     assert reused == result
 
 
+def test_update_auto_repairs_dereferenced_active_copy(tmp_path):
+    """A process that replaces the active symlink with a validated copy must
+    not block the next activation of the same model."""
+    manifest = _manifest()
+    snapshot = FakeSnapshot({"config.json": b"{}", "model.safetensors": b"weights"})
+    first = update_model(tmp_path, manifest, api=FakeApi("a" * 40), snapshot=snapshot)
+
+    manifest_dir = tmp_path / "manifests"
+    manifest_dir.mkdir(exist_ok=True)
+    (manifest_dir / "demo.yaml").write_text(
+        "name: demo\nrepo: org/demo\nruntime: vllm\n"
+    )
+
+    reference = tmp_path / "active" / "demo"
+    reference.unlink()
+    shutil.copytree(first, reference)
+    assert reference.is_dir() and not reference.is_symlink()
+
+    def should_not_download(**kwargs):
+        raise AssertionError("valid content-addressed object should be reused")
+
+    second = update_model(
+        tmp_path, manifest, api=FakeApi("a" * 40), snapshot=should_not_download
+    )
+    assert second == first
+    assert reference.is_symlink()
+    assert reference.resolve() == first
+
+    repairs = list((tmp_path / "state" / "repairs").glob("demo-*.json"))
+    assert len(repairs) == 1
+    repair = json.loads(repairs[0].read_text())
+    assert repair["state"] == "REPAIRED"
+    quarantine = Path(repair["history"][-1]["quarantine"])
+    assert quarantine.is_dir()
+    assert (quarantine / "config.json").is_file()
+    states = [
+        item["state"]
+        for item in json.loads((tmp_path / "state" / "demo.json").read_text())["history"]
+    ]
+    assert states[-1] == UpdateState.ACTIVE_ON_NAS
+    [record] = load_catalog(tmp_path)["models"]
+    assert record["name"] == "demo"
+    assert catalog_status(tmp_path).status == "ready"
+
+
+def test_update_fails_with_guidance_when_copy_cannot_be_auto_repaired(tmp_path):
+    manifest = _manifest()
+    snapshot = FakeSnapshot({"config.json": b"{}", "model.safetensors": b"weights"})
+    first = update_model(tmp_path, manifest, api=FakeApi("a" * 40), snapshot=snapshot)
+
+    manifest_dir = tmp_path / "manifests"
+    manifest_dir.mkdir(exist_ok=True)
+    (manifest_dir / "demo.yaml").write_text(
+        "name: demo\nrepo: org/demo\nruntime: vllm\n"
+    )
+
+    reference = tmp_path / "active" / "demo"
+    reference.unlink()
+    shutil.copytree(first, reference)
+    (reference / ".modelctl.json").unlink()
+
+    def should_not_download(**kwargs):
+        raise AssertionError("valid content-addressed object should be reused")
+
+    with pytest.raises(ModelctlError, match="cannot be auto-repaired"):
+        update_model(
+            tmp_path, manifest, api=FakeApi("a" * 40), snapshot=should_not_download
+        )
+    assert reference.is_dir() and not reference.is_symlink()
+    assert (reference / "config.json").is_file()
+    history = json.loads((tmp_path / "state" / "demo.json").read_text())["history"]
+    assert history[-1]["state"] == UpdateState.FAILED_TO_ACTIVATE
+
+
 def test_concurrent_updates_publish_complete_catalog(tmp_path):
     def update(name, commit):
         return update_model(

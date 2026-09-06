@@ -710,7 +710,10 @@ Successful activation and active-reference repair refresh the complete catalog
 under a global catalog lock. `modelctl list` reads the catalog directly instead
 of scanning; it detects interrupted refreshes through the dirty marker but does
 not detect out-of-band changes to `active/` on its fast path. Run
-`modelctl catalog refresh` to rebuild the catalog from the store. Active
+`modelctl catalog refresh` to rebuild the catalog from the store. A validated
+regular directory at an active reference (a copy that replaced the symlink
+outside modelctl) still contributes a record during regeneration, so rebuilding
+the catalog never hides a model that `doctor` can repair. Active
 symlinks and validated objects remain authoritative; do not edit
 `catalog.json` manually and do not use it for safety-sensitive path resolution.
 Local `list --local` registrations are not included.
@@ -758,6 +761,12 @@ validated quarantines explicitly:
 modelctl cleanup-quarantine MODEL_NAME --root /mnt/nas/llm-models
 modelctl cleanup-quarantine MODEL_NAME --root /mnt/nas/llm-models --apply
 ```
+
+When the next `update` of a model finds a repairable directory where its active
+symlink should be, modelctl repairs it automatically with the same quarantine
+and journaling as `repair-active --apply` before activating the new revision, so
+the import does not require a manual repair step. A directory that fails the
+evidence checks still fails with the `doctor`/`repair-active` guidance.
 
 Audit unpublished staging data and immutable objects separately:
 

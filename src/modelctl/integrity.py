@@ -310,6 +310,18 @@ def _apply_active_repair(
     return RepairResult(name, "repaired-no-quarantine", reference, target)
 
 
+def repair_reference_locked(layout: Layout, name: str, target: Path) -> RepairResult:
+    """Quarantine a validated duplicate at the active reference and restore the
+    canonical-object symlink.
+
+    The caller must hold the model and catalog locks and must have validated
+    *target* with :func:`repair_target`; this is the lock-free core of
+    :func:`repair_active_reference`, also used to self-heal a dereferenced
+    reference during activation. The repair is journaled and the duplicate
+    retained until cleanup-quarantine runs."""
+    return _apply_active_repair(layout, name, layout.active_path(name), target)
+
+
 def repair_active_reference(root: Path, name: str, *, apply: bool = False) -> RepairResult:
     layout = Layout(root)
     layout.prepare()
@@ -321,11 +333,11 @@ def repair_active_reference(root: Path, name: str, *, apply: bool = False) -> Re
 
         with catalog_lock(root):
             mark_catalog_dirty_locked(root, f"repairing {name}")
-            result = _apply_active_repair(layout, name, reference, target)
+            result = repair_reference_locked(layout, name, target)
             try:
-                from .operations import list_active_models
+                from .operations import catalog_models
 
-                refresh_catalog_locked(root, list_active_models)
+                refresh_catalog_locked(root, catalog_models)
             except ModelctlError as exc:
                 raise ModelctlError(
                     f"active reference {name!r} was repaired, but {exc}"

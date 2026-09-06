@@ -2,6 +2,23 @@
 
 This project follows semantic versioning.
 
+## Unreleased
+
+### Changed
+
+- Catalog regeneration (`catalog refresh`, and the automatic refresh after
+  update, repair, and delete) no longer drops a model whose active symlink was
+  replaced by a validated directory copy outside modelctl. Repairable
+  directories now keep contributing a record with the exact same
+  evidence checks `doctor` uses, so the catalog stays complete until the
+  reference is repaired.
+- `update` now self-heals a dereferenced active reference: when a directory
+  copy replaced the active symlink, the validated duplicate is quarantined
+  and the canonical object symlink is restored before the new revision is
+  activated. The repair is journaled and the duplicate is retained until
+  `cleanup-quarantine` runs. References that fail the evidence checks keep
+  failing with the previous `doctor`/`repair-active` guidance.
+
 ## 0.17.0
 
 ### Added

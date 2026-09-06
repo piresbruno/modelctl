@@ -1,6 +1,8 @@
 import io
 import json
+import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -352,6 +354,164 @@ def test_download_checks_symlink_support_before_remote_work(
         ("download", tmp_path.absolute(), "org/demo"),
     ]
     assert "manifest:" in capsys.readouterr().out
+
+
+def _download_pipeline(files, sha):
+    """Drive the real download -> activate -> catalog-refresh pipeline with a
+    network-free Hugging Face API and snapshot writer."""
+
+    class FakeApi:
+        def model_info(self, repo, revision):
+            return SimpleNamespace(
+                sha=sha,
+                siblings=[
+                    SimpleNamespace(rfilename=name) for name in sorted(files)
+                ],
+            )
+
+    def snapshot(**kwargs):
+        if kwargs.get("dry_run"):
+            return [
+                SimpleNamespace(filename=name, file_size=len(content))
+                for name, content in files.items()
+            ]
+        root = Path(kwargs["local_dir"])
+        for name, content in files.items():
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        return str(root)
+
+    return FakeApi, snapshot
+
+
+def test_download_refreshes_catalog_and_keeps_model_available_in_list(
+    tmp_path, monkeypatch, capsys
+):
+    from modelctl.generation import download_from_hf as real_download_from_hf
+
+    files = {
+        "config.json": b"{}",
+        "model.safetensors": b"weights",
+        "README.md": b"# Model card\n",
+    }
+    FakeApi, snapshot = _download_pipeline(files, "a" * 40)
+
+    def fake_download(root, source, **kwargs):
+        return real_download_from_hf(
+            root, source, api=FakeApi(), snapshot=snapshot, **kwargs
+        )
+
+    monkeypatch.setattr("modelctl.cli.download_from_hf", fake_download)
+    assert run(
+        ["download", "org/demo", "--name", "demo", "--root", str(tmp_path)]
+    ) == 0
+    capsys.readouterr()
+
+    # A process outside modelctl replaces the active symlink with a copy.
+    reference = tmp_path / "active" / "demo"
+    target = reference.resolve()
+    reference.unlink()
+    shutil.copytree(target, reference)
+    assert reference.is_dir() and not reference.is_symlink()
+
+    # Re-downloading the same model auto-repairs its reference without error.
+    assert run(
+        ["download", "org/demo", "--name", "demo", "--root", str(tmp_path)]
+    ) == 0
+    capsys.readouterr()
+    assert reference.is_symlink()
+    assert reference.resolve() == target
+    assert [record["name"] for record in load_catalog(tmp_path)["models"]] == [
+        "demo"
+    ]
+
+    # A process dereferences the model again; downloading a different model
+    # must keep the repairable copy available in the catalog and in list.
+    reference.unlink()
+    shutil.copytree(target, reference)
+    assert run(
+        ["download", "org/fresh", "--name", "fresh", "--root", str(tmp_path)]
+    ) == 0
+    capsys.readouterr()
+    assert {record["name"] for record in load_catalog(tmp_path)["models"]} == {
+        "demo",
+        "fresh",
+    }
+
+    assert run(["list", "--root", str(tmp_path), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert {item["name"] for item in payload} == {"demo", "fresh"}
+
+
+def test_queue_download_refreshes_catalog_and_list_with_dereferenced_model(
+    tmp_path, monkeypatch, capsys
+):
+    import modelctl.download_queue as download_queue_module
+    import modelctl.generation as generation_module
+
+    files = {
+        "config.json": b"{}",
+        "model.safetensors": b"weights",
+        "README.md": b"# Model card\n",
+    }
+    FakeApi, writer = _download_pipeline(files, "b" * 40)
+    real_generate = generation_module.generate_manifest_document
+    real_download_generated = generation_module.download_generated_manifest
+
+    def fake_generate(source, **kwargs):
+        return real_generate(source, api=FakeApi(), **kwargs)
+
+    def fake_download_generated(root, document, *, force_manifest=False, api=None, snapshot=None):
+        return real_download_generated(
+            root,
+            document,
+            force_manifest=force_manifest,
+            api=FakeApi(),
+            snapshot=writer,
+        )
+
+    monkeypatch.setattr(
+        download_queue_module, "generate_manifest_document", fake_generate
+    )
+    monkeypatch.setattr(
+        generation_module, "download_generated_manifest", fake_download_generated
+    )
+
+    first = tmp_path / "first.yaml"
+    first.write_text(
+        "downloads:\n"
+        "  - source: org/alpha\n"
+        "    name: alpha\n"
+        "  - source: org/beta\n"
+        "    name: beta\n"
+    )
+    assert run(["queue", str(first), "--root", str(tmp_path)]) == 0
+    capsys.readouterr()
+    assert {record["name"] for record in load_catalog(tmp_path)["models"]} == {
+        "alpha",
+        "beta",
+    }
+
+    # A process outside modelctl replaces alpha's active symlink with a copy;
+    # the next queue run must keep alpha available in the catalog and list.
+    alpha_reference = tmp_path / "active" / "alpha"
+    alpha_target = alpha_reference.resolve()
+    alpha_reference.unlink()
+    shutil.copytree(alpha_target, alpha_reference)
+    assert alpha_reference.is_dir() and not alpha_reference.is_symlink()
+
+    second = tmp_path / "second.yaml"
+    second.write_text("downloads:\n  - source: org/beta\n    name: beta\n")
+    assert run(["queue", str(second), "--root", str(tmp_path)]) == 0
+    capsys.readouterr()
+    assert {record["name"] for record in load_catalog(tmp_path)["models"]} == {
+        "alpha",
+        "beta",
+    }
+    assert run(["list", "--root", str(tmp_path), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert {item["name"] for item in payload} == {"alpha", "beta"}
 
 
 def test_list_local_uses_hf_cache(tmp_path, monkeypatch, capsys):

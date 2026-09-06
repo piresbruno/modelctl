@@ -1,4 +1,5 @@
 import json
+import shutil
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,9 @@ from modelctl.catalog import (
 )
 from modelctl.errors import ModelctlError
 from modelctl.layout import Layout
+from modelctl.manifest import parse_manifest
+from modelctl.operations import catalog_models, list_active_models
+from modelctl.validation import ExpectedFile, write_metadata
 
 
 def _model(name: str, repo: str = "org/model", runtime: str = "vllm", size: int = 1024):
@@ -86,7 +90,58 @@ def test_failed_refresh_preserves_previous_catalog_and_dirty_marker(
     assert catalog_status(tmp_path).status == "dirty"
 
 
-def test_catalog_reader_refuses_symlink(tmp_path):
+def test_refresh_keeps_repairable_directory_models(tmp_path):
+    """Regenerating the catalog must not drop a model whose active symlink was
+    replaced by a validated copy; doctor marks it repairable and repair-active
+    converges the reference."""
+    name = "demo"
+    layout = Layout(tmp_path)
+    layout.prepare()
+    manifest = parse_manifest({"repo": "org/demo", "runtime": "vllm"}, name)
+    commit = "a" * 40
+    object_path = layout.object_path(manifest, commit)
+    object_path.mkdir(parents=True)
+    (object_path / "config.json").write_bytes(b"{}")
+    write_metadata(
+        object_path, manifest, commit, [ExpectedFile("config.json", 2)], "."
+    )
+    (tmp_path / "manifests").mkdir(exist_ok=True)
+    (tmp_path / "manifests" / f"{name}.yaml").write_text(
+        "name: demo\nrepo: org/demo\nruntime: vllm\n"
+    )
+    layout.state_path(name).write_text(
+        json.dumps(
+            {
+                "operation": "update",
+                "state": "ACTIVE_ON_NAS",
+                "history": [
+                    {
+                        "state": "ACTIVE_ON_NAS",
+                        "at": "2026-01-01T00:00:00+00:00",
+                        "object": str(object_path),
+                        "commit": commit,
+                    }
+                ],
+            }
+        )
+    )
+    reference = layout.active_path(name)
+    shutil.copytree(object_path, reference)
+
+    assert list_active_models(tmp_path) == []
+    models, _ = refresh_catalog(tmp_path, catalog_models)
+    assert [model.name for model in models] == [name]
+    [record] = load_catalog(tmp_path)["models"]
+    assert {
+        key: value for key, value in record.items() if key != "bytes"
+    } == {"name": "demo", "runtime": "vllm", "repository": "org/demo"}
+    assert record["bytes"] > 0
+    # The catalog fingerprints the current active state, so it is ready even
+    # while the reference is a repairable directory; doctor flags the state.
+    assert catalog_status(tmp_path).status == "ready"
+
+
+def test_load_catalog_reader_refuses_symlink(tmp_path):
     target = tmp_path / "outside.json"
     target.write_text("{}")
     (tmp_path / "catalog.json").symlink_to(target)

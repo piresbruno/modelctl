@@ -24,6 +24,7 @@ from .hf_cache import (
     sync_cache,
 )
 from .hub import download_snapshot, estimate_snapshot, resolve_commit
+from .integrity import repair_reference_locked, repair_target
 from .layout import (
     Layout,
     assert_same_filesystem,
@@ -151,18 +152,47 @@ def _activate_reference(
     previous: Path | None = None
     if os.path.lexists(reference):
         if not reference.is_symlink():
-            error = f"active reference path is a {_reference_kind(reference)}: {reference}"
-            journal.transition(
-                UpdateState.FAILED_TO_ACTIVATE,
-                object=str(target),
-                reference=str(reference),
-                observed_type=_reference_kind(reference),
-                rollback="not-needed",
-                error=error,
-            )
-            raise ModelctlError(
-                f"{error}; run 'modelctl doctor' and 'modelctl repair-active'"
-            )
+            if reference.is_dir():
+                try:
+                    prior_target = repair_target(layout.root, name)
+                except (ModelctlError, ValidationError, OSError) as exc:
+                    error = (
+                        f"active reference path is a "
+                        f"{_reference_kind(reference)} that cannot be "
+                        f"auto-repaired: {reference}"
+                    )
+                    journal.transition(
+                        UpdateState.FAILED_TO_ACTIVATE,
+                        object=str(target),
+                        reference=str(reference),
+                        observed_type=_reference_kind(reference),
+                        rollback="not-needed",
+                        error=error,
+                    )
+                    raise ModelctlError(
+                        f"{error}; run 'modelctl doctor' and "
+                        "'modelctl repair-active'"
+                    ) from exc
+                # A process outside modelctl replaced the active symlink with
+                # a validated copy; restore the canonical symlink first so the
+                # update has a well-formed previous reference to roll back to.
+                repair_reference_locked(layout, name, prior_target)
+            else:
+                error = (
+                    f"active reference path is a {_reference_kind(reference)}: "
+                    f"{reference}"
+                )
+                journal.transition(
+                    UpdateState.FAILED_TO_ACTIVATE,
+                    object=str(target),
+                    reference=str(reference),
+                    observed_type=_reference_kind(reference),
+                    rollback="not-needed",
+                    error=error,
+                )
+                raise ModelctlError(
+                    f"{error}; run 'modelctl doctor' and 'modelctl repair-active'"
+                )
         previous, _ = _active_object(layout, name)
 
     try:
@@ -309,7 +339,7 @@ def update_model(
                 UpdateState.ACTIVE_ON_NAS, object=str(final), commit=commit
             )
             try:
-                refresh_catalog_locked(root, list_active_models)
+                refresh_catalog_locked(root, catalog_models)
             except ModelctlError as exc:
                 raise ModelctlError(
                     f"model {manifest.name!r} was activated, but {exc}"
@@ -346,6 +376,25 @@ def active_entrypoint(root: Path, name: str) -> Path:
     return path.resolve(strict=True)
 
 
+def _active_model_record(
+    layout: Layout, name: str, object_path: Path, metadata: dict[str, Any]
+) -> ActiveModel:
+    profile = runtime_from_metadata(metadata)
+    entrypoint = metadata["entrypoint"]
+    path = object_path if entrypoint == "." else object_path / entrypoint
+    return ActiveModel(
+        name=name,
+        repo=str(metadata.get("repo", "")),
+        revision=str(metadata.get("revision", "")),
+        commit=str(metadata.get("commit", "")),
+        format=str(metadata.get("format", "")),
+        runtime=profile.kind,
+        entrypoint=entrypoint,
+        path=path.resolve(strict=True),
+        size_bytes=_disk_usage(object_path),
+    )
+
+
 def list_active_models(root: Path) -> list[ActiveModel]:
     layout = Layout(root)
     if not layout.active.exists():
@@ -358,22 +407,43 @@ def list_active_models(root: Path) -> list[ActiveModel]:
             object_path, metadata = _active_object(layout, reference.name)
         except (ModelctlError, ValidationError, OSError):
             continue
-        profile = runtime_from_metadata(metadata)
-        entrypoint = metadata["entrypoint"]
-        path = object_path if entrypoint == "." else object_path / entrypoint
         models.append(
-            ActiveModel(
-                name=reference.name,
-                repo=str(metadata.get("repo", "")),
-                revision=str(metadata.get("revision", "")),
-                commit=str(metadata.get("commit", "")),
-                format=str(metadata.get("format", "")),
-                runtime=profile.kind,
-                entrypoint=entrypoint,
-                path=path.resolve(strict=True),
-                size_bytes=_disk_usage(object_path),
-            )
+            _active_model_record(layout, reference.name, object_path, metadata)
         )
+    return models
+
+
+def catalog_models(root: Path) -> list[ActiveModel]:
+    """Active-model records for catalog generation.
+
+    Like :func:`list_active_models`, but a validated regular directory at the
+    active reference (a copy that replaced the symlink outside modelctl) still
+    contributes a record. Regenerating the catalog therefore never drops a
+    model that 'modelctl doctor' marks repairable; the copied directory passes
+    the same evidence checks :func:`repair_target` uses."""
+    layout = Layout(root)
+    if not layout.active.exists():
+        return []
+    models = []
+    for reference in sorted(layout.active.iterdir(), key=lambda path: path.name):
+        name = reference.name
+        if name.startswith("."):
+            continue
+        if reference.is_symlink():
+            try:
+                object_path, metadata = _active_object(layout, name)
+            except (ModelctlError, ValidationError, OSError):
+                continue
+        elif reference.is_dir():
+            try:
+                repair_target(root, name)
+                metadata = validate_object(reference, expected_name=name)
+            except (ModelctlError, ValidationError, OSError):
+                continue
+            object_path = reference
+        else:
+            continue
+        models.append(_active_model_record(layout, name, object_path, metadata))
     return models
 
 
@@ -539,7 +609,7 @@ def delete_model(root: Path, name: str, *, apply: bool = False) -> DeleteResult:
         with catalog_lock(root):
             mark_catalog_dirty_locked(root, f"deleting {name}")
             try:
-                refresh_catalog_locked(root, list_active_models)
+                refresh_catalog_locked(root, catalog_models)
             except ModelctlError as exc:
                 raise ModelctlError(
                     f"model {name!r} was deactivated, but {exc}"
