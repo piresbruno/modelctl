@@ -186,7 +186,9 @@ def _store_records(root: Path) -> tuple[list[dict[str, Any]], list[str]]:
         if document["active_fingerprint"] == active_fingerprint(root):
             return list(document["models"]), []
         try:
-            models, _ = refresh_catalog(root, catalog_models, preserve_if_empty=True)
+            models, result = refresh_catalog(
+                root, catalog_models, preserve_if_empty=True
+            )
         except CatalogStaleViewError as exc:
             return list(document["models"]), [f"warning: {exc}"]
         except ModelctlError as exc:
@@ -195,9 +197,11 @@ def _store_records(root: Path) -> tuple[list[dict[str, Any]], list[str]]:
                 f"warning: live listing succeeded but catalog refresh failed: {exc}"
             ]
         else:
-            warnings = [
-                "warning: catalog was stale; regenerated from the live store"
-            ]
+            warnings = (
+                ["warning: catalog was stale; regenerated from the live store"]
+                if result.changed
+                else []
+            )
     malformed = malformed_active_references(root)
     malformed_warning = _malformed_warning(malformed, local=False)
     if malformed_warning:
@@ -464,7 +468,9 @@ store is genuinely empty.""",
         ),
     )
     catalog_refresh_command.add_argument(
-        "--force", action="store_true", help="allow an empty live view to overwrite a non-empty catalog"
+        "--force",
+        action="store_true",
+        help="allow an empty live view to overwrite a non-empty catalog",
     )
     catalog_refresh_command.add_argument(
         "--json", action="store_true", help="emit JSON"

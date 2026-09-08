@@ -84,6 +84,17 @@ def test_active_fingerprint_normalizes_symlink_rendering(tmp_path):
     assert active_fingerprint(tmp_path) != relative_fp
 
 
+def test_active_fingerprint_out_of_root_targets_use_raw_text(tmp_path):
+    layout = Layout(tmp_path)
+    layout.prepare()
+    raw = os.path.relpath("/dev/null", layout.active)
+    os.symlink(raw, layout.active_path("demo"))
+
+    entries = catalog._active_entries(tmp_path)
+
+    assert entries == [{"name": "demo", "kind": "object", "value": raw}]
+
+
 def test_refresh_preserve_if_empty_keeps_nonempty_catalog(tmp_path):
     refresh_catalog(tmp_path, lambda root: [_model("alpha")])
     document = load_catalog(tmp_path)

@@ -184,7 +184,12 @@ def project_models(models: Iterable[CatalogModel]) -> list[dict[str, Any]]:
     return projected
 
 
-def active_fingerprint(root: Path) -> str:
+def _active_entries(root: Path) -> list[dict[str, str]]:
+    """Canonical fingerprint entries for the active tree.
+
+    Symlink values are client-independent: resolvable in-store targets use the
+    store-relative object path, everything else uses the raw link text (the
+    bytes stored in the symlink), never a client-resolved absolute path."""
     active = Layout(root).active
     entries: list[dict[str, str]] = []
     if active.is_dir():
@@ -205,7 +210,7 @@ def active_fingerprint(root: Path) -> str:
                             try:
                                 value = resolved.relative_to(root).as_posix()
                             except ValueError:
-                                value = str(resolved)
+                                value = raw
                         else:
                             kind, value = "broken", raw
                 elif path.is_dir():
@@ -221,7 +226,11 @@ def active_fingerprint(root: Path) -> str:
                 kind = "error"
                 value = f"{type(exc).__name__}:{exc}"
             entries.append({"name": path.name, "kind": kind, "value": value})
-    return hashlib.sha256(_canonical_json(entries)).hexdigest()
+    return entries
+
+
+def active_fingerprint(root: Path) -> str:
+    return hashlib.sha256(_canonical_json(_active_entries(root))).hexdigest()
 
 
 @contextmanager
