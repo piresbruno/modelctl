@@ -2,6 +2,37 @@
 
 This project follows semantic versioning.
 
+## 0.20.0
+
+### Changed
+
+- Catalog is now write-exclusive to mutations and explicit refresh on stores
+  shared by several modelctl hosts. `modelctl list` never rewrites
+  `catalog.json`; it trusts the catalog only while `seq` matches the store's
+  mutation counter (`state/.catalog-seq`) and the active fingerprint matches
+  the client's live view, and otherwise falls back to a cheap live scan of
+  `active/` with a warning. A client with a degraded view of the shared store
+  (NFS/SMB caching, root squash, transient I/O errors) can therefore no longer
+  poison the catalog for every other client, and an interrupted mutation no
+  longer leaves every client stuck on a stale list behind the dirty marker.
+- Activation, deletion, and repair publish a per-mutation delta to the
+  catalog (schema 3) instead of rescanning the whole store under the global
+  lock: the mutator's own validated record is applied and sibling records
+  come from the stored projection, so catalog quality no longer depends on
+  the mutating client's view of other models. A delta that cannot see its own
+  change is refused with the dirty marker left in place; when the stored
+  catalog is more than one mutation behind, the delta falls back to a full
+  rescan. `catalog refresh` refuses to replace a non-empty catalog with an
+  empty live view unless `--force` is passed (unchanged from 0.19.0).
+- `delete` now removes the `active/NAME` reference under the catalog lock
+  with the dirty marker set first, closing the window in which other clients
+  could observe a mutated active tree with no staleness signal.
+- Store listings fall back to a metadata-only live scan (`scan_active_records`)
+  instead of revalidating every object's file content; deep validation remains
+  with publish-time checks, `doctor`, and `catalog refresh`. When a live scan
+  shows nothing while the catalog lists models, the listing keeps the last
+  known catalog with a degraded-view warning.
+
 ## 0.19.0
 
 ### Changed

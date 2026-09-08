@@ -13,7 +13,9 @@ from .catalog import (
     catalog_dirty,
     catalog_path,
     catalog_status,
+    catalog_token,
     load_catalog,
+    project_models,
     refresh_catalog,
 )
 from .config import load_local_root, load_root, save_local_root, save_root
@@ -34,7 +36,6 @@ from .generation import (
 from .integrity import (
     audit_active_references,
     cleanup_quarantine,
-    malformed_active_references,
     repair_active_reference,
 )
 from .hf_cache import malformed_cached_records, receive_staged_cache
@@ -51,9 +52,9 @@ from .operations import (
     catalog_models,
     delete_cached,
     delete_model,
-    list_active_models,
     list_cached_models,
     local_active_entrypoint,
+    scan_active_records,
     serve_cached_command,
     serve_command,
     sync_local,
@@ -159,62 +160,69 @@ def _print_table(rows: list[tuple[str, ...]], headers: tuple[str, ...]) -> None:
 
 
 def _store_records(root: Path) -> tuple[list[dict[str, Any]], list[str]]:
-    """Active-model records for store listings, fingerprint-checking the catalog.
+    """Active-model records for store listings. Read-only on the catalog.
 
-    Reads ROOT/catalog.json (one JSON parse) instead of scanning active
-    references. The catalog is trusted only while its fingerprint matches the
-    live active tree; a mismatching catalog is regenerated, and a non-empty
-    catalog is never replaced by an empty live view. A missing or invalid
-    catalog falls back to the live listing, which regenerates it."""
+    ``list`` never writes catalog.json: with several modelctl clients on one
+    NAS store, a client whose view of the store is degraded (NFS/SMB client
+    caching) must never rewrite the shared catalog from its own view. The
+    catalog is trusted only while it carries the store's current mutation
+    token and its fingerprint matches this client's live view; otherwise the
+    listing falls back to a cheap live scan with a warning. Only mutating
+    commands and 'modelctl catalog refresh' write the catalog."""
+    warnings: list[str] = []
+    records: list[dict[str, Any]] | None = None
+    document: dict[str, Any] | None = None
+    token = catalog_token(root)
     try:
         document = load_catalog(root)
-    except ModelctlError:
-        try:
-            models, _ = refresh_catalog(root, catalog_models)
-        except ModelctlError as exc:
-            models = list_active_models(root)
-            warnings = [
-                f"warning: live listing succeeded but catalog refresh failed: {exc}"
-            ]
-        else:
-            warnings = []
+    except ModelctlError as exc:
+        warnings.append(
+            f"warning: catalog is missing or invalid ({exc}); listing a live "
+            "scan of the store; run 'modelctl catalog refresh' to generate it"
+        )
     else:
         if catalog_dirty(root):
-            return list(document["models"]), [
-                "warning: catalog may be stale; run 'modelctl catalog refresh'"
-            ]
-        if document["active_fingerprint"] == active_fingerprint(root):
-            return list(document["models"]), []
-        try:
-            models, result = refresh_catalog(
-                root, catalog_models, preserve_if_empty=True
+            warnings.append(
+                "warning: catalog may be stale; listing a live scan of the "
+                "store; run 'modelctl catalog refresh' to rebuild it"
             )
-        except CatalogStaleViewError as exc:
-            return list(document["models"]), [f"warning: {exc}"]
-        except ModelctlError as exc:
-            models = list_active_models(root)
-            warnings = [
-                f"warning: live listing succeeded but catalog refresh failed: {exc}"
-            ]
+        elif document.get("seq") != token:
+            seq = document.get("seq")
+            if seq is None:
+                detail = "catalog predates mutation tracking"
+            elif token > seq:
+                detail = f"catalog is {token - seq} mutation(s) behind the store"
+            else:
+                detail = f"catalog seq {seq} is ahead of store seq {token}"
+            warnings.append(
+                f"warning: {detail}; listing a live scan of the store; run "
+                "'modelctl catalog refresh' to rebuild it"
+            )
+        elif document["active_fingerprint"] != active_fingerprint(root):
+            warnings.append(
+                "warning: catalog does not match the live active references; "
+                "listing a live scan of the store; run 'modelctl catalog "
+                "refresh' to rebuild it"
+            )
         else:
-            warnings = (
-                ["warning: catalog was stale; regenerated from the live store"]
-                if result.changed
-                else []
+            records = list(document["models"])
+    if records is None:
+        models, skipped = scan_active_records(root)
+        scanned = project_models(models)
+        known = list(document["models"]) if document is not None else None
+        if not scanned and known:
+            warnings.append(
+                f"warning: live scan of the store shows 0 active models but "
+                f"the catalog lists {len(known)}; keeping the last known "
+                "catalog for this listing; the store view on this client may "
+                "be degraded (NFS/SMB mount); run 'modelctl doctor'"
             )
-    malformed = malformed_active_references(root)
-    malformed_warning = _malformed_warning(malformed, local=False)
-    if malformed_warning:
-        warnings.append(malformed_warning)
-    records = [
-        {
-            "name": model.name,
-            "runtime": model.runtime,
-            "repository": model.repo,
-            "bytes": model.size_bytes,
-        }
-        for model in models
-    ]
+            records = known
+        else:
+            records = scanned
+            malformed_warning = _malformed_warning(skipped, local=False)
+            if malformed_warning:
+                warnings.append(malformed_warning)
     return records, warnings
 
 
@@ -424,11 +432,12 @@ Only active, validated models are listed. Published objects that are not active
 and incomplete staging downloads are excluded.
 
 Store listings read ROOT/catalog.json and include the on-disk size of each
-model. If the catalog is missing or invalid, the store is scanned live and the
-catalog is regenerated. A catalog that no longer matches the store is
-regenerated automatically from the live store. A non-empty catalog is never
-replaced by an empty live view; use 'modelctl catalog refresh --force' if the
-store is genuinely empty.""",
+model. Listings never rewrite the catalog: when it is missing, invalid,
+interrupted, or behind the store, the command falls back to a cheap live scan
+with a warning, so a client with a degraded view of a shared NAS store cannot
+corrupt the catalog for other clients. Run 'modelctl catalog refresh' to
+rebuild the catalog; it refuses to replace a non-empty catalog with an empty
+live view unless --force is passed.""",
     )
     list_location = list_models.add_mutually_exclusive_group()
     list_location.add_argument(

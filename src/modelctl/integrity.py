@@ -10,9 +10,11 @@ from typing import Any
 from uuid import uuid4
 
 from .catalog import (
+    bump_catalog_token_locked,
     catalog_lock,
+    commit_catalog_delta_locked,
     mark_catalog_dirty_locked,
-    refresh_catalog_locked,
+    project_models,
 )
 from .errors import ModelctlError, ValidationError
 from .layout import Layout, atomic_symlink, model_lock, verify_symlink
@@ -335,9 +337,14 @@ def repair_active_reference(root: Path, name: str, *, apply: bool = False) -> Re
             mark_catalog_dirty_locked(root, f"repairing {name}")
             result = repair_reference_locked(layout, name, target)
             try:
-                from .operations import catalog_models
+                from .operations import _active_model_record, catalog_models
 
-                refresh_catalog_locked(root, catalog_models)
+                metadata = validate_object(target, expected_name=name)
+                record = project_models(
+                    [_active_model_record(layout, name, target, metadata)]
+                )[0]
+                bump_catalog_token_locked(root)
+                commit_catalog_delta_locked(root, catalog_models, upsert=record)
             except ModelctlError as exc:
                 raise ModelctlError(
                     f"active reference {name!r} was repaired, but {exc}"

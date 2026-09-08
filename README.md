@@ -679,11 +679,13 @@ listings contain only validated modelctl cache registrations. Human NAS
 listings warn when malformed active references were skipped (live scans only).
 
 NAS store listings read `ROOT/catalog.json` directly, so they are fast and do
-not scan the store. If the catalog is missing or invalid, the store is scanned
-live and the catalog is regenerated. A dirty catalog is listed with a warning;
-run `modelctl catalog refresh` to rebuild it. A catalog whose active
-fingerprint no longer matches the store is regenerated automatically from the
-live store.
+not scan the store. Listings never rewrite the catalog: when it is missing,
+invalid, interrupted (dirty marker), behind the store's mutation counter, or
+out of sync with this client's live view, the command falls back to a cheap
+live scan of `active/` with a warning on stderr. This keeps every client's
+listing truthful without letting a client with a degraded view of a shared
+store rewrite the catalog for everyone; run `modelctl catalog refresh` to
+rebuild the shared file.
 
 ### Generated model catalog
 
@@ -693,11 +695,12 @@ the same sorted projection emitted by `modelctl list --json`:
 
 ```json
 {
-  "schema": 2,
+  "schema": 3,
   "generation": 42,
   "generated_at": "2026-08-11T21:00:00+00:00",
   "active_fingerprint": "...",
   "content_sha256": "...",
+  "seq": 17,
   "models": [
     {"name": "demo", "runtime": "vllm", "repository": "org/model", "bytes": 8732166144}
   ]
@@ -708,21 +711,30 @@ the same sorted projection emitted by `modelctl list --json`:
 (`du`-style; file sizes are summed from block counts, falling back to file
 sizes when a filesystem reports zero blocks).
 
-Successful activation and active-reference repair refresh the complete catalog
-under a global catalog lock. `modelctl list` reads the catalog directly instead
-of scanning; it detects interrupted refreshes through the dirty marker, and it
-detects out-of-band changes to `active/` through the stored active fingerprint,
-regenerating the catalog when they diverge. With concurrent modelctl clients on
-one store, a client whose view of the store is degraded (for example an SMB
-mount that cannot decode the store's symlinks) cannot overwrite a non-empty
-catalog with its empty view: the refresh is refused with a warning, and
-`catalog refresh --force` overrides the guard for a genuinely empty store. A
-validated regular directory at an active reference (a copy that replaced the
-symlink outside modelctl) still contributes a record during regeneration, so
-rebuilding the catalog never hides a model that `doctor` can repair. Active
-symlinks and validated objects remain authoritative; do not edit
-`catalog.json` manually and do not use it for safety-sensitive path resolution.
-Local `list --local` registrations are not included.
+`seq` is the store's mutation counter. Every committed change to `active/`
+(activation, deletion, repair) bumps `state/.catalog-seq` under the global
+catalog lock and then publishes a delta to the catalog: the changed model's
+own record, taken from the object the mutation just validated, while sibling
+records come from the stored projection rather than from the mutating
+client's view of the store. If a delta write fails, the dirty marker remains
+and the counter advances without the catalog; the next mutation detects the
+gap and rebuilds the catalog from a full scan, and `modelctl catalog refresh`
+does the same explicitly. `catalog refresh --force` still allows a genuinely
+empty store to replace a non-empty catalog.
+
+`modelctl list` is a pure reader. It trusts the catalog only while `seq`
+matches the store's counter and the stored active fingerprint matches the
+client's live view; otherwise it lists a live scan of `active/` with a
+warning on stderr. A client whose view of the store is degraded (for example
+an SMB mount that cannot decode the store's symlinks) therefore cannot
+overwrite the shared catalog with a partial or empty view, and an interrupted
+mutation can no longer leave every client stuck on a stale list. A validated
+regular directory at an active reference (a copy that replaced the symlink
+outside modelctl) still contributes a record during a rescan, so rebuilding
+the catalog never hides a model that `doctor` can repair. Active symlinks and
+validated objects remain authoritative; do not edit `catalog.json` manually
+and do not use it for safety-sensitive path resolution. Local `list --local`
+registrations are not included.
 
 Inspect, rebuild, or locate the catalog explicitly:
 
@@ -734,9 +746,11 @@ jq -r '.models[].name' /mnt/nas/llm-models/catalog.json
 ```
 
 Catalog writes use a temporary file, file and directory `fsync`, and atomic
-replacement. The file is not rewritten when its model projection and active
-fingerprint are unchanged. A failed refresh preserves the previous valid file
-and leaves a dirty marker for `catalog status` and the next refresh.
+replacement. The file is not rewritten when its model projection, active
+fingerprint, and mutation counter are unchanged. A failed delta or refresh
+preserves the previous valid file, leaves the dirty marker in place, and
+advances the mutation counter so every client falls back to a live scan until
+the catalog is rebuilt.
 
 Audit every active-store entry without modifying the store:
 

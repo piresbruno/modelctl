@@ -15,7 +15,7 @@ from uuid import uuid4
 from .errors import CatalogStaleViewError, ModelctlError
 from .layout import Layout
 
-CATALOG_SCHEMA = 2
+CATALOG_SCHEMA = 3
 CATALOG_FILE = "catalog.json"
 
 
@@ -67,6 +67,10 @@ def _status_path(layout: Layout) -> Path:
 
 def _dirty_path(layout: Layout) -> Path:
     return layout.state / ".catalog-dirty"
+
+
+def _token_path(layout: Layout) -> Path:
+    return layout.state / ".catalog-seq"
 
 
 def _lock_path(layout: Layout) -> Path:
@@ -126,12 +130,13 @@ def _read_json_no_follow(path: Path) -> dict[str, Any]:
 
 
 def _validate_document(path: Path, document: dict[str, Any]) -> dict[str, Any]:
-    if document.get("schema") != CATALOG_SCHEMA:
+    if document.get("schema") not in (2, CATALOG_SCHEMA):
         raise ModelctlError(f"unsupported catalog schema at {path}")
     generation = document.get("generation")
     generated_at = document.get("generated_at")
     fingerprint = document.get("active_fingerprint")
     digest = document.get("content_sha256")
+    seq = document.get("seq")
     models = document.get("models")
     if not isinstance(generation, int) or generation < 1:
         raise ModelctlError(f"catalog has an invalid generation at {path}")
@@ -141,6 +146,10 @@ def _validate_document(path: Path, document: dict[str, Any]) -> dict[str, Any]:
         raise ModelctlError(f"catalog has an invalid active fingerprint at {path}")
     if not isinstance(digest, str) or len(digest) != 64:
         raise ModelctlError(f"catalog has an invalid content hash at {path}")
+    if document["schema"] >= 3 and (
+        not isinstance(seq, int) or isinstance(seq, bool) or seq < 0
+    ):
+        raise ModelctlError(f"catalog has an invalid mutation token at {path}")
     if not isinstance(models, list):
         raise ModelctlError(f"catalog models must be a list at {path}")
     string_keys = {"name", "runtime", "repository"}
@@ -260,6 +269,92 @@ def _write_status(layout: Layout, status: str, **details: Any) -> None:
     )
 
 
+def catalog_token(root: Path) -> int:
+    """Monotonic store mutation counter used for catalog invalidation.
+
+    Every committed change to ``active/`` bumps the token under the catalog
+    lock immediately after the change and before the matching catalog delta.
+    Readers compare the token with the ``seq`` stamped in catalog.json; the
+    token file is opened fresh on every read (close-to-open consistency), so
+    a client whose directory view is stale still observes committed
+    mutations. A missing or unreadable token file reads as 0."""
+    try:
+        document = _read_json_no_follow(_token_path(Layout(root)))
+    except ModelctlError:
+        return 0
+    seq = document.get("seq")
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+        return 0
+    return seq
+
+
+def bump_catalog_token_locked(root: Path) -> int:
+    """Advance the mutation counter; the caller must hold catalog_lock."""
+    token = catalog_token(root) + 1
+    _atomic_json(
+        _token_path(Layout(root)),
+        {"schema": CATALOG_SCHEMA, "seq": token},
+    )
+    return token
+
+
+def _load_previous_catalog(
+    root: Path, path: Path
+) -> dict[str, Any] | None:
+    if not os.path.lexists(path):
+        return None
+    try:
+        return load_catalog(root)
+    except ModelctlError:
+        return None
+
+
+def _next_generation(previous: dict[str, Any] | None, unchanged: bool) -> int:
+    if previous is None:
+        return 1
+    return (
+        int(previous["generation"])
+        if unchanged
+        else int(previous["generation"]) + 1
+    )
+
+
+def _publish_catalog_document_locked(
+    layout: Layout, path: Path, document: dict[str, Any]
+) -> None:
+    try:
+        _atomic_json(path, document)
+    except (ModelctlError, OSError) as exc:
+        status_error: str | None = None
+        try:
+            _write_status(
+                layout,
+                "stale",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        except (ModelctlError, OSError) as state_exc:
+            status_error = f"; status update also failed: {state_exc}"
+        raise ModelctlError(
+            f"failed to refresh model catalog at {path}: {exc}{status_error or ''}"
+        ) from exc
+
+
+def _finalize_ready_locked(
+    layout: Layout, generation: int, count: int, changed: bool
+) -> None:
+    try:
+        _write_status(
+            layout,
+            "ready",
+            generation=generation,
+            models=count,
+            changed=changed,
+        )
+        _dirty_path(layout).unlink(missing_ok=True)
+    except OSError as exc:
+        raise ModelctlError(f"failed to finalize model catalog state: {exc}") from exc
+
+
 def _refresh_catalog_locked(
     root: Path,
     loader: Callable[[Path], list[ModelT]],
@@ -273,12 +368,8 @@ def _refresh_catalog_locked(
     projected = project_models(models)
     fingerprint = active_fingerprint(root)
     digest = _content_hash(projected)
-    previous: dict[str, Any] | None = None
-    if os.path.lexists(path):
-        try:
-            previous = load_catalog(root)
-        except ModelctlError:
-            previous = None
+    token = catalog_token(root)
+    previous = _load_previous_catalog(root, path)
     if (
         preserve_if_empty
         and not projected
@@ -293,51 +384,119 @@ def _refresh_catalog_locked(
         )
     unchanged = (
         previous is not None
+        and previous.get("seq") == token
         and previous["content_sha256"] == digest
         and previous["active_fingerprint"] == fingerprint
         and previous["models"] == projected
     )
-    generation = (
-        int(previous["generation"])
-        if unchanged
-        else (int(previous["generation"]) + 1 if previous is not None else 1)
-    )
+    generation = _next_generation(previous, unchanged)
     if not unchanged:
-        document = {
-            "schema": CATALOG_SCHEMA,
-            "generation": generation,
-            "generated_at": _utc_now(),
-            "active_fingerprint": fingerprint,
-            "content_sha256": digest,
-            "models": projected,
-        }
-        try:
-            _atomic_json(path, document)
-        except (ModelctlError, OSError) as exc:
-            status_error: str | None = None
-            try:
-                _write_status(
-                    layout,
-                    "stale",
-                    error=f"{type(exc).__name__}: {exc}",
-                )
-            except (ModelctlError, OSError) as state_exc:
-                status_error = f"; status update also failed: {state_exc}"
-            raise ModelctlError(
-                f"failed to refresh model catalog at {path}: {exc}{status_error or ''}"
-            ) from exc
-    try:
-        _write_status(
+        _publish_catalog_document_locked(
             layout,
-            "ready",
-            generation=generation,
-            models=len(projected),
-            changed=not unchanged,
+            path,
+            {
+                "schema": CATALOG_SCHEMA,
+                "generation": generation,
+                "generated_at": _utc_now(),
+                "active_fingerprint": fingerprint,
+                "content_sha256": digest,
+                "seq": token,
+                "models": projected,
+            },
         )
-        _dirty_path(layout).unlink(missing_ok=True)
-    except OSError as exc:
-        raise ModelctlError(f"failed to finalize model catalog state: {exc}") from exc
+    _finalize_ready_locked(layout, generation, len(projected), not unchanged)
     return models, CatalogRefresh(path, not unchanged, generation, projected)
+
+
+def commit_catalog_delta_locked(
+    root: Path,
+    loader: Callable[[Path], list[ModelT]],
+    *,
+    upsert: dict[str, Any] | None = None,
+    remove: str | None = None,
+) -> CatalogRefresh:
+    """Commit one mutation's catalog delta; the caller holds catalog_lock.
+
+    The caller bumps the mutation token after changing ``active/`` and before
+    calling this, so on the happy path the stored catalog is exactly one
+    token behind and the delta applies to its stored projection directly —
+    the mutator's own record was validated by the mutation itself, and the
+    sibling records come from the stored catalog, never from this client's
+    view of other models. When the stored catalog is further behind (a
+    previous mutation's delta write failed) or missing, the whole store is
+    rescanned, and then the mutator's own change must be observable in the
+    result: a store view that cannot see a freshly activated model, or that
+    still shows a freshly deleted one, is degraded (NFS/SMB caching), and
+    the write is refused with the dirty marker left in place so every client
+    falls back to its own live scan instead of trusting a poisoned catalog."""
+    layout = Layout(root)
+    layout.prepare()
+    path = catalog_path(root)
+    token = catalog_token(root)
+    previous = _load_previous_catalog(root, path)
+    if (
+        (upsert is not None or remove is not None)
+        and previous is not None
+        and token >= 1
+        and previous.get("seq") == token - 1
+    ):
+        projected = [
+            item
+            for item in previous["models"]
+            if not (remove is not None and item["name"] == remove)
+        ]
+        if upsert is not None:
+            projected = [
+                item for item in projected if item["name"] != upsert["name"]
+            ]
+            projected.append(dict(upsert))
+        projected.sort(key=lambda item: item["name"])
+    else:
+        projected = project_models(loader(root))
+        if upsert is not None and not any(
+            item["name"] == upsert["name"] for item in projected
+        ):
+            mark_catalog_dirty_locked(root, "catalog delta refused")
+            raise ModelctlError(
+                f"activated model {upsert['name']!r} is not visible in this "
+                "client's store view; refusing to write the catalog; the "
+                "view may be degraded (NFS/SMB mount); run 'modelctl doctor'"
+            )
+        if remove is not None and any(
+            item["name"] == remove for item in projected
+        ):
+            mark_catalog_dirty_locked(root, "catalog delta refused")
+            raise ModelctlError(
+                f"deleted model {remove!r} is still visible in this "
+                "client's store view; refusing to write the catalog; the "
+                "view may be degraded (NFS/SMB mount); run 'modelctl doctor'"
+            )
+    fingerprint = active_fingerprint(root)
+    digest = _content_hash(projected)
+    unchanged = (
+        previous is not None
+        and previous.get("seq") == token
+        and previous["content_sha256"] == digest
+        and previous["active_fingerprint"] == fingerprint
+        and previous["models"] == projected
+    )
+    generation = _next_generation(previous, unchanged)
+    if not unchanged:
+        _publish_catalog_document_locked(
+            layout,
+            path,
+            {
+                "schema": CATALOG_SCHEMA,
+                "generation": generation,
+                "generated_at": _utc_now(),
+                "active_fingerprint": fingerprint,
+                "content_sha256": digest,
+                "seq": token,
+                "models": projected,
+            },
+        )
+    _finalize_ready_locked(layout, generation, len(projected), not unchanged)
+    return CatalogRefresh(path, not unchanged, generation, projected)
 
 
 def refresh_catalog(
@@ -377,7 +536,8 @@ def catalog_status(root: Path) -> CatalogStatus:
         document = load_catalog(root)
     except ModelctlError as exc:
         return CatalogStatus(path, "invalid", str(exc), dirty=dirty)
-    current = active_fingerprint(root)
+    token = catalog_token(root)
+    catalog_seq = document.get("seq")
     if dirty:
         return CatalogStatus(
             path,
@@ -387,7 +547,26 @@ def catalog_status(root: Path) -> CatalogStatus:
             len(document["models"]),
             True,
         )
-    if document["active_fingerprint"] != current:
+    if catalog_seq != token:
+        if catalog_seq is None:
+            detail = "catalog predates mutation tracking; run 'modelctl catalog refresh'"
+        elif token > catalog_seq:
+            detail = (
+                f"catalog is {token - catalog_seq} mutation(s) behind the "
+                f"store (catalog seq {catalog_seq}, store seq {token})"
+            )
+        else:
+            detail = (
+                f"catalog seq {catalog_seq} is ahead of store seq {token}"
+            )
+        return CatalogStatus(
+            path,
+            "stale",
+            detail,
+            int(document["generation"]),
+            len(document["models"]),
+        )
+    if document["active_fingerprint"] != active_fingerprint(root):
         return CatalogStatus(
             path,
             "stale",

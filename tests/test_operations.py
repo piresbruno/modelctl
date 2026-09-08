@@ -1029,10 +1029,10 @@ def test_delete_catalog_failure_retains_delete_journal_evidence(tmp_path, monkey
 
     import modelctl.operations as operations_module
 
-    def fail_refresh(root, listing):
+    def fail_delta(root, listing, **kwargs):
         raise ModelctlError("catalog boom")
 
-    monkeypatch.setattr(operations_module, "refresh_catalog_locked", fail_refresh)
+    monkeypatch.setattr(operations_module, "commit_catalog_delta_locked", fail_delta)
     with pytest.raises(ModelctlError, match="was deactivated.*catalog boom"):
         delete_model(tmp_path, "demo", apply=True)
 

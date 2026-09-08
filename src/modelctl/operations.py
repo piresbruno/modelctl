@@ -9,9 +9,11 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 from .catalog import (
+    bump_catalog_token_locked,
     catalog_lock,
+    commit_catalog_delta_locked,
     mark_catalog_dirty_locked,
-    refresh_catalog_locked,
+    project_models,
 )
 from .errors import ModelctlError, ValidationError
 from .generation import parse_hf_source
@@ -41,6 +43,7 @@ from .maintenance import (
 from .manifest import ModelManifest, validate_name
 from .state import DeleteState, StateJournal, UpdateState
 from .validation import (
+    read_metadata,
     resolve_entrypoint,
     runtime_from_metadata,
     validate_artifacts,
@@ -339,14 +342,18 @@ def update_model(
                 UpdateState.ACTIVE_ON_NAS, object=str(final), commit=commit
             )
             try:
-                refresh_catalog_locked(root, catalog_models)
+                bump_catalog_token_locked(root)
+                metadata = validate_object(
+                    final, expected_commit=commit, expected_name=manifest.name
+                )
+                record = project_models(
+                    [_active_model_record(layout, manifest.name, final, metadata)]
+                )[0]
+                commit_catalog_delta_locked(root, catalog_models, upsert=record)
             except ModelctlError as exc:
                 raise ModelctlError(
                     f"model {manifest.name!r} was activated, but {exc}"
                 ) from exc
-        metadata = validate_object(
-            final, expected_commit=commit, expected_name=manifest.name
-        )
         entrypoint = metadata["entrypoint"]
         return (final if entrypoint == "." else final / entrypoint).resolve(strict=True)
 
@@ -445,6 +452,58 @@ def catalog_models(root: Path) -> list[ActiveModel]:
             continue
         models.append(_active_model_record(layout, name, object_path, metadata))
     return models
+
+
+def _active_metadata(
+    layout: Layout, name: str, reference: Path
+) -> tuple[Path, dict[str, Any]]:
+    """Resolve an active reference to its object and metadata without
+    revalidating object file content; publish-time validation and
+    'modelctl doctor' remain the deep checks."""
+    if not reference.is_symlink():
+        raise ModelctlError(f"model {name!r} has no active reference at {reference}")
+    try:
+        object_path = reference.resolve(strict=True)
+        object_path.relative_to(layout.models.resolve(strict=True))
+    except (OSError, ValueError) as exc:
+        raise ModelctlError(
+            f"active reference for {name!r} does not point into {layout.models}"
+        ) from exc
+    if not object_path.is_dir():
+        raise ModelctlError(f"active object for {name!r} is not a directory")
+    return object_path, read_metadata(object_path)
+
+
+def scan_active_records(root: Path) -> tuple[list[ActiveModel], list[str]]:
+    """Cheap live scan of active references for listings.
+
+    Reads each reference's object metadata without revalidating object file
+    content, and returns the records plus the names of entries that had to
+    be skipped. Listing fallbacks use this so a degraded client view of a
+    shared store never rewrites the shared catalog."""
+    layout = Layout(root)
+    if not layout.active.exists():
+        return [], []
+    models: list[ActiveModel] = []
+    skipped: list[str] = []
+    for reference in sorted(layout.active.iterdir(), key=lambda path: path.name):
+        name = reference.name
+        if name.startswith("."):
+            continue
+        try:
+            if reference.is_symlink():
+                object_path, metadata = _active_metadata(layout, name, reference)
+            elif reference.is_dir():
+                object_path = reference
+                metadata = read_metadata(reference)
+            else:
+                skipped.append(name)
+                continue
+            models.append(_active_model_record(layout, name, object_path, metadata))
+        except (ModelctlError, OSError):
+            skipped.append(name)
+            continue
+    return models, skipped
 
 
 def delete_local(
@@ -598,18 +657,18 @@ def delete_model(root: Path, name: str, *, apply: bool = False) -> DeleteResult:
             objects=len(plan[2]),
         )
 
-        reference.unlink()
-        _fsync_directory(layout.active)
-        journal.transition(
-            DeleteState.REFERENCE_REMOVED,
-            reference=str(reference),
-            object=str(object_path),
-        )
-
         with catalog_lock(root):
             mark_catalog_dirty_locked(root, f"deleting {name}")
+            reference.unlink()
+            _fsync_directory(layout.active)
+            journal.transition(
+                DeleteState.REFERENCE_REMOVED,
+                reference=str(reference),
+                object=str(object_path),
+            )
             try:
-                refresh_catalog_locked(root, catalog_models)
+                bump_catalog_token_locked(root)
+                commit_catalog_delta_locked(root, catalog_models, remove=name)
             except ModelctlError as exc:
                 raise ModelctlError(
                     f"model {name!r} was deactivated, but {exc}"

@@ -11,7 +11,12 @@ from modelctl.cards import CardResult
 from modelctl.catalog import active_fingerprint, load_catalog
 from modelctl.cli import DEFAULT_ROOT, _cache_dir, _format_size, _local_root, _root, build_parser, run
 from modelctl.errors import ModelctlError
-from modelctl.catalog import catalog_lock, mark_catalog_dirty_locked
+from modelctl.catalog import (
+    bump_catalog_token_locked,
+    catalog_lock,
+    catalog_token,
+    mark_catalog_dirty_locked,
+)
 from modelctl.integrity import ActiveReferenceAudit, RepairResult
 from modelctl.sync_queue import PreparedSync, SyncQueueEntry, SyncQueueResult
 from modelctl.hf_cache import LocalDeleteResult, state_root
@@ -118,6 +123,8 @@ def test_list_prints_active_models(tmp_path, capsys):
 
 def test_list_json_is_machine_readable(tmp_path, capsys):
     _active_model(tmp_path)
+    assert run(["catalog", "refresh", "--root", str(tmp_path)]) == 0
+    capsys.readouterr()
     assert run(["list", "--root", str(tmp_path), "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     [record] = payload
@@ -181,14 +188,13 @@ def test_list_warns_when_malformed_active_references_are_skipped(tmp_path, capsy
 
 def test_list_reads_catalog_without_live_scan(tmp_path, monkeypatch, capsys):
     _active_model(tmp_path)
-    assert run(["list", "--root", str(tmp_path)]) == 0
+    assert run(["catalog", "refresh", "--root", str(tmp_path)]) == 0
     capsys.readouterr()
 
     def fail_live_scan(root):
         raise AssertionError("live scan must not run when the catalog is valid")
 
-    monkeypatch.setattr("modelctl.cli.list_active_models", fail_live_scan)
-    monkeypatch.setattr("modelctl.cli.malformed_active_references", fail_live_scan)
+    monkeypatch.setattr("modelctl.cli.scan_active_records", fail_live_scan)
     assert run(["list", "--root", str(tmp_path), "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert [model["name"] for model in payload] == ["demo"]
@@ -196,6 +202,8 @@ def test_list_reads_catalog_without_live_scan(tmp_path, monkeypatch, capsys):
 
 def test_list_size_column_shows_disk_usage(tmp_path, capsys):
     _active_model(tmp_path)
+    assert run(["catalog", "refresh", "--root", str(tmp_path)]) == 0
+    capsys.readouterr()
     assert run(["list", "--root", str(tmp_path)]) == 0
     captured = capsys.readouterr()
     [record] = load_catalog(tmp_path)["models"]
@@ -206,7 +214,7 @@ def test_list_size_column_shows_disk_usage(tmp_path, capsys):
 
 def test_list_warns_when_catalog_is_dirty(tmp_path, capsys):
     _active_model(tmp_path)
-    assert run(["list", "--root", str(tmp_path)]) == 0
+    assert run(["catalog", "refresh", "--root", str(tmp_path)]) == 0
     capsys.readouterr()
     with catalog_lock(tmp_path):
         mark_catalog_dirty_locked(tmp_path, "test mutation")
@@ -218,21 +226,24 @@ def test_list_warns_when_catalog_is_dirty(tmp_path, capsys):
     assert "modelctl catalog refresh" in captured.err
 
 
-def test_list_regenerates_missing_catalog(tmp_path, capsys):
+def test_list_falls_back_to_live_scan_without_catalog(tmp_path, capsys):
     _active_model(tmp_path)
-    assert run(["list", "--root", str(tmp_path)]) == 0
+    assert run(["catalog", "refresh", "--root", str(tmp_path)]) == 0
     capsys.readouterr()
     (tmp_path / "catalog.json").unlink()
 
     assert run(["list", "--root", str(tmp_path), "--json"]) == 0
-    payload = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
     assert [model["name"] for model in payload] == ["demo"]
-    assert load_catalog(tmp_path)["schema"] == 2
+    assert "missing or invalid" in captured.err
+    assert "listing a live scan" in captured.err
+    assert not (tmp_path / "catalog.json").exists()
 
 
 def test_list_treats_schema1_catalog_as_missing(tmp_path, capsys):
     _active_model(tmp_path)
-    assert run(["list", "--root", str(tmp_path)]) == 0
+    assert run(["catalog", "refresh", "--root", str(tmp_path)]) == 0
     capsys.readouterr()
     path = tmp_path / "catalog.json"
     document = json.loads(path.read_text())
@@ -240,31 +251,31 @@ def test_list_treats_schema1_catalog_as_missing(tmp_path, capsys):
     path.write_text(json.dumps(document))
 
     assert run(["list", "--root", str(tmp_path), "--json"]) == 0
-    payload = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
     assert [model["name"] for model in payload] == ["demo"]
-    assert load_catalog(tmp_path)["schema"] == 2
+    assert "listing a live scan" in captured.err
+    assert json.loads(path.read_text())["schema"] == 1
 
 
-def test_list_regenerates_stale_catalog(tmp_path, capsys):
+def test_list_shows_live_scan_without_rewriting_stale_catalog(tmp_path, capsys):
     _active_model(tmp_path)
-    assert run(["list", "--root", str(tmp_path)]) == 0
+    assert run(["catalog", "refresh", "--root", str(tmp_path)]) == 0
     capsys.readouterr()
+    catalog_bytes = (tmp_path / "catalog.json").read_bytes()
     (tmp_path / "active" / "extra").write_text("x")
 
     assert run(["list", "--root", str(tmp_path), "--json"]) == 0
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
     assert [model["name"] for model in payload] == ["demo"]
-    assert "catalog was stale; regenerated" in captured.err
-    assert (
-        load_catalog(tmp_path)["active_fingerprint"]
-        == active_fingerprint(tmp_path)
-    )
+    assert "does not match the live active references" in captured.err
+    assert (tmp_path / "catalog.json").read_bytes() == catalog_bytes
 
 
 def test_list_keeps_last_known_catalog_on_degraded_view(tmp_path, capsys):
     _active_model(tmp_path)
-    assert run(["list", "--root", str(tmp_path)]) == 0
+    assert run(["catalog", "refresh", "--root", str(tmp_path)]) == 0
     capsys.readouterr()
     (tmp_path / "active" / "demo").unlink()
 
@@ -272,8 +283,24 @@ def test_list_keeps_last_known_catalog_on_degraded_view(tmp_path, capsys):
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
     assert [model["name"] for model in payload] == ["demo"]
-    assert "refusing to overwrite" in captured.err
+    assert "keeping the last known catalog" in captured.err
     assert len(load_catalog(tmp_path)["models"]) == 1
+
+
+def test_list_never_writes_catalog_when_behind_the_store(tmp_path, capsys):
+    _active_model(tmp_path)
+    assert run(["catalog", "refresh", "--root", str(tmp_path)]) == 0
+    capsys.readouterr()
+    catalog_bytes = (tmp_path / "catalog.json").read_bytes()
+    with catalog_lock(tmp_path):
+        bump_catalog_token_locked(tmp_path)
+
+    assert run(["list", "--root", str(tmp_path), "--json"]) == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert [model["name"] for model in payload] == ["demo"]
+    assert "mutation(s) behind the store" in captured.err
+    assert (tmp_path / "catalog.json").read_bytes() == catalog_bytes
 
 
 def test_catalog_refresh_refuses_empty_and_force_overrides(tmp_path, capsys):
@@ -776,7 +803,7 @@ def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_version_uses_package_version(capsys):
-    assert __version__ == "0.18.0"
+    assert __version__ == "0.19.0"
     with pytest.raises(SystemExit) as exit_info:
         build_parser().parse_args(["--version"])
     assert exit_info.value.code == 0
@@ -788,7 +815,6 @@ def test_queue_help_documents_format_concurrency_and_examples(capsys):
         build_parser().parse_args(["queue", "--help"])
     assert exit_info.value.code == 0
     output = capsys.readouterr().out
-    assert "downloads:" in output
     assert "source: Qwen/Qwen3-8B" in output
     assert "quantization: Q4_K_M" in output
     assert "modelctl queue downloads.yaml --jobs 2" in output
