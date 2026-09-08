@@ -681,7 +681,9 @@ listings warn when malformed active references were skipped (live scans only).
 NAS store listings read `ROOT/catalog.json` directly, so they are fast and do
 not scan the store. If the catalog is missing or invalid, the store is scanned
 live and the catalog is regenerated. A dirty catalog is listed with a warning;
-run `modelctl catalog refresh` to rebuild it.
+run `modelctl catalog refresh` to rebuild it. A catalog whose active
+fingerprint no longer matches the store is regenerated automatically from the
+live store.
 
 ### Generated model catalog
 
@@ -708,12 +710,16 @@ sizes when a filesystem reports zero blocks).
 
 Successful activation and active-reference repair refresh the complete catalog
 under a global catalog lock. `modelctl list` reads the catalog directly instead
-of scanning; it detects interrupted refreshes through the dirty marker but does
-not detect out-of-band changes to `active/` on its fast path. Run
-`modelctl catalog refresh` to rebuild the catalog from the store. A validated
-regular directory at an active reference (a copy that replaced the symlink
-outside modelctl) still contributes a record during regeneration, so rebuilding
-the catalog never hides a model that `doctor` can repair. Active
+of scanning; it detects interrupted refreshes through the dirty marker, and it
+detects out-of-band changes to `active/` through the stored active fingerprint,
+regenerating the catalog when they diverge. With concurrent modelctl clients on
+one store, a client whose view of the store is degraded (for example an SMB
+mount that cannot decode the store's symlinks) cannot overwrite a non-empty
+catalog with its empty view: the refresh is refused with a warning, and
+`catalog refresh --force` overrides the guard for a genuinely empty store. A
+validated regular directory at an active reference (a copy that replaced the
+symlink outside modelctl) still contributes a record during regeneration, so
+rebuilding the catalog never hides a model that `doctor` can repair. Active
 symlinks and validated objects remain authoritative; do not edit
 `catalog.json` manually and do not use it for safety-sensitive path resolution.
 Local `list --local` registrations are not included.

@@ -8,7 +8,7 @@ import pytest
 
 from modelctl import __version__
 from modelctl.cards import CardResult
-from modelctl.catalog import load_catalog
+from modelctl.catalog import active_fingerprint, load_catalog
 from modelctl.cli import DEFAULT_ROOT, _cache_dir, _format_size, _local_root, _root, build_parser, run
 from modelctl.errors import ModelctlError
 from modelctl.catalog import catalog_lock, mark_catalog_dirty_locked
@@ -243,6 +243,54 @@ def test_list_treats_schema1_catalog_as_missing(tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert [model["name"] for model in payload] == ["demo"]
     assert load_catalog(tmp_path)["schema"] == 2
+
+
+def test_list_regenerates_stale_catalog(tmp_path, capsys):
+    _active_model(tmp_path)
+    assert run(["list", "--root", str(tmp_path)]) == 0
+    capsys.readouterr()
+    (tmp_path / "active" / "extra").write_text("x")
+
+    assert run(["list", "--root", str(tmp_path), "--json"]) == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert [model["name"] for model in payload] == ["demo"]
+    assert "catalog was stale; regenerated" in captured.err
+    assert (
+        load_catalog(tmp_path)["active_fingerprint"]
+        == active_fingerprint(tmp_path)
+    )
+
+
+def test_list_keeps_last_known_catalog_on_degraded_view(tmp_path, capsys):
+    _active_model(tmp_path)
+    assert run(["list", "--root", str(tmp_path)]) == 0
+    capsys.readouterr()
+    (tmp_path / "active" / "demo").unlink()
+
+    assert run(["list", "--root", str(tmp_path), "--json"]) == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert [model["name"] for model in payload] == ["demo"]
+    assert "refusing to overwrite" in captured.err
+    assert len(load_catalog(tmp_path)["models"]) == 1
+
+
+def test_catalog_refresh_refuses_empty_and_force_overrides(tmp_path, capsys):
+    _active_model(tmp_path)
+    assert run(["catalog", "refresh", "--root", str(tmp_path)]) == 0
+    capsys.readouterr()
+    (tmp_path / "active" / "demo").unlink()
+
+    assert run(["catalog", "refresh", "--root", str(tmp_path)]) == 1
+    captured = capsys.readouterr()
+    assert "refusing to overwrite" in captured.err
+    assert len(load_catalog(tmp_path)["models"]) == 1
+
+    assert run(["catalog", "refresh", "--root", str(tmp_path), "--force"]) == 0
+    captured = capsys.readouterr()
+    assert "0 model(s)" in captured.out
+    assert load_catalog(tmp_path)["models"] == []
 
 
 def test_doctor_reports_malformed_references(tmp_path, capsys):
