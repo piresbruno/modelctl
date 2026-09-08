@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Protocol, TypeVar
 from uuid import uuid4
 
-from .errors import ModelctlError
+from .errors import CatalogStaleViewError, ModelctlError
 from .layout import Layout
 
 CATALOG_SCHEMA = 2
@@ -184,7 +184,12 @@ def project_models(models: Iterable[CatalogModel]) -> list[dict[str, Any]]:
     return projected
 
 
-def active_fingerprint(root: Path) -> str:
+def _active_entries(root: Path) -> list[dict[str, str]]:
+    """Canonical fingerprint entries for the active tree.
+
+    Symlink values are client-independent: resolvable in-store targets use the
+    store-relative object path, everything else uses the raw link text (the
+    bytes stored in the symlink), never a client-resolved absolute path."""
     active = Layout(root).active
     entries: list[dict[str, str]] = []
     if active.is_dir():
@@ -193,8 +198,21 @@ def active_fingerprint(root: Path) -> str:
                 continue
             try:
                 if path.is_symlink():
-                    kind = "symlink"
-                    value = os.readlink(path)
+                    raw = os.readlink(path)
+                    target = Path(raw) if os.path.isabs(raw) else active / raw
+                    try:
+                        resolved = target.resolve()
+                    except OSError:
+                        kind, value = "broken", raw
+                    else:
+                        if resolved.exists():
+                            kind = "object"
+                            try:
+                                value = resolved.relative_to(root).as_posix()
+                            except ValueError:
+                                value = raw
+                        else:
+                            kind, value = "broken", raw
                 elif path.is_dir():
                     kind = "directory"
                     value = ""
@@ -208,7 +226,11 @@ def active_fingerprint(root: Path) -> str:
                 kind = "error"
                 value = f"{type(exc).__name__}:{exc}"
             entries.append({"name": path.name, "kind": kind, "value": value})
-    return hashlib.sha256(_canonical_json(entries)).hexdigest()
+    return entries
+
+
+def active_fingerprint(root: Path) -> str:
+    return hashlib.sha256(_canonical_json(_active_entries(root))).hexdigest()
 
 
 @contextmanager
@@ -241,6 +263,8 @@ def _write_status(layout: Layout, status: str, **details: Any) -> None:
 def _refresh_catalog_locked(
     root: Path,
     loader: Callable[[Path], list[ModelT]],
+    *,
+    preserve_if_empty: bool = False,
 ) -> tuple[list[ModelT], CatalogRefresh]:
     layout = Layout(root)
     layout.prepare()
@@ -255,6 +279,18 @@ def _refresh_catalog_locked(
             previous = load_catalog(root)
         except ModelctlError:
             previous = None
+    if (
+        preserve_if_empty
+        and not projected
+        and previous is not None
+        and previous["models"]
+    ):
+        raise CatalogStaleViewError(
+            f"0 active models visible but the catalog lists "
+            f"{len(previous['models'])} model(s); refusing to overwrite; the "
+            "store view on this client may be degraded (NFS/SMB mount); run "
+            "'modelctl doctor'"
+        )
     unchanged = (
         previous is not None
         and previous["content_sha256"] == digest
@@ -307,17 +343,21 @@ def _refresh_catalog_locked(
 def refresh_catalog(
     root: Path,
     loader: Callable[[Path], list[ModelT]],
+    *,
+    preserve_if_empty: bool = False,
 ) -> tuple[list[ModelT], CatalogRefresh]:
     with catalog_lock(root):
-        return _refresh_catalog_locked(root, loader)
+        return _refresh_catalog_locked(root, loader, preserve_if_empty=preserve_if_empty)
 
 
 def refresh_catalog_locked(
     root: Path,
     loader: Callable[[Path], list[ModelT]],
+    *,
+    preserve_if_empty: bool = False,
 ) -> tuple[list[ModelT], CatalogRefresh]:
     """Refresh while the caller holds :func:`catalog_lock`."""
-    return _refresh_catalog_locked(root, loader)
+    return _refresh_catalog_locked(root, loader, preserve_if_empty=preserve_if_empty)
 
 
 def catalog_dirty(root: Path) -> bool:

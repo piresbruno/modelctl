@@ -8,7 +8,14 @@ from pathlib import Path
 
 from . import __version__
 from .cards import sync_model_cards
-from .catalog import catalog_dirty, catalog_path, catalog_status, load_catalog, refresh_catalog
+from .catalog import (
+    active_fingerprint,
+    catalog_dirty,
+    catalog_path,
+    catalog_status,
+    load_catalog,
+    refresh_catalog,
+)
 from .config import load_local_root, load_root, save_local_root, save_root
 from .download_queue import (
     DownloadQueueError,
@@ -18,7 +25,7 @@ from .download_queue import (
     validate_prepared_manifests,
     validate_queue_root,
 )
-from .errors import ModelctlError
+from .errors import CatalogStaleViewError, ModelctlError
 from .generation import (
     download_from_hf,
     generate_manifest_document,
@@ -152,31 +159,49 @@ def _print_table(rows: list[tuple[str, ...]], headers: tuple[str, ...]) -> None:
 
 
 def _store_records(root: Path) -> tuple[list[dict[str, Any]], list[str]]:
-    """Active-model records for store listings, preferring the curated catalog.
+    """Active-model records for store listings, fingerprint-checking the catalog.
 
     Reads ROOT/catalog.json (one JSON parse) instead of scanning active
-    references. Staleness is reported via the dirty marker; a missing or
-    invalid catalog falls back to the live listing, which regenerates it."""
+    references. The catalog is trusted only while its fingerprint matches the
+    live active tree; a mismatching catalog is regenerated, and a non-empty
+    catalog is never replaced by an empty live view. A missing or invalid
+    catalog falls back to the live listing, which regenerates it."""
     try:
         document = load_catalog(root)
     except ModelctlError:
-        pass
+        try:
+            models, _ = refresh_catalog(root, catalog_models)
+        except ModelctlError as exc:
+            models = list_active_models(root)
+            warnings = [
+                f"warning: live listing succeeded but catalog refresh failed: {exc}"
+            ]
+        else:
+            warnings = []
     else:
-        warnings: list[str] = []
         if catalog_dirty(root):
-            warnings.append(
+            return list(document["models"]), [
                 "warning: catalog may be stale; run 'modelctl catalog refresh'"
+            ]
+        if document["active_fingerprint"] == active_fingerprint(root):
+            return list(document["models"]), []
+        try:
+            models, result = refresh_catalog(
+                root, catalog_models, preserve_if_empty=True
             )
-        return list(document["models"]), warnings
-    try:
-        models, _ = refresh_catalog(root, catalog_models)
-    except ModelctlError as exc:
-        models = list_active_models(root)
-        warnings = [
-            f"warning: live listing succeeded but catalog refresh failed: {exc}"
-        ]
-    else:
-        warnings = []
+        except CatalogStaleViewError as exc:
+            return list(document["models"]), [f"warning: {exc}"]
+        except ModelctlError as exc:
+            models = list_active_models(root)
+            warnings = [
+                f"warning: live listing succeeded but catalog refresh failed: {exc}"
+            ]
+        else:
+            warnings = (
+                ["warning: catalog was stale; regenerated from the live store"]
+                if result.changed
+                else []
+            )
     malformed = malformed_active_references(root)
     malformed_warning = _malformed_warning(malformed, local=False)
     if malformed_warning:
@@ -219,6 +244,8 @@ def _print_models(root: Path, *, json_output: bool, local: bool = False) -> None
     records, warnings = _store_records(root)
     if json_output:
         print(json.dumps(records, indent=2))
+        for warning in warnings:
+            print(warning, file=sys.stderr)
         return
     if not records:
         print(f"No active models in {root}.")
@@ -398,8 +425,10 @@ and incomplete staging downloads are excluded.
 
 Store listings read ROOT/catalog.json and include the on-disk size of each
 model. If the catalog is missing or invalid, the store is scanned live and the
-catalog is regenerated. A stale catalog is listed with a warning; run
-'modelctl catalog refresh' to rebuild it.""",
+catalog is regenerated. A catalog that no longer matches the store is
+regenerated automatically from the live store. A non-empty catalog is never
+replaced by an empty live view; use 'modelctl catalog refresh --force' if the
+store is genuinely empty.""",
     )
     list_location = list_models.add_mutually_exclusive_group()
     list_location.add_argument(
@@ -430,7 +459,18 @@ catalog is regenerated. A stale catalog is listed with a warning; run
     )
     _add_root(catalog_status_command)
     catalog_refresh_command = catalog_commands.add_parser(
-        "refresh", help="rebuild the catalog from validated active references"
+        "refresh",
+        help="rebuild the catalog from validated active references",
+        description=(
+            "With concurrent modelctl clients on one store, a client whose view "
+            "of the store is degraded cannot overwrite a non-empty catalog "
+            "without --force."
+        ),
+    )
+    catalog_refresh_command.add_argument(
+        "--force",
+        action="store_true",
+        help="allow an empty live view to overwrite a non-empty catalog",
     )
     catalog_refresh_command.add_argument(
         "--json", action="store_true", help="emit JSON"
@@ -1196,7 +1236,13 @@ def run(argv: list[str] | None = None) -> int:
                         f"generation: {status.generation}; models: {status.models}"
                     )
             return 0 if status.status == "ready" else 1
-        _, result = refresh_catalog(root, catalog_models)
+        try:
+            _, result = refresh_catalog(
+                root, catalog_models, preserve_if_empty=not args.force
+            )
+        except CatalogStaleViewError as exc:
+            print(f"catalog refresh: {exc}", file=sys.stderr)
+            return 1
         if args.json:
             print(json.dumps(result.to_dict(), indent=2))
         else:

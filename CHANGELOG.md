@@ -2,6 +2,21 @@
 
 This project follows semantic versioning.
 
+## Unreleased
+
+### Changed
+
+- Multi-client safe catalog handling for stores shared by several modelctl
+  hosts. The active fingerprint now normalizes symlink targets to
+  store-relative object paths, so clients that render the same links
+  differently (relative vs absolute, different mount prefixes) agree.
+  `modelctl list` compares the catalog fingerprint against the live store and
+  regenerates a mismatching catalog automatically. A refresh that would
+  replace a non-empty catalog with an empty live view is refused with a
+  warning (a client whose store view is degraded can no longer empty the
+  catalog for everyone); `modelctl catalog refresh --force` overrides the
+  guard. Update, delete, activate, and repair keep full catalog authority.
+
 ## 0.18.0
 
 ### Changed

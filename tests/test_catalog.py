@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 from types import SimpleNamespace
 
@@ -6,6 +7,7 @@ import pytest
 
 from modelctl import catalog
 from modelctl.catalog import (
+    active_fingerprint,
     catalog_lock,
     catalog_status,
     load_catalog,
@@ -13,8 +15,8 @@ from modelctl.catalog import (
     refresh_catalog,
     refresh_catalog_locked,
 )
-from modelctl.errors import ModelctlError
-from modelctl.layout import Layout
+from modelctl.errors import CatalogStaleViewError, ModelctlError
+from modelctl.layout import Layout, atomic_symlink
 from modelctl.manifest import parse_manifest
 from modelctl.operations import catalog_models, list_active_models
 from modelctl.validation import ExpectedFile, write_metadata
@@ -62,6 +64,62 @@ def test_catalog_status_detects_dirty_and_external_active_changes(tmp_path):
     status = catalog_status(tmp_path)
     assert status.status == "stale"
     assert "fingerprint" in status.detail
+
+
+def test_active_fingerprint_normalizes_symlink_rendering(tmp_path):
+    layout = Layout(tmp_path)
+    layout.prepare()
+    obj = layout.models / "org" / "model" / "hash"
+    obj.mkdir(parents=True)
+    atomic_symlink(obj, layout.active_path("demo"))
+    relative_fp = active_fingerprint(tmp_path)
+
+    (layout.active / "demo").unlink()
+    os.symlink(str(obj), layout.active_path("demo"))
+    absolute_fp = active_fingerprint(tmp_path)
+
+    assert relative_fp == absolute_fp
+
+    (layout.active / "gone").symlink_to(tmp_path / "models" / "nope")
+    assert active_fingerprint(tmp_path) != relative_fp
+
+
+def test_active_fingerprint_out_of_root_targets_use_raw_text(tmp_path):
+    layout = Layout(tmp_path)
+    layout.prepare()
+    raw = os.path.relpath("/dev/null", layout.active)
+    os.symlink(raw, layout.active_path("demo"))
+
+    entries = catalog._active_entries(tmp_path)
+
+    assert entries == [{"name": "demo", "kind": "object", "value": raw}]
+
+
+def test_refresh_preserve_if_empty_keeps_nonempty_catalog(tmp_path):
+    refresh_catalog(tmp_path, lambda root: [_model("alpha")])
+    document = load_catalog(tmp_path)
+
+    with pytest.raises(CatalogStaleViewError, match="refusing to overwrite"):
+        refresh_catalog(tmp_path, lambda root: [], preserve_if_empty=True)
+
+    reloaded = load_catalog(tmp_path)
+    assert len(reloaded["models"]) == 1
+    assert reloaded["generation"] == document["generation"]
+
+
+def test_refresh_preserve_allows_growth_and_empty_start(tmp_path):
+    _, first = refresh_catalog(tmp_path, lambda root: [], preserve_if_empty=True)
+    assert first.changed is True
+    assert first.models == []
+
+    _, second = refresh_catalog(
+        tmp_path, lambda root: [_model("alpha")], preserve_if_empty=True
+    )
+    assert second.changed is True
+
+    _, third = refresh_catalog(tmp_path, lambda root: [])
+    assert third.changed is True
+    assert third.models == []
 
 
 def test_failed_refresh_preserves_previous_catalog_and_dirty_marker(
