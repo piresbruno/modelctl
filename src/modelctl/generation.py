@@ -359,8 +359,9 @@ def write_generated_manifest(
     text = yaml.safe_dump(document, sort_keys=False, allow_unicode=True)
     temp = path.parent / f".{path.name}.tmp-{os.getpid()}"
     try:
-        temp.write_text(text, encoding="utf-8")
-        with temp.open("rb") as handle:
+        with temp.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
             os.fsync(handle.fileno())
         if force:
             os.replace(temp, path)

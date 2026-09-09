@@ -29,6 +29,7 @@ from .hub import download_snapshot, estimate_snapshot, resolve_commit
 from .integrity import repair_reference_locked, repair_target
 from .layout import (
     Layout,
+    _fsync_directory,
     assert_same_filesystem,
     atomic_symlink,
     model_lock,
@@ -125,14 +126,6 @@ class DeleteResult:
             "retained_objects": [item.to_dict() for item in self.retained_objects],
             "pruned_dirs": [str(path) for path in self.pruned_dirs],
         }
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def _reference_kind(path: Path) -> str:

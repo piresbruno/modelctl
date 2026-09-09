@@ -14,7 +14,13 @@ from typing import Any
 from uuid import uuid4
 
 from .errors import ModelctlError
-from .layout import Layout, assert_same_filesystem, atomic_symlink, model_lock
+from .layout import (
+    Layout,
+    _fsync_directory,
+    assert_same_filesystem,
+    atomic_symlink,
+    model_lock,
+)
 from .manifest import validate_name
 from .operations import _active_object
 
@@ -52,12 +58,6 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def _read_card(path: Path) -> bytes:
@@ -285,12 +285,18 @@ def _publish_card(
             "instruction_sections": headings,
             "sha256": {"README.md": _sha256(readme), "RUN.md": _sha256(run)},
         }
-        (staging / _CARD_METADATA).write_text(
-            json.dumps(payload, indent=2) + "\n", encoding="utf-8"
-        )
-        for path in staging.iterdir():
-            with path.open("rb") as handle:
-                os.fsync(handle.fileno())
+        with (staging / "README.md").open("wb") as handle:
+            handle.write(readme)
+            handle.flush()
+            os.fsync(handle.fileno())
+        with (staging / "RUN.md").open("wb") as handle:
+            handle.write(run)
+            handle.flush()
+            os.fsync(handle.fileno())
+        with (staging / _CARD_METADATA).open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         _fsync_directory(staging)
         if final.exists() and _published_card_matches(
             final,

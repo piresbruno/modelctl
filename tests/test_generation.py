@@ -215,3 +215,30 @@ def test_download_generates_manifest_and_activates_model(tmp_path):
         snapshot=no_download,
     )
     assert reused == active
+
+
+def test_write_generated_manifest_fsyncs_writable_descriptor(tmp_path, monkeypatch):
+    """SMB servers deny fsync on read-only descriptors; the manifest temp file
+    must be flushed through its writable handle (regression: EACCES on CIFS)."""
+    import errno
+    import fcntl
+    import os
+
+    seen_modes = []
+    real_fsync = os.fsync
+
+    def hostile_fsync(fd):
+        mode = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE
+        if mode == os.O_RDONLY:
+            raise PermissionError(errno.EACCES, "Permission denied")
+        seen_modes.append(mode)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", hostile_fsync)
+
+    path = write_generated_manifest(tmp_path, {"name": "demo", "repo": "org/demo"})
+
+    assert path == tmp_path / "manifests" / "demo.yaml"
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert document["name"] == "demo"
+    assert seen_modes == [os.O_WRONLY]

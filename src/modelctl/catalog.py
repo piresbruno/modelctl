@@ -13,7 +13,7 @@ from typing import Any, Protocol, TypeVar
 from uuid import uuid4
 
 from .errors import CatalogStaleViewError, ModelctlError
-from .layout import Layout
+from .layout import Layout, _fsync_directory
 
 CATALOG_SCHEMA = 3
 CATALOG_FILE = "catalog.json"
@@ -107,11 +107,7 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp, path)
-        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        _fsync_directory(path.parent)
     finally:
         temp.unlink(missing_ok=True)
 

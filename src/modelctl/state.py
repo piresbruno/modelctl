@@ -86,8 +86,9 @@ class StateJournal:
         }
         temp = self.path.with_name(f".{self.path.name}.tmp-{os.getpid()}")
         try:
-            temp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-            with temp.open("rb") as handle:
+            with temp.open("w", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, indent=2) + "\n")
+                handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temp, self.path)
         finally:

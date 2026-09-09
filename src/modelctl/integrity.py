@@ -17,7 +17,13 @@ from .catalog import (
     project_models,
 )
 from .errors import ModelctlError, ValidationError
-from .layout import Layout, atomic_symlink, model_lock, verify_symlink
+from .layout import (
+    Layout,
+    _fsync_directory,
+    atomic_symlink,
+    model_lock,
+    verify_symlink,
+)
 from .manifest import load_manifest, validate_name
 from .state import StateJournal
 from .validation import validate_object
@@ -207,13 +213,6 @@ def malformed_active_references(root: Path) -> list[ActiveReferenceAudit]:
         if item.status not in {"valid", "hidden_foreign_entry", "missing_journal"}
     ]
 
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def _quarantine_path(layout: Layout, name: str) -> Path:

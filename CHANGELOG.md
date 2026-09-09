@@ -2,6 +2,19 @@
 
 This project follows semantic versioning.
 
+## Unreleased
+
+### Fixed
+
+- Atomic file writes no longer fail with `PermissionError: [Errno 13]` on
+  SMB/CIFS stores. Manifest, journal, metadata, catalog, and cache-record
+  writes used to reopen their temp file read-only before `fsync`, and SMB
+  servers reject flush on handles without write access; they now flush
+  through the writable handle that produced the content. Directory fsyncs
+  around rename/symlink publication tolerate the same server-side denial
+  (EACCES/EPERM/EINVAL/EOPNOTSUPP) instead of aborting a finished mutation;
+  real storage errors still propagate.
+
 ## 0.20.0
 
 ### Changed

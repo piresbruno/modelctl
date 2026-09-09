@@ -16,7 +16,7 @@ from modelctl import catalog, hf_cache
 from modelctl.catalog import catalog_status, load_catalog
 from modelctl.errors import ModelctlError, ValidationError
 from modelctl.hf_cache import list_records, load_record, malformed_cached_records, state_root
-from modelctl.layout import Layout, atomic_symlink
+from modelctl.layout import Layout, _fsync_directory, atomic_symlink
 from modelctl.manifest import parse_manifest
 from modelctl.operations import (
     active_entrypoint,
@@ -1134,3 +1134,24 @@ def test_failed_size_measurement_does_not_roll_back_activated_model(
     assert (tmp_path / "active" / "new").is_symlink()
     assert catalog_path.read_bytes() == previous
     assert catalog_status(tmp_path).status == "dirty"
+
+
+def test_fsync_directory_tolerates_server_denied_flush(tmp_path, monkeypatch):
+    """Directory descriptors are read-only by definition; servers that deny
+    flush on such handles (SMB) must not abort a finished rename, but real
+    storage errors still propagate."""
+    import errno
+    import os
+
+    def denied(fd):
+        raise PermissionError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(os, "fsync", denied)
+    _fsync_directory(tmp_path)
+
+    def failed(fd):
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(os, "fsync", failed)
+    with pytest.raises(OSError):
+        _fsync_directory(tmp_path)

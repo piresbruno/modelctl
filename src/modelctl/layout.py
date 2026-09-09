@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -87,6 +88,36 @@ def model_lock(layout: Layout, name: str) -> Iterator[None]:
             yield
         finally:
             fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+_DIR_FSYNC_TOLERATED_ERRNOS = frozenset(
+    {
+        errno.EACCES,
+        errno.EPERM,
+        errno.EINVAL,
+        errno.ENOTSUP,
+        errno.EOPNOTSUPP,
+    }
+)
+
+
+def _fsync_directory(path: Path) -> None:
+    """Flush a directory entry change after rename or symlink switch.
+
+    Directories can only be opened read-only, and some network filesystems
+    (SMB servers that deny flush on handles without write access, mounts
+    without directory flush support) reject the fsync outright. The rename
+    the caller just applied is already visible, so a denied durability
+    guarantee must not abort the workflow; anything else still raises.
+    """
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    except OSError as exc:
+        if exc.errno not in _DIR_FSYNC_TOLERATED_ERRNOS:
+            raise
+    finally:
+        os.close(descriptor)
 
 
 def assert_same_filesystem(staging: Path, final: Path) -> None:

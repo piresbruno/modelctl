@@ -203,8 +203,9 @@ def write_metadata(
     path = directory / METADATA_FILE
     temp = directory / f".{METADATA_FILE}.tmp-{os.getpid()}"
     try:
-        temp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        with temp.open("rb") as handle:
+        with temp.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2) + "\n")
+            handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp, path)
     finally:

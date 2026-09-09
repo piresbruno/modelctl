@@ -16,7 +16,7 @@ from typing import Any, Callable, Iterator
 from huggingface_hub.utils import WeakFileLock
 
 from .errors import ModelctlError, ValidationError
-from .layout import Layout
+from .layout import Layout, _fsync_directory
 from .manifest import validate_name
 from .validation import ExpectedFile, validate_object
 
@@ -127,22 +127,14 @@ def _ensure_real_directory(path: Path, *, create: bool = True) -> None:
         raise ValidationError(f"cache structural path is not a directory: {path}")
 
 
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
     try:
-        temporary.write_text(
-            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
-        with temporary.open("rb") as handle:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
         _fsync_directory(path.parent)
@@ -360,8 +352,9 @@ def _publish_ref(
     ref.parent.mkdir(parents=True, exist_ok=True)
     temporary = ref.with_name(f".{ref.name}.tmp-{os.getpid()}")
     try:
-        temporary.write_text(commit, encoding="utf-8")
-        with temporary.open("rb") as handle:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(commit)
+            handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, ref)
         _fsync_directory(ref.parent)
