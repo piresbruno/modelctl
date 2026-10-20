@@ -344,6 +344,20 @@ Execution behavior after preflight:
 - Interrupted entries retain resumable staging data. Rerunning the queue reuses
   valid published objects and resumes incomplete downloads.
 
+With `--json`, stdout carries exactly one compact JSON line — the per-entry
+results document — and human progress moves to stderr:
+
+```bash
+modelctl queue downloads.yaml --json --root /mnt/nas/llm-models
+{"schema":1,"results":[{"index":1,"name":"qwen3","source":"Qwen/Qwen3-8B","status":"complete","active_path":"/mnt/nas/llm-models/models/Qwen/Qwen3-8B/…","error_type":null,"error":null},{"index":2,"status":"failed","error_type":"DownloadError","error":"…"}]}
+```
+
+The document is emitted even when the run exits non-zero, so wrappers can
+reconcile per-entry outcomes on partially failed batches. It is deliberately a
+single line (not the `indent=2` style of other `--json` commands): consumers
+tail a bounded line ring, and a pretty-printed document for a large queue
+would evict its own opening line.
+
 ### Backfill model cards and run instructions
 
 Fetch cards for every active model in a NAS store:
@@ -1005,7 +1019,8 @@ and remote cache staging preflight plus a narrowed transfer file list in
 registration (a `sync-local` record) instead of the NAS store, and `list
 --local` tolerates stale registrations. Parallel `--jobs` rsync streams and
 round-robin distribution over repeated `--host` fabric interfaces were added
-in `0.13.0`.
+in `0.13.0`. The `queue` command gained a machine-readable `--json` results
+document in `0.21.0`.
 
 `src/modelctl/__init__.py` is the single version source. Hatch reads it when
 building the package, and `modelctl --version` imports the same value so package

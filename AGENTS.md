@@ -13,8 +13,8 @@ package uses a `src/` layout and exposes the `modelctl` command through
   output.
 - `src/modelctl/generation.py`: Hugging Face source inspection and manifest
   generation.
-- `src/modelctl/download_queue.py`: queue parsing, validation, and concurrent
-  download orchestration.
+- `src/modelctl/download_queue.py`: queue parsing, validation, concurrent
+  download orchestration, and the `queue --json` results document.
 - `src/modelctl/manifest.py`: immutable manifest models and parsing.
 - `src/modelctl/operations.py`: update, activation, local sync, deletion, and
   serve-command workflows.

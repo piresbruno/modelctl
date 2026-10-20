@@ -4,6 +4,28 @@ This project follows semantic versioning.
 
 ## Unreleased
 
+## 0.21.0
+
+### Added
+
+- `modelctl queue --json` emits a machine-readable per-entry results document
+  as a single compact JSON line on stdout (schema 1: `index`, `name`,
+  `source`, `status` = `complete`|`failed`, `active_path`, `error_type`,
+  `error`), and human progress moves to stderr. The document is printed even
+  when the run exits non-zero, so wrappers can reconcile per-entry outcomes
+  on partially failed batches. It is deliberately one line — not the
+  `indent=2` style of other `--json` commands — because consumers tail a
+  bounded line ring and a pretty-printed document for a large queue would
+  evict its own opening line.
+
+### Fixed
+
+- The root preflight's CIFS hint ("`mfsymlinks` mount option") now names
+  errno constants instead of Linux literal values (95/45), so the hint also
+  appears on platforms where `EOPNOTSUPP` has a different number (macOS 102).
+
+## 0.20.1
+
 ### Fixed
 
 - Atomic file writes no longer fail with `PermissionError: [Errno 13]` on

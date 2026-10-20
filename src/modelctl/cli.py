@@ -21,6 +21,7 @@ from .catalog import (
 from .config import load_local_root, load_root, save_local_root, save_root
 from .download_queue import (
     DownloadQueueError,
+    build_results_document,
     execute_download_queue,
     load_download_queue,
     prepare_download_queue,
@@ -798,6 +799,14 @@ There is no fixed jobs limit; start with 2 or 3 to avoid contention.""",
         metavar="N",
         help="maximum concurrent downloads (default: 1)",
     )
+    queue.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "emit a machine-readable per-entry results document as the final "
+            "stdout line (human progress moves to stderr)"
+        ),
+    )
     _add_root(queue)
 
     cards = commands.add_parser(
@@ -1426,7 +1435,14 @@ def run(argv: list[str] | None = None) -> int:
     if args.command == "queue":
         requests = load_download_queue(args.file)
         concurrency = min(args.jobs, len(requests))
-        print(f"preflight: validating store and {len(requests)} queue entries")
+        # With --json, stdout carries ONLY the final results document; human
+        # progress moves to stderr so the document stays machine-readable.
+        note = sys.stderr if args.json else sys.stdout
+
+        def emit(message: str, *, file=None) -> None:
+            print(message, file=file if file is not None else note)
+
+        emit(f"preflight: validating store and {len(requests)} queue entries")
         validate_queue_root(root)
         prepared = prepare_download_queue(requests, jobs=args.jobs)
         validate_prepared_manifests(root, prepared)
@@ -1434,11 +1450,11 @@ def run(argv: list[str] | None = None) -> int:
             selection = item.request.quantization or item.document.get(
                 "format", "auto"
             )
-            print(
+            emit(
                 f"[{index}/{len(prepared)}] ready: {item.name} "
                 f"<- {item.request.source} ({selection})"
             )
-        print(
+        emit(
             f"preflight complete: starting {len(prepared)} download(s), "
             f"up to {concurrency} concurrent"
         )
@@ -1447,7 +1463,7 @@ def run(argv: list[str] | None = None) -> int:
         for index, result in enumerate(results, start=1):
             label = prepared[index - 1].name
             if result.succeeded:
-                print(
+                emit(
                     f"[{index}/{len(results)}] complete: "
                     f"{label} -> {result.active_path}"
                 )
@@ -1459,6 +1475,11 @@ def run(argv: list[str] | None = None) -> int:
                     f"{type(error).__name__}: {error}",
                     file=sys.stderr,
                 )
+        if args.json:
+            # Last stdout line, ring-buffer friendly (one line regardless of
+            # queue size). Printed BEFORE the failure exit so consumers can
+            # reconcile per-entry outcomes on partially failed batches.
+            print(json.dumps(build_results_document(prepared, results), separators=(",", ":")))
         if failures:
             raise DownloadQueueError(
                 f"{failures} of {len(results)} queued download(s) failed"

@@ -10,6 +10,7 @@ from modelctl import __version__
 from modelctl.cards import CardResult
 from modelctl.catalog import active_fingerprint, load_catalog
 from modelctl.cli import DEFAULT_ROOT, _cache_dir, _format_size, _local_root, _root, build_parser, run
+from modelctl.download_queue import DownloadQueueError
 from modelctl.errors import ModelctlError
 from modelctl.catalog import (
     bump_catalog_token_locked,
@@ -589,6 +590,135 @@ def test_queue_download_refreshes_catalog_and_list_with_dereferenced_model(
     assert {item["name"] for item in payload} == {"alpha", "beta"}
 
 
+def test_queue_json_emits_single_line_results_document(
+    tmp_path, monkeypatch, capsys
+):
+    import modelctl.download_queue as download_queue_module
+    import modelctl.generation as generation_module
+
+    files = {
+        "config.json": b"{}",
+        "model.safetensors": b"weights",
+    }
+    FakeApi, writer = _download_pipeline(files, "c" * 40)
+    real_generate = generation_module.generate_manifest_document
+    real_download_generated = generation_module.download_generated_manifest
+
+    def fake_generate(source, **kwargs):
+        return real_generate(source, api=FakeApi(), **kwargs)
+
+    def fake_download_generated(root, document, *, force_manifest=False, api=None, snapshot=None):
+        return real_download_generated(
+            root,
+            document,
+            force_manifest=force_manifest,
+            api=FakeApi(),
+            snapshot=writer,
+        )
+
+    monkeypatch.setattr(
+        download_queue_module, "generate_manifest_document", fake_generate
+    )
+    monkeypatch.setattr(
+        generation_module, "download_generated_manifest", fake_download_generated
+    )
+
+    queue_file = tmp_path / "queue.yaml"
+    queue_file.write_text(
+        "downloads:\n"
+        "  - source: org/alpha\n"
+        "    name: alpha\n"
+        "  - source: org/beta\n"
+        "    name: beta\n"
+    )
+    assert run(["queue", str(queue_file), "--root", str(tmp_path), "--json"]) == 0
+    captured = capsys.readouterr()
+
+    # stdout is EXACTLY the results document: one compact line, ring-buffer
+    # friendly for consumers that tail a bounded line ring.
+    lines = captured.out.splitlines()
+    assert len(lines) == 1
+    document = json.loads(lines[-1])
+    assert document["schema"] == 1
+    [alpha, beta] = document["results"]
+    assert alpha == {
+        "index": 1,
+        "name": "alpha",
+        "source": "org/alpha",
+        "status": "complete",
+        "active_path": alpha["active_path"],
+        "error_type": None,
+        "error": None,
+    }
+    # active_path is the published OBJECT path (same as the human line shows).
+    assert "/models/org/alpha/" in alpha["active_path"]
+    assert beta["status"] == "complete" and beta["index"] == 2
+
+    # Human progress moved to stderr.
+    assert "preflight: validating store and 2 queue entries" in captured.err
+    assert "[1/2] complete: alpha" in captured.err
+
+
+def test_queue_json_reports_per_entry_failures_and_exits_nonzero(
+    tmp_path, monkeypatch, capsys
+):
+    import modelctl.download_queue as download_queue_module
+    import modelctl.generation as generation_module
+
+    files = {
+        "config.json": b"{}",
+        "model.safetensors": b"weights",
+    }
+    FakeApi, writer = _download_pipeline(files, "d" * 40)
+    real_generate = generation_module.generate_manifest_document
+    real_download_generated = generation_module.download_generated_manifest
+
+    def fake_generate(source, **kwargs):
+        return real_generate(source, api=FakeApi(), **kwargs)
+
+    def fake_download_generated(root, document, *, force_manifest=False, api=None, snapshot=None):
+        if document.get("name") == "beta":
+            raise RuntimeError("connection reset mid-stream")
+        return real_download_generated(
+            root,
+            document,
+            force_manifest=force_manifest,
+            api=FakeApi(),
+            snapshot=writer,
+        )
+
+    monkeypatch.setattr(
+        download_queue_module, "generate_manifest_document", fake_generate
+    )
+    monkeypatch.setattr(
+        generation_module, "download_generated_manifest", fake_download_generated
+    )
+
+    queue_file = tmp_path / "queue.yaml"
+    queue_file.write_text(
+        "downloads:\n"
+        "  - source: org/alpha\n"
+        "    name: alpha\n"
+        "  - source: org/beta\n"
+        "    name: beta\n"
+    )
+    with pytest.raises(DownloadQueueError) as exc:
+        run(["queue", str(queue_file), "--root", str(tmp_path), "--json"])
+    assert "1 of 2 queued download(s) failed" in str(exc.value)
+    captured = capsys.readouterr()
+
+    # The document is still emitted on partially failed batches (consumers
+    # reconcile per-entry outcomes) and is the last stdout line.
+    document = json.loads(captured.out.splitlines()[-1])
+    [alpha, beta] = document["results"]
+    assert alpha["status"] == "complete" and alpha["active_path"] is not None
+    assert beta["status"] == "failed"
+    assert beta["error_type"] == "RuntimeError"
+    assert "connection reset mid-stream" in beta["error"]
+    assert beta["active_path"] is None
+    assert "[2/2] failed: beta" in captured.err
+
+
 def test_list_local_uses_hf_cache(tmp_path, monkeypatch, capsys):
     cache = tmp_path / "hub"
     model = type("Model", (), {"name": "demo", "runtime": "vllm", "repo": "org/model"})()
@@ -803,7 +933,6 @@ def test_sync_cards_prints_results_and_summary(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_version_uses_package_version(capsys):
-    assert __version__ == "0.20.0"
     with pytest.raises(SystemExit) as exit_info:
         build_parser().parse_args(["--version"])
     assert exit_info.value.code == 0

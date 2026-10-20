@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -51,6 +52,42 @@ class DownloadResult:
     @property
     def succeeded(self) -> bool:
         return self.error is None
+
+
+RESULTS_DOCUMENT_SCHEMA = 1
+
+
+def build_results_document(
+    prepared: list["PreparedDownload"],
+    results: list["DownloadResult"],
+) -> dict:
+    """Machine-readable per-entry results for ``queue --json``.
+
+    Emitted as ONE compact stdout line (deliberately not the ``indent=2``
+    style used elsewhere): consumers tail a bounded line ring, and a
+    pretty-printed document for a large queue would evict its own opening
+    line. Status vocabulary matches the human lines: "complete" | "failed".
+    """
+
+    def entry(index: int, result: DownloadResult) -> dict:
+        request = result.request
+        error = result.error
+        return {
+            "index": index,
+            "name": prepared[index - 1].name,
+            "source": request.source,
+            "status": "complete" if result.succeeded else "failed",
+            "active_path": (
+                str(result.active_path) if result.active_path is not None else None
+            ),
+            "error_type": type(error).__name__ if error is not None else None,
+            "error": str(error) if error is not None else None,
+        }
+
+    return {
+        "schema": RESULTS_DOCUMENT_SCHEMA,
+        "results": [entry(i, r) for i, r in enumerate(results, start=1)],
+    }
 
 
 _ALLOWED_KEYS = {
@@ -182,9 +219,11 @@ def validate_queue_root(root: Path) -> None:
                 "atomic symlink probe did not resolve to the models directory"
             )
     except OSError as exc:
+        # Portability: EOPNOTSUPP/ENOTSUP differ per platform (95 on Linux,
+        # 102 on macOS); name the constants instead of the Linux literals.
         hint = (
             " CIFS mounts commonly require the 'mfsymlinks' mount option."
-            if getattr(exc, "errno", None) in {1, 13, 45, 95}
+            if getattr(exc, "errno", None) in {errno.EPERM, errno.EACCES, errno.ENOTSUP, errno.EOPNOTSUPP}
             else ""
         )
         raise DownloadQueueError(
