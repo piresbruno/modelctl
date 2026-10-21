@@ -122,7 +122,7 @@ def test_audit_accepts_manifest_derived_object_when_journal_path_is_stale(tmp_pa
     assert results["demo"].object == object_path.resolve()
 
 
-def test_audit_still_flags_missing_journal_without_manifest(tmp_path):
+def test_audit_still_flags_missing_journal_when_commits_disagree(tmp_path):
     manifest = parse_manifest({"repo": "org/demo", "runtime": "vllm"}, "demo")
     layout = Layout(tmp_path)
     layout.prepare()
@@ -139,7 +139,7 @@ def test_audit_still_flags_missing_journal_without_manifest(tmp_path):
                 "state": "ACTIVE_ON_NAS",
                 "at": "2026-01-01T00:00:00+00:00",
                 "object": "/defunct-store/models/org/demo",
-                "commit": commit,
+                "commit": "b" * 40,
             }
         ],
     }
@@ -162,6 +162,38 @@ def test_repair_uses_manifest_derived_object_when_journal_path_is_stale(tmp_path
 
     assert dry_run.status == "dry-run"
     assert dry_run.object == object_path
+
+
+def test_audit_accepts_commit_matching_target_when_journal_mount_is_foreign(tmp_path):
+    manifest = parse_manifest({"repo": "org/demo", "runtime": "vllm"}, "demo")
+    layout = Layout(tmp_path)
+    layout.prepare()
+    commit = "a" * 40
+    object_path = layout.object_path(manifest, commit)
+    object_path.mkdir(parents=True)
+    (object_path / "config.json").write_bytes(b"{}")
+    write_metadata(object_path, manifest, commit, [ExpectedFile("config.json", 2)], ".")
+    # Journal written by a host mounting the store elsewhere: the recorded
+    # path can never resolve on this machine, and no store manifest exists.
+    state = {
+        "operation": "update",
+        "state": "ACTIVE_ON_NAS",
+        "history": [
+            {
+                "state": "ACTIVE_ON_NAS",
+                "at": "2026-01-01T00:00:00+00:00",
+                "object": "/mnt/nas/models/org/demo",
+                "commit": commit,
+            }
+        ],
+    }
+    layout.state_path("demo").write_text(json.dumps(state))
+    layout.active_path("demo").symlink_to(object_path)
+
+    results = {item.name: item for item in audit_active_references(tmp_path)}
+
+    assert results["demo"].status == "valid"
+    assert results["demo"].object == object_path.resolve()
 
 
 def test_repair_is_dry_run_by_default_and_apply_quarantines_copy(tmp_path):

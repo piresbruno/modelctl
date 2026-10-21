@@ -145,6 +145,17 @@ def repair_target(root: Path, name: str) -> Path:
     return object_path
 
 
+def _journal_commit_matches(layout: Layout, name: str, metadata: dict[str, Any]) -> bool:
+    """True when the journal's latest activation commit equals the validated
+    target's metadata commit - the journal path may be stale (foreign mount)
+    while the store remains self-consistent."""
+    try:
+        event = _latest_active_event(layout, name)
+        return str(event["commit"]) == str(metadata.get("commit"))
+    except ModelctlError:
+        return False
+
+
 def _audit_symlink(layout: Layout, reference: Path) -> ActiveReferenceAudit:
     name = reference.name
     try:
@@ -170,6 +181,14 @@ def _audit_symlink(layout: Layout, reference: Path) -> ActiveReferenceAudit:
     try:
         expected, commit = _journal_object(layout, name)
     except ModelctlError as exc:
+        # Journals record the publisher's ABSOLUTE object path: a model
+        # published from a host mounting the store elsewhere (e.g. /mnt/nas
+        # vs /mnt/llms) carries a path that can never resolve here. The store
+        # is still self-consistent when the validated target's metadata
+        # commit matches the journal's latest activation commit - the stale
+        # path is then a relic, not a defect.
+        if _journal_commit_matches(layout, name, metadata):
+            return ActiveReferenceAudit(name, "valid", reference, resolved)
         return ActiveReferenceAudit(
             name, "missing_journal", reference, resolved, str(exc)
         )

@@ -4,6 +4,18 @@ This project follows semantic versioning.
 
 ## Unreleased
 
+## 0.21.2
+
+### Fixed
+
+- `doctor` now accepts an active reference whose journal records a foreign
+  absolute object path (model published from a host mounting the store at a
+  different mount point, e.g. `/mnt/nas` vs `/mnt/llms`) when the validated
+  target's metadata commit matches the journal's latest activation commit -
+  the stale path is a relic of the publishing host, not a store defect.
+  Journals whose commit disagrees with the validated target are still
+  reported as `missing_journal`.
+
 ## 0.21.1
 
 ### Fixed
