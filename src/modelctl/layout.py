@@ -80,9 +80,23 @@ class Layout:
 def model_lock(layout: Layout, name: str) -> Iterator[None]:
     import fcntl
 
+    from .errors import ModelctlError
+
     layout.locks.mkdir(parents=True, exist_ok=True)
     path = layout.locks / f"{validate_name(name)}.lock"
-    with path.open("a+b") as handle:
+    try:
+        handle = path.open("a+b")
+    except PermissionError as exc:
+        # Seen on CIFS stores: a stale lock file whose server-side ACL the
+        # current SMB session cannot write through (the displayed owner is
+        # fake under forceuid). Lock files carry no data - the remedy is to
+        # remove the file or align the mount principal.
+        raise ModelctlError(
+            f"cannot open the model lock {path}: the store session cannot write it. "
+            "Lock files carry no data - remove the stale file (rm it) or align the "
+            "mount credentials/principal, then retry."
+        ) from exc
+    with handle:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX)
             yield

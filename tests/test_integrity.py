@@ -11,7 +11,7 @@ from modelctl.integrity import (
     cleanup_quarantine,
     repair_active_reference,
 )
-from modelctl.layout import Layout, atomic_symlink
+from modelctl.layout import Layout, atomic_symlink, model_lock
 from modelctl.manifest import parse_manifest
 from modelctl.validation import ExpectedFile, write_metadata
 
@@ -194,6 +194,23 @@ def test_audit_accepts_commit_matching_target_when_journal_mount_is_foreign(tmp_
 
     assert results["demo"].status == "valid"
     assert results["demo"].object == object_path.resolve()
+
+
+def test_model_lock_reports_actionable_error_for_unwritable_lock(tmp_path):
+    layout = Layout(tmp_path)
+    layout.prepare()
+    lock = layout.locks / "demo.lock"
+    lock.write_bytes(b"")
+    lock.chmod(0o444)
+
+    with pytest.raises(ModelctlError) as excinfo:
+        with model_lock(layout, "demo"):
+            pass
+
+    message = str(excinfo.value)
+    assert "cannot open the model lock" in message
+    assert "rm" in message  # the remedy is actionable, not a raw traceback
+    lock.chmod(0o644)  # cleanup on read-only-capable filesystems
 
 
 def test_repair_is_dry_run_by_default_and_apply_quarantines_copy(tmp_path):

@@ -4,6 +4,16 @@ This project follows semantic versioning.
 
 ## Unreleased
 
+## 0.21.3
+
+### Improved
+
+- `model_lock` reports an actionable `ModelctlError` when the store session
+  cannot write a (stale or foreign-principal) lock file - naming the file and
+  the remedy (remove the file; it carries no data) - instead of leaking a raw
+  `PermissionError` traceback into job output. Observed on CIFS stores where
+  a lock was created under a different SMB principal.
+
 ## 0.21.2
 
 ### Fixed
