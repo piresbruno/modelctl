@@ -4,6 +4,17 @@ This project follows semantic versioning.
 
 ## Unreleased
 
+## 0.21.1
+
+### Fixed
+
+- `doctor` / `repair-active` no longer fail models whose update journal
+  records a stale or foreign absolute object path (store moved or restored,
+  journal written under a different root). `_journal_object` now falls back
+  to the manifest-derived canonical object (`models/<repo>/<commit>--<selection>`)
+  and accepts it when it resolves inside the managed store; without a store
+  manifest the audit still reports `missing_journal`.
+
 ## 0.21.0
 
 ### Added

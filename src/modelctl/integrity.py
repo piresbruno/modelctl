@@ -85,14 +85,30 @@ def _journal_object(layout: Layout, name: str) -> tuple[Path, str]:
     raw = Path(event["object"])
     if not raw.is_absolute():
         raise ModelctlError(f"journal object path is not absolute: {raw}")
+    commit = str(event["commit"])
     try:
         object_path = raw.resolve(strict=True)
         object_path.relative_to(layout.models.resolve(strict=True))
-    except (OSError, ValueError) as exc:
-        raise ModelctlError(
-            f"journal object for {name!r} is outside the managed model store"
-        ) from exc
-    return object_path, str(event["commit"])
+        return object_path, commit
+    except (OSError, ValueError) as original:
+        # The recorded path is stale or foreign (store moved/restored, or the
+        # journal was written under a different root). The canonical object is
+        # derivable from the store manifest plus the journaled commit — prefer
+        # it over failing the audit, provided it resolves inside the store.
+        try:
+            manifest = load_manifest(layout.root, name)
+            object_path = layout.object_path(manifest, commit).resolve(strict=True)
+        except (ModelctlError, OSError, ValueError) as fallback_error:
+            raise ModelctlError(
+                f"journal object for {name!r} is outside the managed model store"
+            ) from fallback_error
+        try:
+            object_path.relative_to(layout.models.resolve(strict=True))
+        except (OSError, ValueError) as outside:
+            raise ModelctlError(
+                f"journal object for {name!r} is outside the managed model store"
+            ) from outside
+        return object_path, commit
 
 
 def repair_target(root: Path, name: str) -> Path:
