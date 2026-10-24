@@ -89,7 +89,12 @@ def test_speed_bps_present_once_bytes_grow(tmp_path):
     emitter = DownloadProgressEmitter(stream=stream, interval=0.05)
     emitter.configure(staging=staging, name="demo", total_bytes=None)
     emitter.start()
-    time.sleep(0.12)
+    # Gate on the first emitted line, not a fixed sleep: the first sample is
+    # taken as soon as the thread is scheduled, however loaded the runner —
+    # growth is only applied once a <=10-byte sample is guaranteed to exist.
+    deadline = time.monotonic() + 5.0
+    while not _lines(stream) and time.monotonic() < deadline:
+        time.sleep(0.01)
     (staging / "weights.bin").write_bytes(b"x" * 10_000)
     time.sleep(0.15)
     emitter.stop()
