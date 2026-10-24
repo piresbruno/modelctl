@@ -1,3 +1,3 @@
 """Atomic model deployment primitives used by the modelctl CLI."""
 
-__version__ = "0.21.3"
+__version__ = "0.22.0"
