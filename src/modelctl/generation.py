@@ -9,6 +9,7 @@ from urllib.parse import unquote, urlparse
 
 from .errors import ManifestError, ModelctlError
 from .manifest import parse_manifest, validate_name
+from .progress import DownloadProgressEmitter
 
 _SHARD_RE = re.compile(
     r"^(?P<base>.+)-(?P<index>\d{5})-of-(?P<count>\d{5})\.gguf$", re.I
@@ -384,6 +385,7 @@ def download_generated_manifest(
     force_manifest: bool = False,
     api: Any | None = None,
     snapshot: Any | None = None,
+    progress: DownloadProgressEmitter | None = None,
 ) -> tuple[Path, Path]:
     """Download from a manifest document already validated during preflight."""
     import yaml
@@ -408,7 +410,7 @@ def download_generated_manifest(
             root, document, force=force_manifest
         )
     manifest = parse_manifest(document, manifest_name)
-    active = update_model(root, manifest, api=api, snapshot=snapshot)
+    active = update_model(root, manifest, api=api, snapshot=snapshot, progress=progress)
     return manifest_path, active
 
 
@@ -425,6 +427,7 @@ def download_from_hf(
     force_manifest: bool = False,
     api: Any | None = None,
     snapshot: Any | None = None,
+    progress: DownloadProgressEmitter | None = None,
 ) -> tuple[Path, Path]:
     """Generate a manifest, then download, validate, publish, and activate it."""
     document = generate_manifest_document(
@@ -443,4 +446,5 @@ def download_from_hf(
         force_manifest=force_manifest,
         api=api,
         snapshot=snapshot,
+        progress=progress,
     )

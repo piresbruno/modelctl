@@ -14,6 +14,7 @@ from .errors import ModelctlError
 from .generation import generate_manifest_document, infer_name, parse_hf_source
 from .layout import Layout, atomic_symlink
 from .manifest import validate_name
+from .progress import DownloadProgressEmitter
 
 
 class DownloadQueueError(ModelctlError):
@@ -332,16 +333,21 @@ def execute_download_queue(
     if not prepared:
         return []
 
-    def download(item: PreparedDownload) -> DownloadResult:
+    def download(payload: tuple[int, PreparedDownload]) -> DownloadResult:
+        index, item = payload
         request = item.request
         try:
             if downloader is None:
                 from .generation import download_generated_manifest
 
+                # Real downloads report throttled staging-size progress to
+                # stderr; the injected test path stays silent.
+                emitter = DownloadProgressEmitter(entry=index)
                 manifest_path, active_path = download_generated_manifest(
                     root,
                     item.document,
                     force_manifest=request.force,
+                    progress=emitter,
                 )
             else:
                 manifest_path, active_path = downloader(
@@ -361,7 +367,7 @@ def execute_download_queue(
 
     worker_count = min(jobs, len(prepared))
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        return list(executor.map(download, prepared))
+        return list(executor.map(download, enumerate(prepared, start=1)))
 
 
 def run_download_queue(

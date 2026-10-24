@@ -538,7 +538,7 @@ def test_queue_download_refreshes_catalog_and_list_with_dereferenced_model(
     def fake_generate(source, **kwargs):
         return real_generate(source, api=FakeApi(), **kwargs)
 
-    def fake_download_generated(root, document, *, force_manifest=False, api=None, snapshot=None):
+    def fake_download_generated(root, document, *, force_manifest=False, api=None, snapshot=None, progress=None):
         return real_download_generated(
             root,
             document,
@@ -607,7 +607,7 @@ def test_queue_json_emits_single_line_results_document(
     def fake_generate(source, **kwargs):
         return real_generate(source, api=FakeApi(), **kwargs)
 
-    def fake_download_generated(root, document, *, force_manifest=False, api=None, snapshot=None):
+    def fake_download_generated(root, document, *, force_manifest=False, api=None, snapshot=None, progress=None):
         return real_download_generated(
             root,
             document,
@@ -676,7 +676,7 @@ def test_queue_json_reports_per_entry_failures_and_exits_nonzero(
     def fake_generate(source, **kwargs):
         return real_generate(source, api=FakeApi(), **kwargs)
 
-    def fake_download_generated(root, document, *, force_manifest=False, api=None, snapshot=None):
+    def fake_download_generated(root, document, *, force_manifest=False, api=None, snapshot=None, progress=None):
         if document.get("name") == "beta":
             raise RuntimeError("connection reset mid-stream")
         return real_download_generated(

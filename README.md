@@ -1020,7 +1020,9 @@ registration (a `sync-local` record) instead of the NAS store, and `list
 --local` tolerates stale registrations. Parallel `--jobs` rsync streams and
 round-robin distribution over repeated `--host` fabric interfaces were added
 in `0.13.0`. The `queue` command gained a machine-readable `--json` results
-document in `0.21.0`.
+document in `0.21.0`. Throttled `progress:` JSONL emission on stderr (bytes
+done/total, speed, queue entry) for hub-side download tracking was added in
+`0.22.0`.
 
 `src/modelctl/__init__.py` is the single version source. Hatch reads it when
 building the package, and `modelctl --version` imports the same value so package

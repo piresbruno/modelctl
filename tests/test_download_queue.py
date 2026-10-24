@@ -5,14 +5,17 @@ from pathlib import Path
 import pytest
 
 import modelctl.download_queue as queue_module
+import modelctl.generation as generation_module
 from modelctl.download_queue import (
     DownloadQueueError,
     DownloadRequest,
+    execute_download_queue,
     load_download_queue,
     prepare_download_queue,
     run_download_queue,
     validate_queue_root,
 )
+from modelctl.progress import DownloadProgressEmitter
 
 
 def _generator(source, *, name, revision, quantization, runtime, mmproj, mtp):
@@ -208,3 +211,23 @@ def test_queue_rejects_nonpositive_jobs(tmp_path):
             jobs=0,
             generator=_generator,
         )
+
+
+def test_queue_workers_thread_entry_index_and_emitter(tmp_path, monkeypatch):
+    recorded: list[tuple[str, object]] = []
+
+    def fake_download(root, document, *, force_manifest=False, progress=None):
+        recorded.append((document["name"], progress))
+        return (tmp_path / "manifest.yaml", tmp_path / "active")
+
+    monkeypatch.setattr(generation_module, "download_generated_manifest", fake_download)
+    requests = [DownloadRequest("org/one"), DownloadRequest("org/two")]
+    prepared = prepare_download_queue(requests, jobs=1, generator=_generator)
+
+    results = execute_download_queue(tmp_path, prepared, jobs=1)
+
+    assert [result.succeeded for result in results] == [True, True]
+    assert [name for name, _ in recorded] == ["one", "two"]
+    for (_, progress), expected_entry in zip(recorded, [1, 2]):
+        assert isinstance(progress, DownloadProgressEmitter)
+        assert progress._entry == expected_entry
