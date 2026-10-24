@@ -13,8 +13,9 @@ This project follows semantic versioning.
   are written to stderr at most once per second per model, carrying the store
   `name`, the 1-based queue `entry`, `bytes_done` (staging-directory size,
   capped at the dry-run estimate total), `bytes_total`, and `speed_bps`.
-  Emission is always-on for downloads; dry-run estimation and all human/JSON
-  output are unchanged.
+  Emission is always-on for downloads; dry-run estimation is unchanged and
+  the `--json` stdout document is untouched — human runs additionally see
+  throttled `progress:` lines on stderr.
 
 ## 0.21.3
 
