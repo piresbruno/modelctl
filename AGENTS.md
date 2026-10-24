@@ -15,6 +15,8 @@ package uses a `src/` layout and exposes the `modelctl` command through
   generation.
 - `src/modelctl/download_queue.py`: queue parsing, validation, concurrent
   download orchestration, and the `queue --json` results document.
+- `src/modelctl/progress.py`: throttled staging-size progress emission
+  (`progress:` JSONL on stderr) for hub-side download tracking.
 - `src/modelctl/manifest.py`: immutable manifest models and parsing.
 - `src/modelctl/operations.py`: update, activation, local sync, deletion, and
   serve-command workflows.

@@ -1155,3 +1155,56 @@ def test_fsync_directory_tolerates_server_denied_flush(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "fsync", failed)
     with pytest.raises(OSError):
         _fsync_directory(tmp_path)
+
+
+class RecordingEmitter:
+    """IRI-021: records the emitter lifecycle update_model drives."""
+
+    def __init__(self):
+        self.events: list[tuple] = []
+
+    def configure(self, *, staging, name, total_bytes):
+        self.events.append(("configure", staging, name, total_bytes))
+
+    def start(self):
+        self.events.append(("start",))
+
+    def stop(self):
+        self.events.append(("stop",))
+
+
+def test_update_model_arms_and_stops_progress_emitter(tmp_path):
+    snapshot = FakeSnapshot({"config.json": b"{}", "model.safetensors": b"weights"})
+    emitter = RecordingEmitter()
+
+    update_model(
+        tmp_path, _manifest(), api=FakeApi("a" * 40), snapshot=snapshot, progress=emitter
+    )
+
+    assert [event[0] for event in emitter.events] == ["configure", "start", "stop"]
+    _, staging, name, total_bytes = emitter.events[0]
+    assert name == "demo"
+    assert total_bytes == len(b"{}") + len(b"weights")
+    assert Path(staging).is_relative_to(tmp_path / ".staging")
+
+
+def test_update_model_stops_progress_when_download_fails(tmp_path):
+    class FlakySnapshot(FakeSnapshot):
+        def __call__(self, **kwargs):
+            if kwargs.get("dry_run"):
+                return super().__call__(**kwargs)
+            raise OSError("disk on fire")
+
+    emitter = RecordingEmitter()
+
+    with pytest.raises(OSError):
+        update_model(
+            tmp_path,
+            _manifest(),
+            api=FakeApi("a" * 40),
+            snapshot=FlakySnapshot({"config.json": b"{}"}),
+            progress=emitter,
+        )
+
+    assert emitter.events[0][0] == "configure"
+    assert emitter.events[-1] == ("stop",)

@@ -42,6 +42,7 @@ from .maintenance import (
     cleanup_staging,
 )
 from .manifest import ModelManifest, validate_name
+from .progress import DownloadProgressEmitter
 from .state import DeleteState, StateJournal, UpdateState
 from .validation import (
     read_metadata,
@@ -251,6 +252,7 @@ def update_model(
     *,
     api: Any | None = None,
     snapshot: Callable[..., Any] | None = None,
+    progress: DownloadProgressEmitter | None = None,
 ) -> Path:
     layout = Layout(root)
     layout.prepare()
@@ -283,7 +285,21 @@ def update_model(
                 expected = estimate_snapshot(
                     manifest, commit, staging, snapshot=snapshot
                 )
-                download_snapshot(manifest, commit, staging, snapshot=snapshot)
+                if progress is not None:
+                    # The dry-run sizes are the byte denominator; the poller
+                    # only counts what the staging dir actually holds.
+                    known = [item.size for item in expected if item.size is not None]
+                    progress.configure(
+                        staging=staging,
+                        name=manifest.name,
+                        total_bytes=sum(known) if known else None,
+                    )
+                    progress.start()
+                try:
+                    download_snapshot(manifest, commit, staging, snapshot=snapshot)
+                finally:
+                    if progress is not None:
+                        progress.stop()
             except BaseException as exc:
                 journal.transition(
                     UpdateState.PARTIAL_RESUMABLE,

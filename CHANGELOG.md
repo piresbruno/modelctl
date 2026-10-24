@@ -4,6 +4,18 @@ This project follows semantic versioning.
 
 ## Unreleased
 
+## 0.22.0
+
+### Added
+
+- Throttled download-progress emission for hub-side tracking (irori): during
+  real (non-dry-run) `download` and `queue` runs, `progress: {...}` JSON lines
+  are written to stderr at most once per second per model, carrying the store
+  `name`, the 1-based queue `entry`, `bytes_done` (staging-directory size,
+  capped at the dry-run estimate total), `bytes_total`, and `speed_bps`.
+  Emission is always-on for downloads; dry-run estimation and all human/JSON
+  output are unchanged.
+
 ## 0.21.3
 
 ### Improved

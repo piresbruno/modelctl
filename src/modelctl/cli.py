@@ -47,6 +47,7 @@ from .maintenance import (
     cleanup_staging,
 )
 from .manifest import load_manifest, validate_name
+from .progress import DownloadProgressEmitter
 from .operations import (
     DeleteResult,
     active_entrypoint,
@@ -1411,6 +1412,7 @@ def run(argv: list[str] | None = None) -> int:
             mmproj=args.mmproj,
             mtp=args.mtp,
             force_manifest=args.force,
+            progress=DownloadProgressEmitter(),
         )
         print(f"manifest: {manifest_path}")
         print(f"active: {active}")
