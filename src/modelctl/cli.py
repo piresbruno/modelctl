@@ -59,6 +59,7 @@ from .operations import (
     scan_active_records,
     serve_cached_command,
     serve_command,
+    register_local,
     sync_local,
     update_model,
 )
@@ -377,6 +378,7 @@ def build_parser() -> argparse.ArgumentParser:
   modelctl path qwen3-8b --root /mnt/nas/llm-models
   modelctl serve-command qwen3-8b --root /mnt/nas/llm-models
   modelctl sync-local qwen3-8b --source-root /mnt/nas/llm-models --cache-dir ~/.cache/huggingface/hub
+  modelctl register-local qwen3-8b --source-root /mnt/nas/llm-models --dry-run
   modelctl push qwen3-8b --host node-b
 
 Use 'modelctl COMMAND --help' for command-specific examples.
@@ -965,6 +967,48 @@ progress is replaced by completion lines to keep output readable.""",
     sync.add_argument("--rsync", default="rsync", help="rsync executable")
     _add_local_root(sync)
 
+    register = commands.add_parser(
+        "register-local",
+        help="register an existing local HF cache entry without transferring",
+        description=(
+            "Verify an active NAS object against an existing local Hugging "
+            "Face cache entry (models--<owner>--<name>) and register it — "
+            "the same record, ref, and journal sync-local writes — without "
+            "transferring any bytes. LFS blobs are proven by blob filename "
+            "and size (zero content reads); small non-LFS files are hashed "
+            "on both sides. Every store file must be present in the local "
+            "snapshot tree and the local ref must point at the store commit. "
+            "Any mismatch refuses the registration and prints per-file "
+            "diffs; --dry-run writes nothing and doubles as a completeness "
+            "checker for a moved cache."
+        ),
+        formatter_class=HELP_FORMATTER,
+        epilog="""examples:
+  modelctl register-local qwen3-8b-vllm --source-root /mnt/nas/llm-models
+  modelctl register-local unsloth/DeepSeek-V4-Flash-0731 --dry-run
+  modelctl register-local qwen3-8b-vllm --json
+
+Pass an active model name or its unique Hugging Face repository id. The local
+cache entry must already contain the store commit (for example a cache moved
+from another host). Exit status is 0 only when the cache is verified
+equivalent; use --dry-run in scripts to check a moved copy. No transfer
+occurs and no Hugging Face API is contacted.""",
+    )
+    register.add_argument(
+        "name", metavar="MODEL_OR_REPO",
+        help="active model name or unique Hugging Face repository id",
+    )
+    register.add_argument(
+        "--source-root", "--from-root", metavar="PATH", dest="source_root",
+        help="NAS source root (default: configured NAS root)",
+    )
+    register.add_argument(
+        "--dry-run", action="store_true",
+        help="verify only; print the verdict and per-file diffs, write nothing",
+    )
+    _add_local_root(register)
+    register.add_argument("--json", action="store_true", help="emit JSON")
+
     push = commands.add_parser(
         "push",
         aliases=["sync-remote"],
@@ -1209,6 +1253,39 @@ def run(argv: list[str] | None = None) -> int:
         )
         print(result)
         return 0
+
+    if args.command == "register-local":
+        cache = _selected_cache(args)
+        source_root = _root(args.source_root)
+        result = register_local(
+            source_root,
+            cache,
+            args.name,
+            dry_run=args.dry_run,
+            # Progress moves to stderr under --json so the document stays
+            # machine-readable (same contract as `queue --json`).
+            progress=lambda message: print(
+                message, file=sys.stderr if args.json else sys.stdout, flush=True
+            ),
+        )
+        if args.json:
+            print(json.dumps(result.to_dict(), indent=2))
+        elif result.issues:
+            for issue in result.issues:
+                print(f"mismatch: {issue.path}: {issue.detail}")
+            print("register-local: not registered")
+        elif result.dry_run:
+            print(
+                f"verified: {result.selected_files} files match "
+                f"({result.lfs_files} by blob identity — names and sizes, "
+                f"not content; {result.hashed_files} content-hashed, "
+                f"{_format_size(result.hashed_bytes)})"
+            )
+            print("dry-run: no changes written")
+            print(result.entrypoint)
+        else:
+            print(result.entrypoint)
+        return 0 if result.verified else 1
 
     if args.command == "push":
         hosts = args.host

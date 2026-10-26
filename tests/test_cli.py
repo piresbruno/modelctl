@@ -20,7 +20,12 @@ from modelctl.catalog import (
 )
 from modelctl.integrity import ActiveReferenceAudit, RepairResult
 from modelctl.sync_queue import PreparedSync, SyncQueueEntry, SyncQueueResult
-from modelctl.hf_cache import LocalDeleteResult, state_root
+from modelctl.hf_cache import (
+    LocalCacheIssue,
+    LocalCacheRegistration,
+    LocalDeleteResult,
+    state_root,
+)
 from modelctl.layout import Layout, atomic_symlink
 from modelctl.maintenance import StoreEntryAudit
 from modelctl.manifest import parse_manifest
@@ -863,6 +868,131 @@ def test_sync_local_requires_name_or_queue(tmp_path):
         run(["sync-local"])
 
 
+def test_register_local_passes_arguments_and_prints_json(
+    tmp_path, monkeypatch, capsys
+):
+    nas, cache = tmp_path / "nas", tmp_path / "hub"
+    calls = []
+
+    def fake_register(source_root, cache_dir, name, *, dry_run=False, progress=None):
+        calls.append((source_root, cache_dir, name, dry_run, progress is not None))
+        return LocalCacheRegistration(
+            name=name,
+            repo="org/demo",
+            revision="main",
+            commit="d" * 40,
+            cache=cache_dir,
+            repository=cache_dir / "models--org--demo",
+            snapshot=cache_dir / "models--org--demo" / "snapshots" / ("d" * 40),
+            entrypoint=(
+                cache_dir / "models--org--demo" / "snapshots" / ("d" * 40) / "m.gguf"
+            ),
+            dry_run=dry_run,
+            verified=True,
+            registered=not dry_run,
+            selected_files=1,
+            lfs_files=0,
+            hashed_files=1,
+            hashed_bytes=2,
+            issues=(),
+        )
+
+    monkeypatch.setattr("modelctl.cli.register_local", fake_register)
+    assert run([
+        "register-local", "demo",
+        "--source-root", str(nas),
+        "--cache-dir", str(cache),
+        "--dry-run", "--json",
+    ]) == 0
+    assert calls == [(nas, cache, "demo", True, True)]
+    document = json.loads(capsys.readouterr().out)
+    assert document["command"] == "register-local"
+    assert document["dry_run"] is True
+    assert document["verified"] is True
+    assert document["registered"] is False
+    assert document["files"] == {
+        "selected": 1,
+        "lfs_by_name": 0,
+        "hashed": 1,
+        "hash_bytes": 2,
+    }
+
+
+def test_register_local_prints_entrypoint_on_success(
+    tmp_path, monkeypatch, capsys
+):
+    nas, cache = tmp_path / "nas", tmp_path / "hub"
+    entrypoint = cache / "models--org--demo" / "snapshots" / ("d" * 40) / "m.gguf"
+
+    def fake_register(source_root, cache_dir, name, *, dry_run=False, progress=None):
+        return LocalCacheRegistration(
+            name=name,
+            repo="org/demo",
+            revision="main",
+            commit="d" * 40,
+            cache=cache_dir,
+            repository=cache_dir / "models--org--demo",
+            snapshot=cache_dir / "models--org--demo" / "snapshots" / ("d" * 40),
+            entrypoint=entrypoint,
+            dry_run=False,
+            verified=True,
+            registered=True,
+            selected_files=1,
+            lfs_files=0,
+            hashed_files=1,
+            hashed_bytes=2,
+            issues=(),
+        )
+
+    monkeypatch.setattr("modelctl.cli.register_local", fake_register)
+    assert run([
+        "register-local", "demo",
+        "--source-root", str(nas),
+        "--cache-dir", str(cache),
+    ]) == 0
+    assert capsys.readouterr().out == f"{entrypoint}\n"
+
+
+def test_register_local_reports_issues_and_exits_nonzero(
+    tmp_path, monkeypatch, capsys
+):
+    nas, cache = tmp_path / "nas", tmp_path / "hub"
+
+    def fake_register(source_root, cache_dir, name, *, dry_run=False, progress=None):
+        return LocalCacheRegistration(
+            name=name,
+            repo="org/demo",
+            revision="main",
+            commit="d" * 40,
+            cache=cache_dir,
+            repository=cache_dir / "models--org--demo",
+            snapshot=cache_dir / "models--org--demo" / "snapshots" / ("d" * 40),
+            entrypoint=cache_dir / "models--org--demo" / "snapshots" / ("d" * 40),
+            dry_run=False,
+            verified=False,
+            registered=False,
+            selected_files=2,
+            lfs_files=1,
+            hashed_files=1,
+            hashed_bytes=0,
+            issues=(
+                LocalCacheIssue(
+                    "file-set", "tokenizer.json", "missing from the local snapshot tree"
+                ),
+            ),
+        )
+
+    monkeypatch.setattr("modelctl.cli.register_local", fake_register)
+    assert run([
+        "register-local", "demo",
+        "--source-root", str(nas),
+        "--cache-dir", str(cache),
+    ]) == 1
+    out = capsys.readouterr().out
+    assert "mismatch: tokenizer.json: missing from the local snapshot tree" in out
+    assert "register-local: not registered" in out
+
+
 def test_delete_local_deletes_cache_data_by_default(tmp_path, monkeypatch, capsys):
     cache = tmp_path / "hub"
     record = cache / "state" / "active" / "demo.json"
@@ -978,6 +1108,7 @@ def test_top_level_help_has_description_and_examples(capsys):
         ("path", "MODEL_PATH=$(modelctl path"),
         ("serve-command", "modelctl serve-command model-q4"),
         ("sync-local", "modelctl sync-local qwen3-8b-vllm"),
+        ("register-local", "modelctl register-local qwen3-8b-vllm"),
         ("push", "modelctl push qwen3-8b-vllm --host node-b"),
         ("sync-remote", "modelctl sync-remote qwen3-8b-vllm --host node-b"),
         ("receive-cache", "modelctl receive-cache --probe qwen3-8b-vllm"),

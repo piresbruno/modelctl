@@ -24,6 +24,7 @@ from modelctl.operations import (
     delete_model,
     list_active_models,
     list_cached_models,
+    register_local,
     serve_command,
     sync_local,
     update_model,
@@ -79,6 +80,46 @@ class FakeSnapshot:
 def _manifest(name="demo", **overrides):
     raw = {"repo": "org/demo", "runtime": "vllm", **overrides}
     return parse_manifest(raw, name)
+
+
+def _object_path(nas: Path, name: str = "demo") -> Path:
+    return (nas / "active" / name).resolve()
+
+
+def _promote_to_lfs(store: Path, filename: str) -> str:
+    """Rewrite one store file's HF metadata to a sha256 (LFS) ETag, as a real
+    Hugging Face download produces for LFS files."""
+    metadata = store / ".cache" / "huggingface" / "download" / f"{filename}.metadata"
+    lines = metadata.read_text().splitlines()
+    digest = hashlib.sha256((store / filename).read_bytes()).hexdigest()
+    lines[1] = digest
+    metadata.write_text("\n".join(lines) + "\n")
+    return digest
+
+
+def _seed_local_cache(cache: Path, store: Path) -> Path:
+    """Mirror a store object into a standard HF hub cache layout: blobs named
+    by ETag, snapshot symlinks, refs/main."""
+    metadata = json.loads((store / ".modelctl.json").read_text())
+    commit = metadata["commit"]
+    repository = cache / f"models--{metadata['repo'].replace('/', '--')}"
+    for item in metadata["files"]:
+        filename = item["path"]
+        etag = (
+            (store / ".cache" / "huggingface" / "download" / f"{filename}.metadata")
+            .read_text()
+            .splitlines()[1]
+            .strip()
+        )
+        blob = repository / "blobs" / etag
+        blob.parent.mkdir(parents=True, exist_ok=True)
+        blob.write_bytes((store / filename).read_bytes())
+        pointer = repository / "snapshots" / commit / filename
+        pointer.parent.mkdir(parents=True, exist_ok=True)
+        pointer.symlink_to(os.path.relpath(blob, pointer.parent))
+    (repository / "refs").mkdir(parents=True, exist_ok=True)
+    (repository / "refs" / "main").write_text(commit)
+    return repository
 
 
 def test_update_publishes_before_switching_reference_and_reuses_valid_object(tmp_path):
@@ -515,6 +556,435 @@ def test_local_sync_publishes_hf_cache_and_updates_record_last(
     assert [(item.name, item.repo, item.path) for item in inventory] == [
         ("demo", "org/demo", snapshot.resolve())
     ]
+
+
+def test_register_local_publishes_record_without_transfer(tmp_path, monkeypatch):
+    nas, cache = tmp_path / "nas", tmp_path / "cache"
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot(
+            {"config.json": b"data", "model.safetensors": b"weights"}
+        ),
+    )
+    store = _object_path(nas)
+    lfs_etag = _promote_to_lfs(store, "model.safetensors")
+    repository = _seed_local_cache(cache, store)
+    snapshot = repository / "snapshots" / ("d" * 40)
+
+    hashed = []
+    real_git_blob = hf_cache._git_blob_digest
+
+    def track_git_blob(path):
+        hashed.append(path.name)
+        return real_git_blob(path)
+
+    monkeypatch.setattr("modelctl.hf_cache._git_blob_digest", track_git_blob)
+
+    def no_sha256(path):
+        raise AssertionError("LFS blob content was read")
+
+    monkeypatch.setattr("modelctl.hf_cache._sha256_digest", no_sha256)
+
+    result = register_local(nas, cache, "demo")
+
+    assert result.verified is True
+    assert result.registered is True
+    assert result.issues == ()
+    assert result.selected_files == 2
+    assert result.lfs_files == 1
+    assert result.hashed_files == 1
+    assert result.hashed_bytes == 4  # only the non-LFS file is measured
+    assert result.entrypoint == snapshot.resolve()
+    record = load_record(cache, "demo")
+    config_etag = hashlib.sha1(b"blob 4\x00data").hexdigest()
+    assert record.files == {
+        "config.json": config_etag,
+        "model.safetensors": lfs_etag,
+    }
+    assert record.snapshot == snapshot.resolve()
+    assert (repository / "refs" / "main").read_text() == "d" * 40
+    # LFS blobs are proven by identity only: store side + blob side of the
+    # one small file, never the safetensors blob
+    assert hashed == ["config.json", config_etag]
+    state = json.loads((state_root(cache) / "state" / "demo.json").read_text())
+    assert state["operation"] == "hf-cache-register"
+    assert [item["state"] for item in state["history"]] == [
+        "REGISTERING_LOCAL_CACHE",
+        "READY_FOR_SERVICE_RESTART",
+    ]
+    info = scan_cache_dir(cache)
+    assert not info.warnings
+    assert [
+        (item.name, item.repo, item.path) for item in list_cached_models(cache)
+    ] == [("demo", "org/demo", snapshot.resolve())]
+
+
+def test_register_local_dry_run_verifies_and_writes_nothing(tmp_path):
+    nas, cache = tmp_path / "nas", tmp_path / "cache"
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot({"config.json": b"data"}),
+    )
+    repository = _seed_local_cache(cache, _object_path(nas))
+    refs_before = (repository / "refs" / "main").read_bytes()
+
+    result = register_local(nas, cache, "demo", dry_run=True)
+
+    assert result.verified is True
+    assert result.registered is False
+    assert result.dry_run is True
+    assert result.issues == ()
+    assert not state_root(cache).exists()
+    assert (repository / "refs" / "main").read_bytes() == refs_before
+
+
+def test_register_local_requires_cache_entry(tmp_path):
+    nas, cache = tmp_path / "nas", tmp_path / "cache"
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot({"config.json": b"data"}),
+    )
+    with pytest.raises(ModelctlError, match="not present.+sync-local"):
+        register_local(nas, cache, "demo")
+
+
+def test_register_local_requires_store_commit_snapshot(tmp_path):
+    nas, cache = tmp_path / "nas", tmp_path / "cache"
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot({"config.json": b"data"}),
+    )
+    repository = _seed_local_cache(cache, _object_path(nas))
+    (repository / "snapshots" / ("d" * 40)).rename(
+        repository / "snapshots" / ("e" * 40)
+    )
+    with pytest.raises(ModelctlError, match="no snapshot for store commit"):
+        register_local(nas, cache, "demo")
+
+
+def test_register_local_lists_missing_files_and_fails_closed(tmp_path):
+    nas, cache = tmp_path / "nas", tmp_path / "cache"
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot({"config.json": b"data", "weights.bin": b"12345678"}),
+    )
+    repository = _seed_local_cache(cache, _object_path(nas))
+    weights_etag = hashlib.sha1(b"blob 8\x0012345678").hexdigest()
+    (repository / "snapshots" / ("d" * 40) / "weights.bin").unlink()
+    (repository / "blobs" / weights_etag).unlink()
+
+    result = register_local(nas, cache, "demo")
+
+    assert result.verified is False
+    assert result.registered is False
+    assert [(issue.check, issue.path) for issue in result.issues] == [
+        ("file-set", "weights.bin")
+    ]
+    assert "missing" in result.issues[0].detail
+    assert not (state_root(cache) / "active" / "demo.json").exists()
+    assert (repository / "refs" / "main").read_text() == "d" * 40
+
+
+def test_register_local_rejects_lfs_blob_size_mismatch(tmp_path):
+    nas, cache = tmp_path / "nas", tmp_path / "cache"
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot(
+            {"config.json": b"data", "model.safetensors": b"weights"}
+        ),
+    )
+    store = _object_path(nas)
+    lfs_etag = _promote_to_lfs(store, "model.safetensors")
+    repository = _seed_local_cache(cache, store)
+    # Truncated in transit with its content-addressed name preserved
+    (repository / "blobs" / lfs_etag).write_bytes(b"w")
+
+    result = register_local(nas, cache, "demo")
+
+    assert result.verified is False
+    assert result.registered is False
+    assert [(issue.check, issue.path) for issue in result.issues] == [
+        ("blob-name", "model.safetensors")
+    ]
+    assert "size" in result.issues[0].detail
+
+
+def test_register_local_rejects_local_content_hash_mismatch(tmp_path):
+    nas, cache = tmp_path / "nas", tmp_path / "cache"
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot({"config.json": b"data"}),
+    )
+    repository = _seed_local_cache(cache, _object_path(nas))
+    blob = repository / "blobs" / hashlib.sha1(b"blob 4\0data").hexdigest()
+    blob.write_bytes(b"datX")  # same length, different content
+
+    result = register_local(nas, cache, "demo")
+
+    assert result.verified is False
+    assert [(issue.check, issue.path) for issue in result.issues] == [
+        ("content-hash", "config.json")
+    ]
+    assert not (state_root(cache) / "active" / "demo.json").exists()
+
+
+def test_register_local_rejects_store_hash_disagreement(tmp_path):
+    nas, cache = tmp_path / "nas", tmp_path / "cache"
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot({"config.json": b"data"}),
+    )
+    store = _object_path(nas)
+    repository = _seed_local_cache(cache, store)
+    (store / "config.json").write_bytes(b"datX")  # store corrupted after update
+
+    result = register_local(nas, cache, "demo")
+
+    assert result.verified is False
+    assert [(issue.check, issue.path) for issue in result.issues] == [
+        ("content-hash", "config.json")
+    ]
+    assert "store" in result.issues[0].detail
+
+
+def test_register_local_rejects_ref_mismatch(tmp_path):
+    nas, cache = tmp_path / "nas", tmp_path / "cache"
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot({"config.json": b"data"}),
+    )
+    repository = _seed_local_cache(cache, _object_path(nas))
+    (repository / "refs" / "main").write_text("e" * 40)
+
+    result = register_local(nas, cache, "demo")
+
+    assert result.verified is False
+    assert [(issue.check, issue.path) for issue in result.issues] == [
+        ("refs", "main")
+    ]
+    assert "points to" in result.issues[0].detail
+    assert not (state_root(cache) / "active" / "demo.json").exists()
+
+
+def test_register_local_rejects_missing_ref(tmp_path):
+    nas, cache = tmp_path / "nas", tmp_path / "cache"
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot({"config.json": b"data"}),
+    )
+    repository = _seed_local_cache(cache, _object_path(nas))
+    (repository / "refs" / "main").unlink()
+
+    result = register_local(nas, cache, "demo")
+
+    assert result.verified is False
+    assert [(issue.check, issue.path) for issue in result.issues] == [
+        ("refs", "main")
+    ]
+    assert "no ref for revision" in result.issues[0].detail
+
+
+def test_register_local_accepts_pinned_commit_revision_without_ref(tmp_path):
+    nas, cache = tmp_path / "nas", tmp_path / "cache"
+    update_model(
+        nas,
+        _manifest(revision="d" * 40),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot({"config.json": b"data"}),
+    )
+    repository = _seed_local_cache(cache, _object_path(nas))
+    (repository / "refs" / "main").unlink()
+
+    result = register_local(nas, cache, "demo")
+
+    assert result.verified is True
+    assert result.registered is True
+    # Commit-pinned revisions have no ref to publish or require
+    assert not (repository / "refs" / "main").exists()
+
+
+def test_register_local_rejects_snapshot_pointer_escaping_blobs(tmp_path):
+    nas, cache = tmp_path / "nas", tmp_path / "cache"
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot({"config.json": b"data"}),
+    )
+    repository = _seed_local_cache(cache, _object_path(nas))
+    blob = repository / "blobs" / hashlib.sha1(b"blob 4\0data").hexdigest()
+    blob.unlink()
+    blob.symlink_to(_object_path(nas) / "config.json")
+
+    result = register_local(nas, cache, "demo")
+
+    assert result.verified is False
+    assert [(issue.check, issue.path) for issue in result.issues] == [
+        ("file-set", "config.json")
+    ]
+    assert "does not resolve inside" in result.issues[0].detail
+
+
+def test_register_local_rejects_non_regular_blob(tmp_path):
+    nas, cache = tmp_path / "nas", tmp_path / "cache"
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot({"config.json": b"data"}),
+    )
+    repository = _seed_local_cache(cache, _object_path(nas))
+    blob = repository / "blobs" / hashlib.sha1(b"blob 4\0data").hexdigest()
+    blob.unlink()
+    blob.mkdir()
+
+    result = register_local(nas, cache, "demo")
+
+    assert [(issue.check, issue.path) for issue in result.issues] == [
+        ("blob-name", "config.json")
+    ]
+    assert "not a regular file" in result.issues[0].detail
+
+
+def test_register_local_reregistering_same_commit_is_idempotent(tmp_path):
+    nas, cache = tmp_path / "nas", tmp_path / "cache"
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot({"config.json": b"data"}),
+    )
+    _seed_local_cache(cache, _object_path(nas))
+    register_local(nas, cache, "demo")
+    first = load_record(cache, "demo")
+
+    result = register_local(nas, cache, "demo")
+
+    assert result.registered is True
+    second = load_record(cache, "demo")
+    assert second.files == first.files
+    assert second.snapshot == first.snapshot
+    history = json.loads(
+        (state_root(cache) / "state" / "demo.json").read_text()
+    )["history"]
+    assert [item["state"] for item in history] == [
+        "REGISTERING_LOCAL_CACHE",
+        "READY_FOR_SERVICE_RESTART",
+        "REGISTERING_LOCAL_CACHE",
+        "READY_FOR_SERVICE_RESTART",
+    ]
+
+
+def test_register_local_reregistering_moves_record_to_new_commit(tmp_path):
+    nas, cache = tmp_path / "nas", tmp_path / "cache"
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot({"config.json": b"v1"}),
+    )
+    _seed_local_cache(cache, _object_path(nas))
+    register_local(nas, cache, "demo")
+
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("e" * 40),
+        snapshot=FakeSnapshot({"config.json": b"v2"}),
+    )
+    _seed_local_cache(cache, _object_path(nas))
+    result = register_local(nas, cache, "demo")
+
+    assert result.verified is True
+    assert result.registered is True
+    record = load_record(cache, "demo")
+    assert record.commit == "e" * 40
+    assert record.files == {
+        "config.json": hashlib.sha1(b"blob 2\0v2").hexdigest()
+    }
+    state = json.loads(
+        (state_root(cache) / "state" / "demo.json").read_text()
+    )
+    registering = [
+        item for item in state["history"]
+        if item["state"] == "REGISTERING_LOCAL_CACHE"
+    ]
+    assert registering[-1]["previous_commit"] == "d" * 40
+    # Content-addressed data from the previous registration is retained
+    old_blob = (
+        cache / "models--org--demo" / "blobs"
+        / hashlib.sha1(b"blob 2\0v1").hexdigest()
+    )
+    assert old_blob.is_file()
+
+
+def test_register_local_ignores_extra_local_files(tmp_path):
+    nas, cache = tmp_path / "nas", tmp_path / "cache"
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot({"config.json": b"data"}),
+    )
+    repository = _seed_local_cache(cache, _object_path(nas))
+    snapshot = repository / "snapshots" / ("d" * 40)
+    extra_blob = repository / "blobs" / ("f" * 64)
+    extra_blob.write_bytes(b"extra")
+    (snapshot / "extra.txt").symlink_to(os.path.relpath(extra_blob, snapshot))
+
+    result = register_local(nas, cache, "demo")
+
+    # Partial selections stay partial: the record pins the store's selection
+    assert result.verified is True
+    assert result.registered is True
+    assert set(load_record(cache, "demo").files) == {"config.json"}
+
+
+def test_register_local_after_keep_data_rebuilds_record(tmp_path):
+    nas, cache = tmp_path / "nas", tmp_path / "cache"
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot({"config.json": b"data"}),
+    )
+
+    def copy(command, check):
+        source = Path(command[-2].removesuffix("/"))
+        destination = Path(command[-1].removesuffix("/"))
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source / "config.json", destination / "config.json")
+
+    sync_local(nas, cache, "demo", runner=copy)
+    delete_local(cache, "demo", keep_data=True)
+    assert not (state_root(cache) / "active" / "demo.json").exists()
+
+    result = register_local(nas, cache, "demo")
+
+    assert result.verified is True
+    assert result.registered is True
+    refs = json.loads((state_root(cache) / "refs.json").read_text())
+    assert refs["refs"] == {"org/demo@main": {"commit": "d" * 40}}
 
 
 def test_delete_local_deletes_cache_data_and_preserves_nas(tmp_path):
