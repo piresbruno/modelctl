@@ -4,6 +4,26 @@ This project follows semantic versioning.
 
 ## Unreleased
 
+### Added
+
+- `modelctl register-local MODEL_OR_REPO [--source-root NAS] [--cache-dir DIR]
+  [--dry-run] [--json]`: adopt an existing local Hugging Face cache entry
+  (`models--<owner>--<name>`) as a modelctl registration without
+  transferring anything. The active NAS object is resolved exactly like
+  `sync-local` and verified against the local entry — LFS blobs by
+  content-addressed blob filename and size (zero content reads), small
+  non-LFS files by Git-blob hash on both sides, every store file present in
+  the snapshot tree, and the local ref pointing at the store commit. On a
+  full match, the same internal publish/register routine `sync-local` uses
+  after staging writes the registration record, ref, and journal under
+  `~/.local/state/modelctl/hf-cache/<sha20>/` while holding the existing
+  per-name and per-repo locks. Any mismatch refuses with per-file diffs and
+  writes nothing; `--dry-run` verifies and reports without taking locks or
+  creating state, doubling as a completeness checker for a moved cache, and
+  exits 0 only when verified. `--json` emits a machine-readable verdict
+  document (progress moves to stderr, as with `queue --json`). The command
+  is fully offline and never contacts the Hugging Face API.
+
 ## 0.22.0
 
 ### Added

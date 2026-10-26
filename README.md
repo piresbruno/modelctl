@@ -538,6 +538,39 @@ access to the synchronized files, but it is not a complete repository snapshot.
 Foreign branch or tag refs are preserved; modelctl resolves its exact cached
 commit through its own registration state.
 
+### Register an existing cache entry without transferring
+
+`register-local` adopts a Hugging Face cache entry that is already on this
+host — for example a cache moved from another machine — without transferring
+a single byte from the NAS. It resolves the active store object exactly like
+`sync-local`, locates the local `models--OWNER--REPO` entry, verifies the
+two are equivalent, and then writes the same registration record, ref, and
+journal that `sync-local` publishes after a transfer:
+
+```bash
+modelctl register-local qwen3-8b-vllm \
+  --source-root /mnt/nas/llm-models
+```
+
+Verification reads no large content: LFS blobs are proven by their
+content-addressed blob filename and size (zero content reads), while small
+non-LFS files are Git-blob-hashed on both sides. Every store file must be
+present in the local snapshot tree, and the local ref must point at the
+store's commit. Any mismatch refuses the registration, prints per-file
+diffs, and leaves the cache and any existing registration untouched;
+`--dry-run` additionally writes nothing, which makes it a free completeness
+checker for a moved copy:
+
+```bash
+modelctl register-local unsloth/DeepSeek-V4-Flash-0731 --dry-run
+```
+
+Exit status is 0 only when the cache is verified equivalent, so scripts can
+gate on it. Like `sync-local`, the command is fully offline: it never
+contacts the Hugging Face API. Re-registering an already registered model
+overwrites its record once verification passes (sync-local parity); a
+failed verification never degrades an existing registration.
+
 ### Copy active models to another instance over SSH
 
 `push` copies a model from **this host's Hugging Face cache** into another
@@ -970,6 +1003,12 @@ contain only metadata or references. It does not prove that cached and NAS
 revisions or selected weight files are identical; compare the resolved revision
 and modelctl object metadata when exact equivalence is required.
 
+`modelctl register-local --dry-run` performs exactly that equivalence check:
+it compares an active store object with a local cache entry file by file
+(LFS blobs by content-addressed name and size, small files by Git-blob
+hash), prints per-file diffs for anything that disagrees, and writes
+nothing.
+
 ## CLI help
 
 The top-level and every subcommand provide descriptions, option details, and
@@ -989,6 +1028,7 @@ modelctl update --help
 modelctl path --help
 modelctl serve-command --help
 modelctl sync-local --help
+modelctl register-local --help
 modelctl push --help
 modelctl receive-cache --help
 ```

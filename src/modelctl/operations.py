@@ -18,11 +18,13 @@ from .catalog import (
 from .errors import ModelctlError, ValidationError
 from .generation import parse_hf_source
 from .hf_cache import (
+    LocalCacheRegistration,
     LocalDeleteResult,
     cached_entrypoint,
     delete_record,
     list_records,
     load_record,
+    register_local_cache,
     sync_cache,
 )
 from .hub import download_snapshot, estimate_snapshot, resolve_commit
@@ -850,6 +852,26 @@ def sync_local(
         resolved_name,
         rsync=rsync,
         runner=runner,
+        progress=progress,
+    )
+
+
+def register_local(
+    source_root: Path,
+    local_root: Path,
+    selector: str,
+    *,
+    dry_run: bool = False,
+    progress: Callable[[str], None] | None = None,
+) -> LocalCacheRegistration:
+    """Register an existing local HF cache entry against the active store
+    object without transferring anything."""
+    name = resolve_active_name(source_root, selector)
+    return register_local_cache(
+        source_root,
+        local_root,
+        name,
+        dry_run=dry_run,
         progress=progress,
     )
 

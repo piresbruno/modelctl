@@ -54,6 +54,67 @@ class LocalDeleteResult:
     retained: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class LocalCacheIssue:
+    """One mismatch between a store object and a local Hugging Face cache."""
+
+    check: str  # "file-set" | "blob-name" | "content-hash" | "refs"
+    path: str
+    detail: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"check": self.check, "path": self.path, "detail": self.detail}
+
+
+@dataclass(frozen=True)
+class LocalCacheRegistration:
+    """Outcome of ``modelctl register-local``.
+
+    ``verified`` means the local cache entry is equivalent to the active
+    store object; ``registered`` means a record was actually written (never
+    under ``--dry-run``, and only when every check passed)."""
+
+    name: str
+    repo: str
+    revision: str
+    commit: str
+    cache: Path
+    repository: Path
+    snapshot: Path
+    entrypoint: Path
+    dry_run: bool
+    verified: bool
+    registered: bool
+    selected_files: int
+    lfs_files: int
+    hashed_files: int
+    hashed_bytes: int
+    issues: tuple[LocalCacheIssue, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "command": "register-local",
+            "name": self.name,
+            "repo": self.repo,
+            "revision": self.revision,
+            "commit": self.commit,
+            "cache": str(self.cache),
+            "repository": str(self.repository),
+            "snapshot": str(self.snapshot),
+            "entrypoint": str(self.entrypoint),
+            "dry_run": self.dry_run,
+            "verified": self.verified,
+            "registered": self.registered,
+            "files": {
+                "selected": self.selected_files,
+                "lfs_by_name": self.lfs_files,
+                "hashed": self.hashed_files,
+                "hash_bytes": self.hashed_bytes,
+            },
+            "issues": [issue.to_dict() for issue in self.issues],
+        }
+
+
 def canonical_cache(cache_dir: Path) -> Path:
     return cache_dir.expanduser().absolute().resolve(strict=False)
 
@@ -170,7 +231,14 @@ def _journal_path(cache_dir: Path, name: str) -> Path:
     return state_root(cache_dir) / "state" / f"{validate_name(name)}.json"
 
 
-def _transition(cache_dir: Path, name: str, state: str, **details: Any) -> None:
+def _transition(
+    cache_dir: Path,
+    name: str,
+    state: str,
+    *,
+    operation: str = "hf-cache-sync",
+    **details: Any,
+) -> None:
     path = _journal_path(cache_dir, name)
     history: list[dict[str, Any]] = []
     if path.exists():
@@ -185,7 +253,7 @@ def _transition(cache_dir: Path, name: str, state: str, **details: Any) -> None:
     )
     _atomic_json(
         path,
-        {"operation": "hf-cache-sync", "state": state, "history": history},
+        {"operation": operation, "state": state, "history": history},
     )
 
 
@@ -225,18 +293,28 @@ def read_source_etag(source: Path, filename: str, commit: str) -> str:
     return _read_etag(source, filename, commit)
 
 
-def _digest_for_etag(path: Path, etag: str) -> str:
-    if len(etag) == 64:
-        digest = hashlib.sha256()
-        prefix = b""
-    else:
-        digest = hashlib.sha1()
-        prefix = f"blob {path.stat().st_size}\0".encode()
-    digest.update(prefix)
+def _sha256_digest(path: Path) -> str:
+    digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _git_blob_digest(path: Path) -> str:
+    """Git blob hash (``blob <size>\\0`` prefix + SHA-1) of a file's content."""
+    digest = hashlib.sha1()
+    digest.update(f"blob {path.stat().st_size}\0".encode())
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _digest_for_etag(path: Path, etag: str) -> str:
+    if len(etag) == 64:
+        return _sha256_digest(path)
+    return _git_blob_digest(path)
 
 
 def _verify_etag(path: Path, etag: str) -> None:
@@ -387,17 +465,14 @@ def _record_payload(
     }
 
 
-def sync_cache(
-    source_root: Path,
-    cache_dir: Path,
-    name: str,
-    *,
-    rsync: str = "rsync",
-    runner: Callable[..., Any] = subprocess.run,
-    progress: Callable[[str], None] | None = None,
-) -> Path:
+def _active_store_object(source_root: Path, name: str) -> tuple[Path, dict[str, Any]]:
+    """Resolve an active store object exactly like ``sync-local`` does.
+
+    Returns the object directory and its validated metadata. Deliberately
+    stat-only: object metadata never carries per-file SHA-256 digests, so
+    ``validate_object`` sizes and contains files without reading content.
+    """
     validate_name(name)
-    cache = canonical_cache(cache_dir)
     source_layout = Layout(source_root)
     reference = source_layout.active_path(name)
     if not reference.is_symlink():
@@ -410,12 +485,36 @@ def sync_cache(
     metadata = validate_object(source, expected_name=name)
     commit = str(metadata.get("commit", ""))
     if not _COMMIT_RE.fullmatch(commit):
-        raise ValidationError(f"invalid Hugging Face commit in object metadata: {commit!r}")
-    expected = [ExpectedFile.from_dict(item) for item in metadata["files"]]
-    files = {
+        raise ValidationError(
+            f"invalid Hugging Face commit in object metadata: {commit!r}"
+        )
+    return source, metadata
+
+
+def _store_file_etags(source: Path, metadata: dict[str, Any]) -> dict[str, str]:
+    """Read the retained Hugging Face ETag for every selected object file."""
+    commit = str(metadata["commit"])
+    return {
         item.path: read_source_etag(source, item.path, commit)
-        for item in expected
+        for item in (ExpectedFile.from_dict(item) for item in metadata["files"])
     }
+
+
+def sync_cache(
+    source_root: Path,
+    cache_dir: Path,
+    name: str,
+    *,
+    rsync: str = "rsync",
+    runner: Callable[..., Any] = subprocess.run,
+    progress: Callable[[str], None] | None = None,
+) -> Path:
+    validate_name(name)
+    cache = canonical_cache(cache_dir)
+    source, metadata = _active_store_object(source_root, name)
+    commit = str(metadata["commit"])
+    expected = [ExpectedFile.from_dict(item) for item in metadata["files"]]
+    files = _store_file_etags(source, metadata)
     repository = repo_path(cache, str(metadata.get("repo", "")))
     selection = _selection(files)
     staging = staging_path_for(cache, str(metadata.get("repo", "")), commit, files)
@@ -466,6 +565,66 @@ def sync_cache(
         return publish_synced_staging(
             cache, name, metadata, files, staging, progress=progress
         )
+
+
+def _verify_snapshot_pointers(
+    repository: Path, snapshot: Path, files: dict[str, str]
+) -> None:
+    """Prove every snapshot pointer is a symlink to exactly its own blob."""
+    blobs = repository / "blobs"
+    for filename, etag in files.items():
+        pointer = snapshot.joinpath(*PurePosixPath(filename).parts)
+        try:
+            resolved = pointer.resolve(strict=True)
+            resolved.relative_to(blobs.resolve(strict=True))
+        except (OSError, ValueError) as exc:
+            raise ValidationError(
+                f"snapshot pointer escapes cache blobs: {pointer}"
+            ) from exc
+        if resolved != (blobs / etag).resolve(strict=True):
+            raise ValidationError(f"snapshot pointer has unexpected target: {pointer}")
+
+
+def _finalize_registration(
+    cache: Path,
+    name: str,
+    metadata: dict[str, Any],
+    files: dict[str, str],
+    snapshot: Path,
+    *,
+    operation: str = "hf-cache-sync",
+) -> Path:
+    """Publish the ref, registration record, and journal for a snapshot.
+
+    Callers must hold the per-name and per-repo cache locks. Never deletes
+    anything; staging cleanup stays with the caller. Shared by
+    ``publish_synced_staging`` (post-transfer) and ``register_local_cache``
+    (no-transfer registration), so both write identical state.
+    """
+    repository = repo_path(cache, str(metadata["repo"]))
+    _verify_snapshot_pointers(repository, snapshot, files)
+    _publish_ref(
+        cache,
+        repository,
+        str(metadata["repo"]),
+        str(metadata["revision"]),
+        str(metadata["commit"]),
+    )
+    _atomic_json(
+        _record_path(cache, name),
+        _record_payload(cache, name, metadata, files, snapshot),
+    )
+    _transition(
+        cache,
+        name,
+        "READY_FOR_SERVICE_RESTART",
+        operation=operation,
+        snapshot=str(snapshot),
+    )
+    entrypoint = str(metadata["entrypoint"])
+    return (
+        snapshot if entrypoint == "." else snapshot.joinpath(*PurePosixPath(entrypoint).parts)
+    ).resolve(strict=True)
 
 
 def publish_synced_staging(
@@ -585,35 +744,285 @@ def publish_synced_staging(
                 f"cache snapshot appeared concurrently at {snapshot}; retry sync"
             )
 
-    for filename, etag in files.items():
-        pointer = snapshot.joinpath(*PurePosixPath(filename).parts)
+    result = _finalize_registration(cache, name, metadata, files, snapshot)
+    shutil.rmtree(staging, ignore_errors=True)
+    return result
+
+
+def _verify_local_cache(
+    source: Path,
+    cache: Path,
+    metadata: dict[str, Any],
+    files: dict[str, str],
+    *,
+    progress: Callable[[str], None] | None = None,
+) -> list[LocalCacheIssue]:
+    """Compare an active store object with a local cache entry, collecting
+    every mismatch instead of failing on the first.
+
+    LFS blobs (64-hex ETags) are proven by blob filename and size only —
+    zero content reads. Small non-LFS files are git-blob-hashed on both
+    sides. Read-only: nothing is created and no walk has side effects."""
+    repository = repo_path(cache, str(metadata["repo"]))
+    blobs = repository / "blobs"
+    commit = str(metadata["commit"])
+    snapshot = repository / "snapshots" / commit
+    issues: list[LocalCacheIssue] = []
+
+    revision = str(metadata["revision"])
+    if not _COMMIT_RE.fullmatch(revision):
+        relative = _safe_relative(revision, "Hugging Face revision")
+        ref = repository / "refs" / Path(*relative.parts)
+        if not ref.is_file():
+            issues.append(
+                LocalCacheIssue(
+                    "refs",
+                    relative.as_posix(),
+                    f"local cache has no ref for revision {revision!r} "
+                    f"(store commit is {commit!r}); re-download that revision "
+                    "or run 'modelctl sync-local'",
+                )
+            )
+        else:
+            try:
+                local_ref = ref.read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                raise ModelctlError(f"cannot read local ref {ref}: {exc}") from exc
+            if local_ref != commit:
+                issues.append(
+                    LocalCacheIssue(
+                        "refs",
+                        relative.as_posix(),
+                        f"local ref points to {local_ref!r}, "
+                        f"store commit is {commit!r}",
+                    )
+                )
+
+    expected_sizes = {
+        item.path: item.size
+        for item in (ExpectedFile.from_dict(item) for item in metadata["files"])
+    }
+    lfs = sum(1 for etag in files.values() if len(etag) == 64)
+    _report(
+        progress,
+        f"register-local: verifying {len(files)} files "
+        f"({lfs} by blob identity, {len(files) - lfs} by content hash)",
+    )
+    for filename, etag in sorted(files.items()):
+        relative = _safe_relative(filename, "repository file")
+        parent = snapshot
+        broken: str | None = None
+        for part in relative.parts[:-1]:
+            candidate = parent / part
+            if candidate.is_symlink():
+                broken = f"snapshot directory is a symlink: {candidate}"
+                break
+            if not candidate.is_dir():
+                broken = f"snapshot path component is not a directory: {candidate}"
+                break
+            parent = candidate
+        pointer = parent / relative.name
+        if broken is not None:
+            issues.append(LocalCacheIssue("file-set", filename, broken))
+            continue
+        if not pointer.is_symlink() and not pointer.exists():
+            issues.append(
+                LocalCacheIssue(
+                    "file-set", filename, "missing from the local snapshot tree"
+                )
+            )
+            continue
+        if not pointer.is_symlink():
+            issues.append(
+                LocalCacheIssue(
+                    "file-set", filename, "snapshot path is not a symlink into blobs"
+                )
+            )
+            continue
         try:
             resolved = pointer.resolve(strict=True)
             resolved.relative_to(blobs.resolve(strict=True))
-        except (OSError, ValueError) as exc:
-            raise ValidationError(
-                f"snapshot pointer escapes cache blobs: {pointer}"
-            ) from exc
-        if resolved != (blobs / etag).resolve(strict=True):
-            raise ValidationError(f"snapshot pointer has unexpected target: {pointer}")
+        except (OSError, ValueError):
+            issues.append(
+                LocalCacheIssue(
+                    "file-set",
+                    filename,
+                    "snapshot pointer does not resolve inside the cache blobs",
+                )
+            )
+            continue
+        blob = blobs / resolved.name
+        if not blob.is_file() or blob.is_symlink():
+            issues.append(
+                LocalCacheIssue(
+                    "blob-name", filename, f"blob is not a regular file: {blob}"
+                )
+            )
+            continue
+        if resolved.name != etag:
+            issues.append(
+                LocalCacheIssue(
+                    "blob-name",
+                    filename,
+                    f"local blob filename {resolved.name!r} != store ETag {etag!r}",
+                )
+            )
+            continue
+        expected_size = expected_sizes.get(filename)
+        if expected_size is not None and blob.stat().st_size != expected_size:
+            issues.append(
+                LocalCacheIssue(
+                    "blob-name",
+                    filename,
+                    f"local blob size {blob.stat().st_size} != "
+                    f"store size {expected_size}",
+                )
+            )
+            continue
+        if len(etag) == 64:
+            continue
+        store_file = source.joinpath(*relative.parts)
+        if not store_file.is_file() or store_file.is_symlink():
+            issues.append(
+                LocalCacheIssue(
+                    "content-hash",
+                    filename,
+                    f"store file is not a regular file: {store_file}",
+                )
+            )
+            continue
+        store_hash = _git_blob_digest(store_file)
+        blob_hash = _git_blob_digest(blob)
+        if store_hash != etag or blob_hash != etag:
+            issues.append(
+                LocalCacheIssue(
+                    "content-hash",
+                    filename,
+                    f"git-blob hashes disagree: store {store_hash}, "
+                    f"local blob {blob_hash}, store ETag {etag}",
+                )
+            )
+    return issues
 
-    _publish_ref(
-        cache,
-        repository,
-        str(metadata["repo"]),
-        str(metadata["revision"]),
-        commit,
-    )
-    _atomic_json(
-        _record_path(cache, name),
-        _record_payload(cache, name, metadata, files, snapshot),
-    )
-    _transition(cache, name, "READY_FOR_SERVICE_RESTART", snapshot=str(snapshot))
-    shutil.rmtree(staging, ignore_errors=True)
+
+def register_local_cache(
+    source_root: Path,
+    cache_dir: Path,
+    name: str,
+    *,
+    dry_run: bool = False,
+    progress: Callable[[str], None] | None = None,
+) -> LocalCacheRegistration:
+    """Register an existing local Hugging Face cache entry without transferring.
+
+    Resolves the active store object like ``sync-local``, locates the local
+    ``models--<owner>--<name>`` entry, and verifies equivalence: LFS blobs by
+    filename and size (zero content reads), small files by content hash on
+    both sides, every store file present in the snapshot tree, and the local
+    ref pointing at the store commit. When equivalent, publishes the same
+    registration record, ref, and journal ``sync-local`` writes — reusing
+    ``_finalize_registration``. Any doubt refuses the registration and leaves
+    the cache and any existing record untouched. Re-registering over an
+    existing record follows sync-local parity: a verified run overwrites it.
+    """
+    cache = canonical_cache(cache_dir)
+    source, metadata = _active_store_object(source_root, name)
+    repo = str(metadata["repo"])
+    commit = str(metadata["commit"])
+    files = _store_file_etags(source, metadata)
+    repository = repo_path(cache, repo)
+    snapshot = repository / "snapshots" / commit
+
+    if repository.is_symlink() or not repository.is_dir():
+        raise ModelctlError(
+            f"Hugging Face cache entry {repository.name!r} is not present in "
+            f"{cache}; use 'modelctl sync-local' to transfer it"
+        )
+    blobs = repository / "blobs"
+    if blobs.is_symlink() or not blobs.is_dir():
+        raise ModelctlError(
+            f"local cache entry {repository.name!r} has no usable blobs "
+            f"directory: {blobs}"
+        )
+    if snapshot.is_symlink() or not snapshot.is_dir():
+        raise ModelctlError(
+            f"local cache entry {repository.name!r} has no snapshot for store "
+            f"commit {commit!r}: {snapshot}"
+        )
+
+    expected_sizes = {
+        item.path: item.size
+        for item in (ExpectedFile.from_dict(item) for item in metadata["files"])
+    }
+    lfs = sum(1 for etag in files.values() if len(etag) == 64)
     entrypoint = str(metadata["entrypoint"])
-    return (
-        snapshot if entrypoint == "." else snapshot.joinpath(*PurePosixPath(entrypoint).parts)
-    ).resolve(strict=True)
+    would_entrypoint = (
+        snapshot
+        if entrypoint == "."
+        else snapshot.joinpath(*PurePosixPath(entrypoint).parts)
+    )
+
+    def result(
+        issues: list[LocalCacheIssue],
+        registered: bool = False,
+        entrypoint_path: Path | None = None,
+    ) -> LocalCacheRegistration:
+        return LocalCacheRegistration(
+            name=name,
+            repo=repo,
+            revision=str(metadata["revision"]),
+            commit=commit,
+            cache=cache,
+            repository=repository,
+            snapshot=snapshot,
+            entrypoint=entrypoint_path or would_entrypoint,
+            dry_run=dry_run,
+            verified=not issues,
+            registered=registered,
+            selected_files=len(files),
+            lfs_files=lfs,
+            hashed_files=len(files) - lfs,
+            hashed_bytes=sum(
+                expected_sizes.get(filename) or 0
+                for filename, etag in files.items()
+                if len(etag) != 64
+            ),
+            issues=tuple(issues),
+        )
+
+    if dry_run:
+        return result(
+            _verify_local_cache(source, cache, metadata, files, progress=progress)
+        )
+    with _lock(_name_lock(cache, name)), _lock(_repo_lock(cache, repo)):
+        issues = _verify_local_cache(
+            source, cache, metadata, files, progress=progress
+        )
+        if issues:
+            return result(issues)
+        _report(progress, f"register-local: verified; registering {name!r}")
+        record_path = _record_path(cache, name)
+        previous_commit: str | None = None
+        if record_path.exists():
+            try:
+                previous_commit = json.loads(
+                    record_path.read_text(encoding="utf-8")
+                ).get("commit")
+            except (OSError, ValueError):
+                previous_commit = None
+        _transition(
+            cache,
+            name,
+            "REGISTERING_LOCAL_CACHE",
+            operation="hf-cache-register",
+            repo=repo,
+            commit=commit,
+            previous_commit=previous_commit,
+        )
+        entrypoint_path = _finalize_registration(
+            cache, name, metadata, files, snapshot, operation="hf-cache-register"
+        )
+        return result([], registered=True, entrypoint_path=entrypoint_path)
 
 
 def receive_staged_cache(
