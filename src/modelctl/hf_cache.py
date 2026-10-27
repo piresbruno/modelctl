@@ -786,7 +786,10 @@ def _verify_local_cache(
         else:
             try:
                 local_ref = ref.read_text(encoding="utf-8").strip()
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
+                # UnicodeDecodeError subclasses ValueError: a binary or
+                # corrupt ref file must yield the actionable error, not a
+                # traceback.
                 raise ModelctlError(f"cannot read local ref {ref}: {exc}") from exc
             if local_ref != commit:
                 issues.append(
@@ -1005,11 +1008,15 @@ def register_local_cache(
         previous_commit: str | None = None
         if record_path.exists():
             try:
-                previous_commit = json.loads(
-                    record_path.read_text(encoding="utf-8")
-                ).get("commit")
+                previous = json.loads(record_path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
-                previous_commit = None
+                previous = None
+            # A stale record that is valid JSON but not an object must not
+            # crash the re-register; it is simply replaced.
+            if isinstance(previous, dict) and isinstance(
+                previous.get("commit"), str
+            ):
+                previous_commit = previous["commit"]
         _transition(
             cache,
             name,
