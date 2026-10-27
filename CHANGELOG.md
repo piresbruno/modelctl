@@ -4,6 +4,8 @@ This project follows semantic versioning.
 
 ## Unreleased
 
+## 0.23.0
+
 ### Added
 
 - `modelctl register-local MODEL_OR_REPO [--source-root NAS] [--cache-dir DIR]
