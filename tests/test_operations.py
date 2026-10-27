@@ -987,6 +987,49 @@ def test_register_local_after_keep_data_rebuilds_record(tmp_path):
     assert refs["refs"] == {"org/demo@main": {"commit": "d" * 40}}
 
 
+def test_register_local_tolerates_non_object_stale_record(tmp_path):
+    nas, cache = tmp_path / "nas", tmp_path / "cache"
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot({"config.json": b"data"}),
+    )
+    repository = _seed_local_cache(cache, _object_path(nas))
+    # Valid JSON that is not an object: must be replaced, not crash
+    (state_root(cache) / "active").mkdir(parents=True, exist_ok=True)
+    (state_root(cache) / "active" / "demo.json").write_text("[]")
+
+    result = register_local(nas, cache, "demo")
+
+    assert result.verified is True
+    assert result.registered is True
+    assert load_record(cache, "demo").commit == "d" * 40
+    history = json.loads(
+        (state_root(cache) / "state" / "demo.json").read_text()
+    )["history"]
+    registering = [
+        item for item in history
+        if item["state"] == "REGISTERING_LOCAL_CACHE"
+    ]
+    assert registering[-1]["previous_commit"] is None
+
+
+def test_register_local_reports_unreadable_ref(tmp_path):
+    nas, cache = tmp_path / "nas", tmp_path / "cache"
+    update_model(
+        nas,
+        _manifest(),
+        api=FakeApi("d" * 40),
+        snapshot=FakeSnapshot({"config.json": b"data"}),
+    )
+    repository = _seed_local_cache(cache, _object_path(nas))
+    (repository / "refs" / "main").write_bytes(b"\xff\xfe\x00binary")
+
+    with pytest.raises(ModelctlError, match="cannot read local ref"):
+        register_local(nas, cache, "demo")
+
+
 def test_delete_local_deletes_cache_data_and_preserves_nas(tmp_path):
     nas = tmp_path / "nas"
     cache = tmp_path / "hub"
