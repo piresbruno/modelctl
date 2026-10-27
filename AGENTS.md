@@ -22,7 +22,8 @@ package uses a `src/` layout and exposes the `modelctl` command through
   serve-command workflows.
 - `src/modelctl/remote.py`: `push` orchestration over ssh and rsync.
 - `src/modelctl/hf_cache.py`: Hugging Face cache synchronization, local cache
-  registrations, and the receive-cache probe and commit paths used by push.
+  registrations (`sync-local` transfer and `register-local` no-transfer
+  adoption), and the receive-cache probe and commit paths used by push.
 - `src/modelctl/layout.py`: managed-store paths, locks, and atomic symlinks.
 - `src/modelctl/validation.py`: artifact checks and object metadata.
 - `src/modelctl/state.py`: durable state-transition journals.
